@@ -1,4 +1,4 @@
-"""
+﻿"""
 定时/手动数据更新与 raw 文件合并。
 
 功能：
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -28,8 +29,25 @@ import numpy as np
 from resource_predict.settings import settings
 from resource_predict.data.io import coerce_metric_series, read_raw_dataset, write_raw_dataset
 from resource_predict.providers.mock import mock_incremental_provider
+from resource_predict.resource_types import metric_names_for_resource
 
 logger = logging.getLogger(__name__)
+
+
+def backup_raw_dataset(raw_path: Path) -> Optional[Path]:
+    """Back up raw_data.json before an in-place merge/write."""
+    if not raw_path.exists():
+        return None
+    backup_dir = raw_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_path = backup_dir / f"{raw_path.stem}.{stamp}.json"
+    suffix = 1
+    while backup_path.exists():
+        backup_path = backup_dir / f"{raw_path.stem}.{stamp}-{suffix}.json"
+        suffix += 1
+    shutil.copy2(raw_path, backup_path)
+    return backup_path
 
 # ---------------------------------------------------------------------------
 # 可插拔增量数据源接口
@@ -37,7 +55,7 @@ logger = logging.getLogger(__name__)
 # 函数签名为：
 #   (prepared_resources: List[Dict], points_to_add: int) -> List[Dict]
 # 其中 prepared_resources 结构与 read_raw_dataset 返回一致：
-#   [{"resource_id": str, "vm_spec": {...}, "cpu": Series, "memory": Series, "disk": Series}, ...]
+#   [{"resource_id": str, "spec": {...}, "cpu": Series, "memory": Series, "disk": Series}, ...]
 # 返回值结构需与 data_provider 格式一致：
 #   [{"resource_id": str, "metrics": {"cpu": {"timestamps":[], "values":[]}, ...}}, ...]
 IncrementalProvider = Callable[
@@ -303,9 +321,15 @@ def _build_new_resource_from_upsert(item: Dict[str, Any]) -> Dict[str, Any]:
 
     prepared: Dict[str, Any] = {
         "resource_id": rid,
-        "vm_spec": item.get("vm_spec", {}) if isinstance(item.get("vm_spec"), dict) else {},
+        "spec": item.get("spec", {}) if isinstance(item.get("spec"), dict) else {},
     }
-    for metric in ("cpu", "memory", "disk"):
+    resource_type = str(item.get("resource_type") or "")
+    if resource_type:
+        prepared["resource_type"] = resource_type
+    if isinstance(item.get("data_quality"), dict):
+        prepared["data_quality"] = item["data_quality"]
+
+    for metric in metric_names_for_resource(prepared):
         metric_data = metrics.get(metric)
         if not isinstance(metric_data, dict):
             raise ValueError(f"新增资源 {rid} 缺少 {metric} 指标数据")
@@ -496,15 +520,22 @@ def _do_update(
                 continue
 
             spec_changed = False
-            incoming_spec = new_info.get("vm_spec", {})
+            incoming_spec = new_info.get("spec", {})
             if isinstance(incoming_spec, dict) and incoming_spec:
-                current_spec = res.get("vm_spec", {})
+                current_spec = res.get("spec", {})
                 if not isinstance(current_spec, dict):
                     current_spec = {}
                 merged_spec = {**current_spec, **incoming_spec}
                 if merged_spec != current_spec:
-                    res["vm_spec"] = merged_spec
+                    res["spec"] = merged_spec
                     spec_changed = True
+            incoming_type = str(new_info.get("resource_type") or "")
+            if incoming_type:
+                res["resource_type"] = incoming_type
+                spec_changed = True
+            if isinstance(new_info.get("data_quality"), dict):
+                res["data_quality"] = new_info["data_quality"]
+                spec_changed = True
 
             new_metrics = new_info.get("metrics", {})
             if not isinstance(new_metrics, dict):
@@ -512,7 +543,7 @@ def _do_update(
 
             has_new = False
             changed_metrics: List[str] = []
-            for metric in ("cpu", "memory", "disk"):
+            for metric in metric_names_for_resource(res):
                 metric_new = new_metrics.get(metric, {})
                 ts_list = metric_new.get("timestamps", []) if isinstance(metric_new, dict) else []
                 val_list = metric_new.get("values", []) if isinstance(metric_new, dict) else []
@@ -535,9 +566,10 @@ def _do_update(
                     if validation.get("warnings"):
                         all_warnings.extend(validation["warnings"])
 
-                    before_len = len(res[metric])
+                    before_series = res[metric]
+                    before_len = len(before_series)
                     updated_series = _merge_incremental_into_series(
-                        res[metric], ts_list, val_list,
+                        before_series, ts_list, val_list,
                     )
                     if use_sw:
                         net = len(updated_series) - before_len
@@ -545,8 +577,9 @@ def _do_update(
                             updated_series = updated_series.iloc[net:]
                     res[metric] = updated_series
                     new_pts = max(0, len(res[metric]) - before_len)
+                    metric_changed = not updated_series.equals(before_series)
                     total_new_pts += new_pts
-                    if new_pts > 0:
+                    if metric_changed:
                         has_new = True
                         changed_metrics.append(metric)
 
@@ -567,7 +600,7 @@ def _do_update(
                 created_count += 1
                 created_resource_ids.append(rid)
                 updated_resource_ids.append(rid)
-                changed_metrics = ["cpu", "memory", "disk"]
+                changed_metrics = list(metric_names_for_resource(new_res))
                 updated_metrics_by_resource[rid] = changed_metrics
                 total_new_pts += sum(len(new_res[metric]) for metric in changed_metrics)
 
@@ -585,6 +618,9 @@ def _do_update(
                 "没有任何资源被更新（新数据与现有资源 ID 不匹配，或所有指标均为空）"
             )
 
+        backup_path = backup_raw_dataset(raw_path)
+        if backup_path is not None:
+            logger.info("[updater] raw_data.json 备份: %s", backup_path)
         logger.info("[updater] 写回 raw_data.json （%d 个资源）…", len(prepared))
         with _lock:
             _update_status["phase"] = "writing_raw"
@@ -744,3 +780,4 @@ def stop_background_updater(timeout: float = 10.0) -> None:
         else:
             logger.info("[updater] 后台调度线程已退出")
     _scheduler_thread = None
+

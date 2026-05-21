@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 from typing import Dict, List
@@ -8,7 +8,7 @@ import numpy as np
 from resource_predict.settings import settings
 
 
-def _normalize_vm_spec(vm_spec: Dict[str, object]) -> Dict[str, int]:
+def _normalize_spec(spec: Dict[str, object]) -> Dict[str, int]:
     def _as_int(v: object) -> int:
         try:
             return int(float(v))
@@ -16,9 +16,9 @@ def _normalize_vm_spec(vm_spec: Dict[str, object]) -> Dict[str, int]:
             return 0
 
     return {
-        "cpu_cores": _as_int((vm_spec or {}).get("cpu_cores")),
-        "memory_gb": _as_int((vm_spec or {}).get("memory_gb")),
-        "disk_gb": _as_int((vm_spec or {}).get("disk_gb")),
+        "cpu_cores": _as_int((spec or {}).get("cpu_cores")),
+        "memory_gb": _as_int((spec or {}).get("memory_gb")),
+        "disk_gb": _as_int((spec or {}).get("disk_gb")),
     }
 
 
@@ -54,7 +54,7 @@ def _metric_is_cold(stats: Dict[str, float]) -> bool:
     return avg < float(cfg.scale_in_threshold) and p95 < float(cfg.scale_in_p95_guard)
 
 
-def _finalize_target_vm_spec_even(action: str, target: Dict[str, int], disk_min_gb: int = 50) -> Dict[str, int]:
+def _finalize_target_spec_even(action: str, target: Dict[str, int], disk_min_gb: int = 50) -> Dict[str, int]:
     """扩容/缩容建议中的规格对齐为偶数（奇数则 +1），贴近常见可购规格。
     
     硬盘缩容时最小规格为 disk_min_gb（默认50GB）。
@@ -85,8 +85,8 @@ def _finalize_target_vm_spec_even(action: str, target: Dict[str, int], disk_min_
     return result
 
 
-def _pick_target_vm_spec_by_metric(
-    current_vm_spec: Dict[str, object],
+def _pick_target_spec_by_metric(
+    current_spec: Dict[str, object],
     by_metric: Dict[str, Dict[str, float]],
     metric_actions: Dict[str, str],
 ) -> Dict[str, int]:
@@ -100,7 +100,7 @@ def _pick_target_vm_spec_by_metric(
     - metric_actions[metric] == hold：该维度保持当前规格。
     - 最终建议核数默认可对齐为偶数（见 snap_target_cpu_cores_to_even）。
     """
-    cur = _normalize_vm_spec(current_vm_spec)
+    cur = _normalize_spec(current_spec)
     if not all(cur[k] > 0 for k in ("cpu_cores", "memory_gb", "disk_gb")):
         return {}
 
@@ -153,18 +153,18 @@ def _pick_target_vm_spec_by_metric(
         overall_action = "scale_in"
     else:
         overall_action = "hold"
-    return _finalize_target_vm_spec_even(overall_action, target)
+    return _finalize_target_spec_even(overall_action, target)
 
 
 def _reconcile_noop_metric_actions(
     *,
-    current_vm_spec: Dict[str, object],
-    target_vm_spec: Dict[str, int],
+    current_spec: Dict[str, object],
+    target_spec: Dict[str, int],
     metric_actions: Dict[str, str],
     metric_reasons: Dict[str, str],
 ) -> None:
-    cur = _normalize_vm_spec(current_vm_spec)
-    target = _normalize_vm_spec(target_vm_spec)
+    cur = _normalize_spec(current_spec)
+    target = _normalize_spec(target_spec)
     if not all(cur[k] > 0 for k in ("cpu_cores", "memory_gb", "disk_gb")):
         return
     if not all(target[k] > 0 for k in ("cpu_cores", "memory_gb", "disk_gb")):
@@ -374,7 +374,7 @@ def _overall_confidence(
 
 def build_scaling_advice(
     metric_future_values: Dict[str, np.ndarray],
-    current_vm_spec: Dict[str, object] | None = None,
+    current_spec: Dict[str, object] | None = None,
 ) -> Dict[str, object]:
     """
     根据未来窗口负载预测生成扩缩容建议。
@@ -386,7 +386,7 @@ def build_scaling_advice(
     - suggested_delta: +1 / -1 / 0（动作方向）
     - metric_actions: 各指标动作（cpu/memory/disk -> scale_out/scale_in/hold）
     - metric_reasons: 各指标判定依据（便于前端按维度展示）
-    - target_vm_spec: 目标规格（cpu_cores/memory_gb/disk_gb）
+    - target_spec: 目标规格（cpu_cores/memory_gb/disk_gb）
     - stats: 每个指标的统计与趋势特征（avg/p95/peak/gap/slope/...）
     """
     cfg = settings.decision
@@ -460,17 +460,17 @@ def build_scaling_advice(
             metric_actions[metric] = "hold"
             metric_reasons[metric] = f"{label}负载在合理区间，建议保持"
 
-    target_vm_spec = _pick_target_vm_spec_by_metric(current_vm_spec or {}, by_metric, metric_actions)
+    target_spec = _pick_target_spec_by_metric(current_spec or {}, by_metric, metric_actions)
     _reconcile_noop_metric_actions(
-        current_vm_spec=current_vm_spec or {},
-        target_vm_spec=target_vm_spec,
+        current_spec=current_spec or {},
+        target_spec=target_spec,
         metric_actions=metric_actions,
         metric_reasons=metric_reasons,
     )
-    target_vm_spec = _pick_target_vm_spec_by_metric(current_vm_spec or {}, by_metric, metric_actions)
+    target_spec = _pick_target_spec_by_metric(current_spec or {}, by_metric, metric_actions)
     _reconcile_noop_metric_actions(
-        current_vm_spec=current_vm_spec or {},
-        target_vm_spec=target_vm_spec,
+        current_spec=current_spec or {},
+        target_spec=target_spec,
         metric_actions=metric_actions,
         metric_reasons=metric_reasons,
     )
@@ -500,7 +500,8 @@ def build_scaling_advice(
         "suggested_delta": suggested_delta,
         "metric_actions": metric_actions,
         "metric_reasons": metric_reasons,
-        "target_vm_spec": target_vm_spec,
+        "target_spec": target_spec,
         "stats": by_metric,
         "has_mixed_signals": has_mixed,
     }
+

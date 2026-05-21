@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import threading
@@ -23,8 +23,8 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
     if not resource_id:
         raise ValueError("scaling plan is missing resource_id")
 
-    effective_spec = _effective_vm_spec(plan)
-    _validate_effective_vm_spec(plan, effective_spec)
+    effective_spec = _effective_spec(plan)
+    _validate_effective_spec(plan, effective_spec)
     out_dir = Path(settings.app.out_dir)
     summary_path = out_dir / settings.app.summary_index_filename
     details_dir = out_dir / settings.app.details_dirname
@@ -33,7 +33,7 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
 
     updated: Dict[str, Any] = {
         "resource_id": resource_id,
-        "effective_vm_spec": effective_spec,
+        "effective_spec": effective_spec,
         "summary_updated": False,
         "detail_updated": False,
         "raw_updated": False,
@@ -59,7 +59,7 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
     return updated
 
 
-def _effective_vm_spec(plan: Any) -> Dict[str, Any]:
+def _effective_spec(plan: Any) -> Dict[str, Any]:
     target = dict(getattr(plan, "target_spec", {}) or {})
     details = getattr(plan, "details", {}) or {}
     selected = details.get("selected_flavor", {}) if isinstance(details, dict) else {}
@@ -75,7 +75,7 @@ def _effective_vm_spec(plan: Any) -> Dict[str, Any]:
     return effective
 
 
-def _validate_effective_vm_spec(plan: Any, effective_spec: Dict[str, Any]) -> None:
+def _validate_effective_spec(plan: Any, effective_spec: Dict[str, Any]) -> None:
     details = getattr(plan, "details", {}) or {}
     is_openstack = isinstance(details, dict) and bool(details.get("instance_id"))
     if not is_openstack:
@@ -89,11 +89,11 @@ def _validate_effective_vm_spec(plan: Any, effective_spec: Dict[str, Any]) -> No
         raise ValueError(
             "local snapshot is missing effective OpenStack spec fields: "
             + ", ".join(missing)
-            + "; ensure target_vm_spec includes CPU/memory/disk or the target flavor can be discovered"
+            + "; ensure target_spec includes CPU/memory/disk or the target flavor can be discovered"
         )
 
 
-def _merge_vm_spec(current: Any, effective: Dict[str, Any]) -> Dict[str, Any]:
+def _merge_spec(current: Any, effective: Dict[str, Any]) -> Dict[str, Any]:
     base = dict(current) if isinstance(current, dict) else {}
     for key, value in effective.items():
         if value is not None:
@@ -115,7 +115,7 @@ def _recompute_advice(item: Dict[str, Any]) -> bool:
         if not best or not isinstance(futures, dict) or best not in futures:
             return False
         future_by_metric[metric] = np.asarray(futures.get(best) or [], dtype=float)
-    item["scaling_advice"] = build_scaling_advice(future_by_metric, current_vm_spec=item.get("vm_spec", {}))
+    item["scaling_advice"] = build_scaling_advice(future_by_metric, current_spec=item.get("spec", {}))
     return True
 
 
@@ -162,7 +162,7 @@ def _update_detail(
     item = chunk_resources[offset]
     if not isinstance(item, dict):
         return None
-    item["vm_spec"] = _merge_vm_spec(item.get("vm_spec", {}), effective_spec)
+    item["spec"] = _merge_spec(item.get("spec", {}), effective_spec)
     if _recompute_advice(item):
         updated["advice_recomputed"] = True
     atomic_write_json(detail_path, chunk, ensure_ascii=False, separators=(",", ":"))
@@ -186,7 +186,7 @@ def _update_summary(
     for row in resources:
         if not isinstance(row, dict) or str(row.get("resource_id")) != resource_id:
             continue
-        row["vm_spec"] = _merge_vm_spec(row.get("vm_spec", {}), effective_spec)
+        row["spec"] = _merge_spec(row.get("spec", {}), effective_spec)
         if isinstance(detail_item, dict) and isinstance(detail_item.get("scaling_advice"), dict):
             row["scaling_advice"] = detail_item["scaling_advice"]
         row["last_scaling_snapshot_at_epoch_ms"] = int(time.time() * 1000)
@@ -211,7 +211,7 @@ def _update_raw(
     for row in resources:
         if not isinstance(row, dict) or str(row.get("resource_id")) != resource_id:
             continue
-        row["vm_spec"] = _merge_vm_spec(row.get("vm_spec", {}), effective_spec)
+        row["spec"] = _merge_spec(row.get("spec", {}), effective_spec)
         updated["raw_updated"] = True
         break
     if updated["raw_updated"]:
@@ -238,10 +238,11 @@ def _update_manifest(
     for row in resources:
         if not isinstance(row, dict) or str(row.get("resource_id")) != resource_id:
             continue
-        row["vm_spec"] = _merge_vm_spec(row.get("vm_spec", {}), effective_spec)
+        row["spec"] = _merge_spec(row.get("spec", {}), effective_spec)
         if isinstance(detail_item, dict) and isinstance(detail_item.get("scaling_advice"), dict):
             row["scaling_advice"] = detail_item["scaling_advice"]
         updated["manifest_updated"] = True
         break
     if updated["manifest_updated"]:
         atomic_write_json(manifest_path, manifest, ensure_ascii=False, indent=2)
+

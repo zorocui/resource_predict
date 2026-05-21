@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -32,7 +32,7 @@ def load_cluster_configs(path: Path | str = DEFAULT_CLUSTER_CONFIG) -> Dict[str,
 def get_cluster_config(cluster: str, path: Path | str = DEFAULT_CLUSTER_CONFIG) -> Dict[str, Any]:
     cluster = str(cluster or "").strip()
     if not cluster:
-        raise ClusterConfigError("资源缺少 vm_spec.cluster，无法定位控制节点")
+        raise ClusterConfigError("资源缺少 spec.cluster，无法定位控制节点")
     configs = load_cluster_configs(path)
     cfg = configs.get(cluster)
     if not isinstance(cfg, dict):
@@ -42,3 +42,4 @@ def get_cluster_config(cluster: str, path: Path | str = DEFAULT_CLUSTER_CONFIG) 
     if not str(cfg.get("ssh_user", "")).strip():
         raise ClusterConfigError(f"集群 {cluster} 缺少 ssh_user")
     return cfg
+

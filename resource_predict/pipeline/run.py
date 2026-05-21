@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import concurrent.futures
 import logging
@@ -13,7 +13,8 @@ from resource_predict.settings import settings
 from resource_predict.data.io import read_raw_dataset, write_raw_dataset
 from resource_predict.core.decision import build_scaling_advice
 from resource_predict.core.forecasting import forecast_arima, forecast_prophet, forecast_sarima
-from resource_predict.pipeline.constants import METRIC_NAMES
+from resource_predict.core.k8s_pod_decision import build_k8s_pod_advice
+from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resource, resource_type_of
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
 from resource_predict.pipeline.prepare import ExternalProvider, build_prepared_data
@@ -97,7 +98,8 @@ def generate_all_images(
             metric_partial_enabled = bool(existing_items_for_partial and metric_filter_by_id)
         for p in prepared_data:
             rid = p["resource_id"]
-            min_len = min(len(p["cpu"]), len(p["memory"]), len(p["disk"]))
+            metric_names = metric_names_for_resource(p)
+            min_len = min(len(p[m]) for m in metric_names)
             if min_len <= test_size:
                 raise ValueError(
                     f"{rid} 有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
@@ -172,14 +174,9 @@ def generate_all_images(
         worker_started = time.perf_counter()
         source = prepared_data[i]
         resource_tag = source["resource_id"]
-        vm_spec = source.get("vm_spec", {})
-        y_cpu = source["cpu"]
-        y_mem = source["memory"]
-        y_disk = source["disk"]
-
-        cpu_train, cpu_test = y_cpu.iloc[:-test_size], y_cpu.iloc[-test_size:]
-        mem_train, mem_test = y_mem.iloc[:-test_size], y_mem.iloc[-test_size:]
-        disk_train, disk_test = y_disk.iloc[:-test_size], y_disk.iloc[-test_size:]
+        spec = source.get("spec", {})
+        resource_type = resource_type_of(source)
+        metric_names = metric_names_for_resource(source)
 
         timing_by_model = {m: 0.0 for m in active_methods}
 
@@ -193,7 +190,7 @@ def generate_all_images(
                 elif m == "sarima":
                     res = forecast_sarima(y_train, test_size)
                 else:
-                    res = forecast_prophet(y_train, test_size, freq=freq)
+                    res = forecast_prophet(y_train, test_size)
                 pred = res.yhat.copy()
                 pred.index = y_test.index
                 preds[m] = pred
@@ -209,26 +206,25 @@ def generate_all_images(
                 elif m == "sarima":
                     res = forecast_sarima(y_full, future_steps)
                 else:
-                    res = forecast_prophet(y_full, future_steps, freq=freq)
+                    res = forecast_prophet(y_full, future_steps)
                 preds_future[m] = res.yhat.copy()
                 timing_local[m] += float(res.seconds)
             return preds, metrics, best, preds_future, timing_local
 
         metric_sources = {
-            "cpu": (cpu_train, cpu_test, y_cpu),
-            "memory": (mem_train, mem_test, y_mem),
-            "disk": (disk_train, disk_test, y_disk),
+            name: (source[name].iloc[:-test_size], source[name].iloc[-test_size:], source[name])
+            for name in metric_names
         }
         if metric_partial_enabled and str(resource_tag) in existing_partial_ids:
             metrics_to_fit = [
                 metric
-                for metric in METRIC_NAMES
-                if metric in metric_filter_by_id.get(str(resource_tag), set(METRIC_NAMES))
+                for metric in metric_names
+                if metric in metric_filter_by_id.get(str(resource_tag), set(metric_names))
             ]
         else:
-            metrics_to_fit = list(METRIC_NAMES)
+            metrics_to_fit = list(metric_names)
         if not metrics_to_fit:
-            metrics_to_fit = list(METRIC_NAMES)
+            metrics_to_fit = list(metric_names)
 
         if parallel_metrics_enabled and len(metrics_to_fit) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=inner_metric_workers) as imx:
@@ -269,22 +265,27 @@ def generate_all_images(
             futures_for_advice[metric_name] = future_pred[best].to_numpy(dtype=float)
 
         advice = None
-        if len(futures_for_advice) == len(METRIC_NAMES):
+        if resource_type == "k8s_pod" and len(futures_for_advice) == len(metric_names):
+            advice = build_k8s_pod_advice(futures_for_advice, resource=source)
+        elif len(futures_for_advice) == len(METRIC_NAMES):
             advice = build_scaling_advice(
                 futures_for_advice,
-                current_vm_spec=vm_spec,
+                current_spec=spec,
             )
 
         wall_seconds = time.perf_counter() - worker_started
         item = {
             "resource_id": resource_tag,
-            "vm_spec": vm_spec if isinstance(vm_spec, dict) else {},
+            "resource_type": resource_type,
+            "spec": spec if isinstance(spec, dict) else {},
             "best_methods": best_methods,
             "metrics": metrics_out,
             "charts_forecast": charts_forecast,
             "_timings": {"by_model": timing_by_model, "total": timing_total, "wall": wall_seconds},
             "_slot": i,
         }
+        if isinstance(source.get("data_quality"), dict):
+            item["data_quality"] = source["data_quality"]
         if advice is not None:
             item["scaling_advice"] = advice
         return item
@@ -421,3 +422,4 @@ def _log_input_stats(
             future_steps,
             freq_display,
         )
+

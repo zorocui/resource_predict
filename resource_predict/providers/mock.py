@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 """
 模拟全量 / 增量数据源（resource_predict.providers.mock）。
@@ -14,6 +14,8 @@ from typing import List, Dict, Any
 
 import numpy as np
 import pandas as pd
+
+from resource_predict.resource_types import metric_names_for_resource
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +70,7 @@ def mock_incremental_provider(
         rid = str(res.get("resource_id", ""))
         result: Dict[str, Any] = {"resource_id": rid, "metrics": {}}
 
-        for metric in ("cpu", "memory", "disk"):
+        for metric in metric_names_for_resource(res):
             series = res.get(metric)
             if not isinstance(series, pd.Series) or series.empty:
                 result["metrics"][metric] = {"timestamps": [], "values": []}
@@ -143,13 +145,13 @@ def _simulate_metric_by_mode(*, n: int, rng: np.random.Generator, mode: str, fre
     return np.clip(y / 100.0, 0.0, 1.0)
 
 
-def mock_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
+def _mock_vm_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
     """
     data_provider 需要返回：
     [
       {
         "resource_id": "vm-001",
-        "vm_spec": {
+        "spec": {
           "ip": "10.0.0.11",
           "cluster": "cluster-a",
           "cpu_cores": 4,
@@ -173,7 +175,7 @@ def mock_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
 
     out: List[Dict[str, Any]] = []
     # 常见虚拟机规格池：mock 中循环使用，便于覆盖不同容量档位场景。
-    vm_specs = [
+    specs = [
         {"cpu_cores": 2, "memory_gb": 4, "disk_gb": 40},
         {"cpu_cores": 2, "memory_gb": 8, "disk_gb": 60},
         {"cpu_cores": 4, "memory_gb": 8, "disk_gb": 80},
@@ -192,13 +194,13 @@ def mock_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
         memory = _simulate_metric_by_mode(n=n, rng=rng_mem, mode=mode, freq=freq)
         disk = _simulate_metric_by_mode(n=n, rng=rng_disk, mode=mode, freq=freq)
 
-        spec = vm_specs[i % len(vm_specs)]
+        spec = specs[i % len(specs)]
         ip_octet_3 = 10 + ((i // 200) % 200)
         ip_octet_4 = 10 + (i % 200)
         out.append(
             {
                 "resource_id": rid,
-                "vm_spec": {
+                "spec": {
                     "ip": f"10.0.{ip_octet_3}.{ip_octet_4}",
                     "cluster": clusters[i % len(clusters)],
                     "cpu_cores": int(spec["cpu_cores"]),
@@ -219,6 +221,82 @@ def mock_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _mock_k8s_pod_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
+    base_seed = 7000 + n
+    idx = pd.date_range("2025-01-01", periods=n, freq=freq)
+    idx_list = idx.tolist()
+    clusters = ["cluster-k8s-a", "cluster-k8s-b"]
+    namespaces = ["payments", "orders", "platform", "monitoring"]
+    owners = [
+        ("Deployment", "api-server"),
+        ("Deployment", "worker"),
+        ("StatefulSet", "redis"),
+        ("Deployment", "collector"),
+    ]
+    node_names = ["worker-01", "worker-02", "worker-03"]
+    cpu_requests = [0.25, 0.5, 1.0, None, 0.2]
+    cpu_limits = [1.0, 2.0, None, 0.8, None]
+    memory_requests = [0.5, 1.0, 2.0, None, 0.25]
+    memory_limits = [1.0, 2.0, None, 1.5, None]
+
+    out: List[Dict[str, Any]] = []
+    for i in range(resources):
+        namespace = namespaces[i % len(namespaces)]
+        owner_kind, owner_name = owners[i % len(owners)]
+        pod = f"{owner_name}-{1000 + i:04d}"
+        container = "app" if i % 4 else "sidecar"
+        mode = ["scale_out", "scale_in", "hold", "scale_out", "hold"][i % 5]
+        rng_cpu = np.random.default_rng(base_seed + i * 5 + 0)
+        rng_mem = np.random.default_rng(base_seed + i * 5 + 1)
+        cpu = _simulate_metric_by_mode(n=n, rng=rng_cpu, mode=mode, freq=freq)
+        memory = _simulate_metric_by_mode(n=n, rng=rng_mem, mode=mode, freq=freq)
+        cpu_request = cpu_requests[i % len(cpu_requests)]
+        cpu_limit = cpu_limits[i % len(cpu_limits)]
+        memory_request = memory_requests[i % len(memory_requests)]
+        memory_limit = memory_limits[i % len(memory_limits)]
+        out.append(
+            {
+                "resource_id": f"k8s:{clusters[i % len(clusters)]}:{namespace}:{pod}:{container}",
+                "resource_type": "k8s_pod",
+                "spec": {
+                    "cluster": clusters[i % len(clusters)],
+                    "namespace": namespace,
+                    "pod": pod,
+                    "container": container,
+                    "node": node_names[i % len(node_names)],
+                    "owner_kind": owner_kind,
+                    "owner_name": owner_name,
+                    "cpu_request_cores": cpu_request,
+                    "cpu_limit_cores": cpu_limit,
+                    "memory_request_gb": memory_request,
+                    "memory_limit_gb": memory_limit,
+                    "cpu_metric_mode": "cpu_usage/cpu_request" if cpu_request else "cpu_usage/cpu_limit" if cpu_limit else "cpu_usage_cores",
+                    "memory_metric_mode": "memory_working_set/memory_limit" if memory_limit else "memory_working_set/memory_request" if memory_request else "memory_working_set_gb",
+                },
+                "metrics": {
+                    "cpu": {"timestamps": idx_list, "values": cpu.astype(float).tolist()},
+                    "memory": {"timestamps": idx_list, "values": memory.astype(float).tolist()},
+                },
+                "data_quality": {
+                    "cpu": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                    "memory": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                },
+            }
+        )
+    return out
+
+
+def mock_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
+    if resources <= 1:
+        return _mock_vm_provider(resources=resources, n=n, freq=freq)
+    pod_count = max(1, resources // 3)
+    vm_count = max(1, resources - pod_count)
+    return [
+        *_mock_vm_provider(resources=vm_count, n=n, freq=freq),
+        *_mock_k8s_pod_provider(resources=pod_count, n=n, freq=freq),
+    ]
+
+
 if __name__ == "__main__":
     # 示例：生成 5 个 resources，n=240，频率按小时
     items = mock_provider(resources=5, n=240, freq="h")
@@ -226,3 +304,4 @@ if __name__ == "__main__":
     print("first resource keys:", items[0].keys())
     print("first metric timestamps[0]:", items[0]["metrics"]["cpu"]["timestamps"][0])
     # print(items)
+

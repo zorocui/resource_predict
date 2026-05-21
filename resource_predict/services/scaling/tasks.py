@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -155,8 +155,8 @@ def _run_task(task_id: str, resource: Dict[str, Any]) -> None:
         task.get("mode", "-"),
     )
     try:
-        vm_spec = resource.get("vm_spec", {}) if isinstance(resource, dict) else {}
-        cluster = str(vm_spec.get("cluster", "")).strip() if isinstance(vm_spec, dict) else ""
+        spec = resource.get("spec", {}) if isinstance(resource, dict) else {}
+        cluster = str(spec.get("cluster", "")).strip() if isinstance(spec, dict) else ""
         cluster_cfg = get_cluster_config(cluster)
         task = get_task(task_id) or task
         mode = str(task.get("mode", "dry_run"))
@@ -421,7 +421,7 @@ def _run_manual_confirm(task_id: str) -> None:
             local_update = apply_scaling_success_snapshot(
                 SimpleNamespace(
                     resource_id=plan_obj.get("resource_id"),
-                    target_spec=plan_obj.get("target_vm_spec", {}),
+                    target_spec=plan_obj.get("target_spec", {}),
                     details=plan_obj.get("details", {}),
                 )
             )
@@ -513,3 +513,4 @@ def _trim_for_log(value: Any, *, limit: int = 1200) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "...<truncated>"
+

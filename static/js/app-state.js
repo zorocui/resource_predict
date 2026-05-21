@@ -9,6 +9,10 @@
     labelMap: { arima: "ARIMA", sarima: "SARIMA", prophet: "Prophet" },
     colorMap: { arima: "#60a5fa", sarima: "#34d399", prophet: "#f59e0b" },
     metricTitleMap: { cpu: "CPU", memory: "内存", disk: "硬盘" },
+    viewMetricMap: {
+      openstack_vm: ["cpu", "memory", "disk"],
+      k8s_pod: ["cpu", "memory"],
+    },
     rowsRoot: document.getElementById("rows-root"),
     rowTemplate: document.getElementById("row-template"),
     summaryText: document.getElementById("summary-text"),
@@ -26,6 +30,7 @@
     sumHold: document.getElementById("sum-hold"),
     sumMixed: document.getElementById("sum-mixed"),
     sumTotal: document.getElementById("sum-total"),
+    viewTabs: Array.from(document.querySelectorAll("[data-resource-type-tab]")),
     actionCards: Array.from(document.querySelectorAll("[data-action-filter]")),
     chartModalEl: document.getElementById("chart-modal"),
     chartModalTitleEl: document.getElementById("chart-modal-title"),
@@ -46,6 +51,7 @@
       total: 0,
       q: "",
       actionFilter: "",
+      resourceType: "openstack_vm",
     },
   };
 })();

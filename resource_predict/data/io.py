@@ -1,7 +1,7 @@
-"""
+﻿"""
 原始监控数据与预测产物的读写、合并。
 
-- raw_data.json：仅保存观测序列（resource_id / vm_spec / metrics），可长期固定。
+- raw_data.json：仅保存观测序列（resource_id / spec / metrics），可长期固定。
 - details 分片：保存 charts_forecast（无 y_train/y_test），重新预测时只覆盖这部分。
 - API 层将二者合并为前端所需的完整 charts。
 """
@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from resource_predict.resource_types import metric_names_for_resource, resource_type_of
 
 RAW_SCHEMA_VERSION = 1
 
@@ -129,24 +131,23 @@ def _series_to_lists(s: pd.Series) -> List[float]:
 
 def prepared_dict_to_raw_record(p: Dict[str, Any]) -> Dict[str, Any]:
     """将内部 prepared_data 一项转为可 JSON 序列化的原始记录。"""
-    return {
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for metric in metric_names_for_resource(p):
+        s = p.get(metric)
+        if isinstance(s, pd.Series):
+            metrics[metric] = {
+                "timestamps": _timestamps_ms_from_index(s.index),
+                "values": _series_to_lists(s),
+            }
+    rec: Dict[str, Any] = {
         "resource_id": str(p["resource_id"]),
-        "vm_spec": p.get("vm_spec", {}) if isinstance(p.get("vm_spec"), dict) else {},
-        "metrics": {
-            "cpu": {
-                "timestamps": _timestamps_ms_from_index(p["cpu"].index),
-                "values": _series_to_lists(p["cpu"]),
-            },
-            "memory": {
-                "timestamps": _timestamps_ms_from_index(p["memory"].index),
-                "values": _series_to_lists(p["memory"]),
-            },
-            "disk": {
-                "timestamps": _timestamps_ms_from_index(p["disk"].index),
-                "values": _series_to_lists(p["disk"]),
-            },
-        },
+        "spec": p.get("spec", {}) if isinstance(p.get("spec"), dict) else {},
+        "resource_type": resource_type_of(p),
+        "metrics": metrics,
     }
+    if isinstance(p.get("data_quality"), dict):
+        rec["data_quality"] = p["data_quality"]
+    return rec
 
 
 def write_raw_dataset(path: Path, prepared_resources: List[Dict[str, Any]], *, freq: str) -> None:
@@ -179,15 +180,20 @@ def read_raw_dataset(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         metrics = rec.get("metrics", {})
         if not isinstance(metrics, dict):
             raise ValueError(f"{rid} 的 metrics 必须为 dict")
-        prepared.append(
-            {
-                "resource_id": str(rid),
-                "vm_spec": rec.get("vm_spec", {}) if isinstance(rec.get("vm_spec"), dict) else {},
-                "cpu": coerce_metric_series(metrics.get("cpu"), "cpu"),
-                "memory": coerce_metric_series(metrics.get("memory"), "memory"),
-                "disk": coerce_metric_series(metrics.get("disk"), "disk"),
-            }
-        )
+        item: Dict[str, Any] = {
+            "resource_id": str(rid),
+            "spec": rec.get("spec", {}) if isinstance(rec.get("spec"), dict) else {},
+        }
+        resource_type = str(rec.get("resource_type") or "")
+        if resource_type:
+            item["resource_type"] = resource_type
+        if isinstance(rec.get("data_quality"), dict):
+            item["data_quality"] = rec["data_quality"]
+        for metric in metric_names_for_resource(item):
+            if metric not in metrics:
+                raise ValueError(f"{rid} 缺少 {metric} 指标")
+            item[metric] = coerce_metric_series(metrics.get(metric), metric)
+        prepared.append(item)
     return prepared, meta if isinstance(meta, dict) else {}
 
 
@@ -221,11 +227,11 @@ def merge_charts_into_detail(
         return detail
 
     out = {**detail}
-    if isinstance(raw.get("vm_spec"), dict) and raw["vm_spec"]:
-        out["vm_spec"] = raw["vm_spec"]
+    if isinstance(raw.get("spec"), dict) and raw["spec"]:
+        out["spec"] = raw["spec"]
 
     merged_charts: Dict[str, Any] = {}
-    for kind in ("cpu", "memory", "disk"):
+    for kind in metric_names_for_resource(raw):
         y_full = raw.get(kind)
         if not isinstance(y_full, pd.Series) or y_full.empty:
             continue
@@ -258,3 +264,4 @@ def merge_manifest_resources(
     test_size: int,
 ) -> List[Dict[str, Any]]:
     return [merge_charts_into_detail(dict(x), raw_by_id, test_size=test_size) for x in resources]
+

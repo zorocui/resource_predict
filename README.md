@@ -1,102 +1,143 @@
 ﻿# 云资源使用预测与扩缩容建议
 
-本项目用于云资源（虚拟机）的 CPU、内存、硬盘时序预测。系统会对每个指标独立训练和评估预测模型，按 RMSE 选择最佳模型，并基于未来负载窗口给出扩容、缩容或保持建议。
+本项目用于云资源使用率分析、时间序列预测和扩缩容建议生成。当前支持两类主视图：
 
-项目支持离线生成预测结果，也支持通过接口推送增量监控数据。增量更新时会合并到 `raw_data.json`，并尽量只对发生变化的资源和指标重新预测。
+- **VM 资源**：以虚拟机为对象，预测 CPU、内存、硬盘，并给出目标规格建议。
+- **K8S Pod 负载**：以 Pod 容器为对象，接入 kube-prometheus 的 CPU、内存监控数据，给出分析建议，不自动执行 Pod 调配。
+
+系统采用“原始监控数据”和“预测产物”分层设计：`raw_data.json` 保存观测序列，`summary_index.json` 与 `details/` 保存预测结果，前端通过 API 合并展示。
+
+---
 
 ## 目录
 
 | 章节 | 说明 |
 | --- | --- |
-| [1. 功能概览](#1-功能概览) | 能力一览 |
-| [2. 快速开始](#2-快速开始) | 安装、运行、生成预测 |
-| [3. 项目结构](#3-项目结构) | 目录与导入约定 |
-| [4. 数据与预测](#4-数据与预测) | 架构、全量/增量、产物、扩缩容建议 |
-| [5. API 参考](#5-api-参考) | HTTP 接口与增量数据格式 |
-| [6. 资源调配](#6-资源调配) | 预检、执行、OpenStack/K8S |
-| [7. 配置与运维](#7-配置与运维) | 配置项、日志、数据接入 |
-| [8. 常见问题](#8-常见问题) | 排错与维护建议 |
+| [1. 功能概览](#1-功能概览) | VM、K8S Pod、预测、前端、调配能力 |
+| [2. 快速开始](#2-快速开始) | 本地运行、预测生成、Web 启动 |
+| [3. 项目结构](#3-项目结构) | 目录说明与主要模块 |
+| [4. 数据流与产物](#4-数据流与产物) | 数据流图、产物职责、全量/增量流程 |
+| [5. 资源类型与数据模型](#5-资源类型与数据模型) | VM 与 K8S Pod 的输入格式和建议结构 |
+| [6. K8S Pod 真实环境接入](#6-k8s-pod-真实环境接入) | kube-prometheus 接入步骤 |
+| [7. API 参考](#7-api-参考) | 列表、详情、更新、调配 API |
+| [8. 资源调配](#8-资源调配) | OpenStack/K8S 调配预检与执行 |
+| [9. 配置与运维](#9-配置与运维) | 配置项、日志、运行建议 |
+| [10. 常见问题](#10-常见问题) | 排错与维护建议 |
 
 ---
 
 ## 1. 功能概览
 
-- **多指标预测**：每个资源包含 `cpu / memory / disk` 三条时序。
+- **双主视图**：前端提供“VM资源”和“K8S Pod负载”两个主视图。
+- **多指标预测**：VM 支持 `cpu / memory / disk`；K8S Pod v1 支持 `cpu / memory`。
 - **自动选模**：支持 ARIMA、SARIMA、Prophet，按测试集 RMSE 选择最佳模型。
 - **数据分层**：`raw_data.json` 存观测数据，`details/` 存预测曲线。
-- **增量更新**：`POST /api/update-data` 立即返回 `202`，后台合并并重预测。
-- **指标级重预测**：仅更新 CPU 时，保留 memory/disk 旧预测并重建扩缩容建议。
-- **扩缩容建议**：输出 `action / confidence / reason / target_vm_spec / stats`。
-- **前端展示**：资源列表、筛选排序、详情图表、紧迫度与置信度说明。
-- **调配执行**：OpenStack / K8S 预检与执行（见 [6. 资源调配](#6-资源调配)）。
-- **稳定写入**：关键 JSON 临时文件 + 原子替换，降低损坏风险。
+- **增量更新**：`POST /api/update-data` 或 `POST /api/upsert-data` 接收监控增量，后台合并并重预测。
+- **指标级重预测**：仅更新某个指标时，可保留其他指标旧预测并重建建议。
+- **VM 扩缩容建议**：输出 `action / confidence / reason / target_spec / stats`。
+- **K8S Pod 分析建议**：输出 `scale_out_candidate / scale_in_candidate / hold / insufficient_data`，仅分析，不自动执行调配。
+- **调配执行**：已有 OpenStack VM resize 和 K8S workload requests/limits 调配入口；Pod 视图 v1 不接入执行。
+- **稳定写入**：关键 JSON 使用临时文件 + 原子替换，降低写坏风险。
 
 ---
 
 ## 2. 快速开始
 
-建议使用 **Python 3.10+**。
+建议使用项目虚拟环境：
 
-```bash
-pip install -r requirements.txt
-python generate_images.py    # 全量生成预测产物
-python app.py                # 启动 Web
+```powershell
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-浏览器访问 `http://127.0.0.1:5000`。首次运行前 `outputs/` 为空，需先执行 `generate_images.py`。
+`PYTHONUTF8=1` 建议保留。Windows 中文路径下，Prophet/CmdStanPy 可能因默认 GBK 解码报错。
 
-### 2.1 预测命令
+### 2.1 生成 VM 演示数据
 
-| 命令 | 说明 |
-| --- | --- |
-| `python generate_images.py` | 全量：生成 raw + 预测产物 |
-| `python generate_images.py predict` | 仅基于已有 `raw_data.json` 重预测 |
-
-代码调用：
-
-```python
-from resource_predict.pipeline import generate_all_images, generate_predictions_only
-
-generate_all_images(data_provider=provider)
-generate_predictions_only()
+```powershell
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe generate_images.py
 ```
 
-根目录 `generate_images.py` 为 CLI 兼容入口，内部转发至 `resource_predict.pipeline`。
+仅基于已有 `outputs/raw_data.json` 重算预测：
+
+```powershell
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe generate_images.py predict
+```
+
+### 2.2 生成 K8S Pod 数据
+
+需要先配置 Prometheus 地址，详见 [6. K8S Pod 真实环境接入](#6-k8s-pod-真实环境接入)。该命令默认使用 upsert 模式，会合并到现有 `raw_data.json`，不会覆盖已有 VM。
+
+```powershell
+$env:K8S_PROMETHEUS_URL="http://你的-prometheus:9090"
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe generate_k8s_pods.py
+```
+
+### 2.3 启动 Web
+
+```powershell
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe app.py
+```
+
+访问：
+
+```text
+http://127.0.0.1:5000
+```
+
+顶部可切换：
+
+- `VM资源`
+- `K8S Pod负载`
+
+---
 
 ## 3. 项目结构
 
 ```text
-resource_predict/                 # 仓库根目录
-├── app.py                        # Web 入口
-├── generate_images.py            # 预测 CLI
-├── deploy/                       # 集群配置（clusters.json，勿提交 Git）
-├── resource_predict/             # 主 Python 包
-│   ├── settings.py
-│   ├── core/                     # decision、forecasting
-│   ├── data/                     # io、updater
-│   ├── providers/                # mock 数据源
-│   ├── pipeline/                 # 预测批处理
-│   ├── api/                      # HTTP 路由
-│   └── services/                 # store、scaling、urgency
+resource_predict/
+├── app.py                         # Flask Web 入口
+├── generate_images.py             # VM/通用预测 CLI
+├── generate_k8s_pods.py           # K8S Pod Prometheus 接入 CLI
+├── deploy/
+│   └── clusters.example.json      # 调配控制节点配置示例
+├── resource_predict/
+│   ├── settings.py                # 全局配置
+│   ├── resource_types.py          # resource_type 与指标集合
+│   ├── core/
+│   │   ├── forecasting.py         # ARIMA/SARIMA/Prophet
+│   │   ├── decision.py            # VM 扩缩容建议
+│   │   └── k8s_pod_decision.py    # K8S Pod 分析建议
+│   ├── data/
+│   │   ├── io.py                  # raw_data 读写与图表合并
+│   │   └── updater.py             # 增量合并与后台重预测
+│   ├── providers/
+│   │   ├── mock.py                # 演示数据
+│   │   └── k8s_prometheus.py      # kube-prometheus provider
+│   ├── pipeline/
+│   │   ├── run.py                 # 全量/仅预测主流程
+│   │   ├── prepare.py             # provider 数据标准化
+│   │   ├── partial.py             # 指标级增量合并
+│   │   └── write_outputs.py       # summary/details/manifest 写出
+│   ├── api/                       # Flask API 路由
+│   └── services/
+│       ├── store/                 # 读取 summary/details/raw
+│       ├── scaling/               # 调配任务
+│       └── urgency.py             # 列表紧迫度排序
 ├── templates/
 ├── static/
-├── outputs/                      # 运行时产物（gitignore）
-├── docs/
-└── requirements.txt
+└── outputs/                       # 运行时产物，已被 .gitignore 忽略
 ```
 
-业务代码统一使用 `resource_predict.*` 导入：
-
-```python
-from resource_predict.settings import settings
-from resource_predict.pipeline import generate_predictions_only
-```
+业务代码统一使用 `resource_predict.*` 导入。
 
 ---
 
-## 4. 数据与预测
-
-系统把**原始观测**与**预测产物**分开：训练与预测只依赖 `raw_data.json`；列表与图表由 `summary_index.json`、`details/` 与 raw 在 API 层合并后返回前端。
+## 4. 数据流与产物
 
 ### 4.1 总体架构
 
@@ -104,6 +145,7 @@ from resource_predict.pipeline import generate_predictions_only
 flowchart TB
     subgraph ingest [数据接入]
         DP["data_provider / mock 全量"]
+        K8S["k8s_prometheus provider"]
         Push["POST /api/update-data 或 POST /api/upsert-data"]
         Pull["POST /api/update-trigger"]
     end
@@ -113,15 +155,16 @@ flowchart TB
     end
 
     subgraph pipeline [resource_predict.pipeline]
-        Prep["prepare"]
-        Pred["并行预测 cpu / memory / disk"]
-        Dec["decision: scaling_advice"]
+        Prep["prepare / read_raw_dataset"]
+        Pred["按资源和指标并行预测"]
+        DecVM["VM decision"]
+        DecPod["K8S Pod decision"]
         WOut["write_outputs"]
     end
 
     subgraph store_out [预测产物层]
         Sum["summary_index.json"]
-        Det["details/part json"]
+        Det["details/part-*.json"]
         Man["manifest.json"]
         Stats["generation_stats.json"]
     end
@@ -129,16 +172,19 @@ flowchart TB
     subgraph web [Web]
         API["resource_predict.api"]
         FS["ForecastStore"]
-        UI["templates + ECharts"]
+        UI["VM资源 / K8S Pod负载"]
     end
 
     DP --> Prep
-    Prep --> Raw
+    K8S --> Prep
     Push --> Raw
     Pull --> Raw
+    Prep --> Raw
     Raw --> Pred
-    Pred --> Dec
-    Dec --> WOut
+    Pred --> DecVM
+    Pred --> DecPod
+    DecVM --> WOut
+    DecPod --> WOut
     WOut --> Sum
     WOut --> Det
     WOut --> Man
@@ -154,29 +200,30 @@ flowchart TB
 
 | 文件 | 写入方 | 读取方 | 内容 |
 | --- | --- | --- | --- |
-| `raw_data.json` | 全量 / updater | pipeline、ForecastStore | 观测序列 + vm_spec |
-| `summary_index.json` | pipeline | 列表 API | 摘要、detail_ref、scaling_advice |
-| `details/part-*.json` | pipeline | 详情 API | 预测曲线、RMSE、best_method |
-| `manifest.json` | pipeline | 兼容回退 | 含完整 charts 的旧结构 |
-| `generation_stats.json` | pipeline | 运维 | 最近一次批处理统计 |
-| `scaling_tasks.json` | 调配任务 | 调配 API | 预检/执行任务与执行结果 |
-| `resource_predict.log` | 运行时 | 运维 | 含调配 SSH、flavor 日志 |
+| `outputs/raw_data.json` | 全量生成 / updater / K8S provider | pipeline、ForecastStore | 原始观测序列、资源元数据、数据质量 |
+| `outputs/summary_index.json` | pipeline | 列表 API | 资源摘要、建议、紧迫度排序依据、详情引用 |
+| `outputs/details/part-*.json` | pipeline | 详情 API | 预测曲线、RMSE、best_method |
+| `outputs/manifest.json` | pipeline | 兼容回退 | 合并后的旧结构 |
+| `outputs/generation_stats.json` | pipeline | 运维 | 最近一次生成统计 |
+| `outputs/scaling_tasks.json` | 调配任务 | 调配 API | 预检/执行任务记录 |
+| `outputs/resource_predict.log` | 运行时 | 运维 | 预测、更新、调配日志 |
 
-`details` 仅存 `charts_forecast`；完整 `charts`（含 `y_train`）由 `ForecastStore` 读取时与 raw 合并。
+`details` 只保存预测曲线；完整图表数据由 `ForecastStore` 读取 `raw_data.json` 后与预测结果合并。
 
 ### 4.3 全量生成
 
 ```mermaid
 flowchart LR
-    A[data_provider] --> B[prepare]
-    B --> C[raw_data.json]
-    C --> D[按资源并行预测]
-    D --> E[RMSE 选模]
-    E --> F[build_scaling_advice]
-    F --> G[summary + details + manifest]
+    A["data_provider"] --> B["prepare"]
+    B --> C["raw_data.json"]
+    C --> D["按资源并行预测"]
+    D --> E["RMSE 选模"]
+    E --> F{"resource_type"}
+    F -->|openstack_vm / vm| G["build_scaling_advice"]
+    F -->|k8s_pod| H["build_k8s_pod_advice"]
+    G --> I["summary + details + manifest"]
+    H --> I
 ```
-
-要点：每资源三条序列，使用率 **[0, 1]** 小数。
 
 ### 4.4 增量更新
 
@@ -200,64 +247,381 @@ sequenceDiagram
     API-->>C: merging / predicting / idle
 ```
 
-Pull 模式：`POST /api/update-trigger` 经 `IncrementalProvider` 拉取后，进入相同合并与重预测流程。
+规则：
 
-**增量预测策略**（补充规则）：
-
-- 记录本次更新的 `resource_id` 及变更指标（如仅 `cpu`）。
-- 有旧产物时只重拟合变更指标，其余保留；再对受影响资源重算 `scaling_advice`。
-- 可选 `sliding_window` 裁旧点；`display_window_points` 仅影响图表展示。
+- `update-data` 只更新已有资源。
+- `upsert-data` 可插入新资源。
+- 更新时记录本次变化的 `resource_id` 和指标名。
+- 若有旧预测产物，会尽量只重算变化指标，再重建建议。
+- `display_window_points` 只影响前端展示，不裁剪训练数据。
 
 ### 4.5 前端读取详情
 
 ```mermaid
 flowchart TD
-    A[GET /api/resources] --> B[summary_index]
-    C[GET /api/resources/id] --> D[details 分片]
-    D --> F[raw_data 合并 charts]
-    F --> G[apply_display_window]
-    G --> H[返回 ECharts JSON]
+    A["GET /api/resources"] --> B["summary_index"]
+    C["GET /api/resources/<id>"] --> D["details 分片"]
+    D --> E["raw_data 合并 y_train/y_test"]
+    E --> F["apply_display_window"]
+    F --> G["返回 ECharts JSON"]
 ```
 
-更新进行中若资源处于 `writing_raw` / `predicting`，详情接口返回 **202 + prediction_pending**。
-
-### 4.6 扩缩容建议与紧迫度
-
-- 扩缩容建议：`resource_predict/core/decision.py`（`scaling_advice`、`target_vm_spec`）。
-- 列表紧迫度：`resource_predict/services/urgency.py`。
-
-列表上的「扩容 / 缩容 / 保持」来自预测建议；**实际改配**见 [6. 资源调配](#6-资源调配)。
-
-### 4.7 并行与性能
-
-资源级、指标级两层并行；`generate_images.py` 自动选择计划。配置见 `settings.py` 的 `GenerationConfig`（`max_workers`、`parallel_metrics` 等）。
+更新进行中若资源处于 `writing_raw` / `predicting`，详情接口返回 `202 + prediction_pending`。
 
 ---
 
-## 5. API 参考
+## 5. 资源类型与数据模型
 
-### 5.1 接口一览
+### 5.1 支持的资源类型
+
+| resource_type | 主视图 | 指标 | 建议类型 | 是否执行调配 |
+| --- | --- | --- | --- | --- |
+| `openstack_vm` / 默认 VM | VM资源 | `cpu / memory / disk` | `scale_out / scale_in / hold` | 支持 OpenStack resize |
+| `k8s_container` | VM资源兼容调配入口 | `cpu / memory / disk` 兼容结构 | `scale_out / scale_in / hold` | 支持 workload requests/limits |
+| `k8s_pod` | K8S Pod负载 | `cpu / memory` | `scale_out_candidate / scale_in_candidate / hold / insufficient_data` | v1 不执行 |
+
+### 5.2 VM 数据格式
+
+`data_provider` 返回 list，每项格式：
+
+```python
+{
+    "resource_id": "vm-001",
+    "resource_type": "openstack_vm",
+    "spec": {
+        "cluster": "cluster-openstack-a",
+        "ip": "10.0.10.11",
+        "instance_id": "server-uuid",
+        "cpu_cores": 4,
+        "memory_gb": 16,
+        "disk_gb": 100
+    },
+    "metrics": {
+        "cpu": {"timestamps": [1730000000000], "values": [0.42]},
+        "memory": {"timestamps": [1730000000000], "values": [0.58]},
+        "disk": {"timestamps": [1730000000000], "values": [0.32]}
+    }
+}
+```
+
+字段规则：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `resource_id` | 是 | 资源唯一 ID |
+| `resource_type` | 建议 | 默认按 VM 处理 |
+| `metrics.cpu/memory/disk` | 是 | VM 三个指标都需要完整序列 |
+| `timestamps` | 是 | 秒/毫秒 Unix 时间戳、ISO 字符串或 pandas 可解析值 |
+| `values` | 是 | 使用率小数，通常为 `[0, 1]`，部分真实口径可超过 1 |
+| `spec.cluster` | 调配必填 | 对应 `deploy/clusters.json` 的集群 key |
+| `spec.instance_id/server_id` | OpenStack 调配必填 | OpenStack server ID |
+| `spec.cpu_cores/memory_gb/disk_gb` | 调配建议必填 | 当前规格 |
+
+### 5.3 K8S Pod 数据格式
+
+K8S Pod provider 会生成：
+
+```python
+{
+    "resource_id": "k8s:cluster-k8s-a:default:demo-pod:main",
+    "resource_type": "k8s_pod",
+    "spec": {
+        "cluster": "cluster-k8s-a",
+        "namespace": "default",
+        "pod": "demo-pod",
+        "container": "main",
+        "node": "node-01",
+        "cpu_request_cores": 1.0,
+        "cpu_limit_cores": 2.0,
+        "memory_request_gb": 1.0,
+        "memory_limit_gb": 2.0,
+        "cpu_metric_mode": "ratio",
+        "memory_metric_mode": "ratio"
+    },
+    "metrics": {
+        "cpu": {"timestamps": [1730000000000], "values": [0.64]},
+        "memory": {"timestamps": [1730000000000], "values": [0.52]}
+    },
+    "data_quality": {
+        "cpu": {"level": "good", "points": 2016, "missing_ratio": 0.01},
+        "memory": {"level": "good", "points": 2016, "missing_ratio": 0.01}
+    }
+}
+```
+
+口径：
+
+| 指标 | 优先口径 | 兜底 |
+| --- | --- | --- |
+| CPU | `cpu_usage_cores / cpu_request_cores` | 无 request 时用 limit；都没有则展示原始 cores |
+| 内存 | `working_set_gb / memory_limit_gb` | 无 limit 时用 request；都没有则展示原始 GB |
+
+Pod 数据质量会影响建议置信度。缺点严重或缺少 request/limit 时，系统会偏向 `insufficient_data` 或 `hold`。
+
+---
+
+## 6. K8S Pod 真实环境接入
+
+你的内网环境是 **K8S 1.14 + kube-prometheus**。推荐通过 Prometheus HTTP API 拉取数据。
+
+### 6.1 接入数据流
+
+```mermaid
+flowchart LR
+    K8S["K8S 1.14 集群"] --> KP["kube-prometheus"]
+    KP --> P["Prometheus HTTP API"]
+    P --> Provider["k8s_pod_prometheus_provider"]
+    Provider --> Raw["outputs/raw_data.json"]
+    Raw --> Pipeline["预测与 Pod 分析建议"]
+    Pipeline --> UI["K8S Pod负载页"]
+```
+
+### 6.2 确认 Prometheus 地址
+
+在 K8S 控制节点或能访问集群内网的机器上执行：
+
+```bash
+kubectl -n monitoring get svc
+kubectl -n monitoring get pod
+```
+
+常见 Prometheus Service：
+
+| 名称 | 说明 |
+| --- | --- |
+| `prometheus-k8s` | kube-prometheus 常见名称 |
+| `prometheus-operated` | Prometheus Operator 创建的 headless Service |
+| `kube-prometheus-stack-prometheus` | Helm chart 常见名称 |
+
+如果 Service 是 `prometheus-k8s`，端口是 `9090`，集群内地址通常为：
+
+```text
+http://prometheus-k8s.monitoring.svc:9090
+```
+
+如果本项目运行在集群外，可先用端口转发验证：
+
+```bash
+kubectl -n monitoring port-forward svc/prometheus-k8s 9090:9090
+```
+
+此时本项目机器访问：
+
+```text
+http://127.0.0.1:9090
+```
+
+生产环境可改为内网 LB、NodePort、Nginx 反代或堡垒机代理。要求只有一个：本项目机器能访问 `http://地址:端口/api/v1/query`。
+
+### 6.3 验证 Prometheus 指标
+
+先在 Prometheus UI 中执行以下查询，确认有数据。
+
+CPU 使用量：
+
+```text
+rate(container_cpu_usage_seconds_total{container!="",pod!=""}[5m])
+```
+
+内存使用量：
+
+```text
+container_memory_working_set_bytes{container!="",pod!="",container!=""}
+```
+
+K8S 1.14 常见 request/limit 指标：
+
+```text
+kube_pod_container_resource_requests_cpu_cores
+kube_pod_container_resource_limits_cpu_cores
+kube_pod_container_resource_requests_memory_bytes
+kube_pod_container_resource_limits_memory_bytes
+```
+
+部分 kube-state-metrics 版本使用新格式，本项目也兼容：
+
+```text
+kube_pod_container_resource_requests{resource="cpu"}
+kube_pod_container_resource_limits{resource="cpu"}
+kube_pod_container_resource_requests{resource="memory"}
+kube_pod_container_resource_limits{resource="memory"}
+```
+
+确认返回标签至少包含：
+
+| 标签 | 用途 |
+| --- | --- |
+| `namespace` | 命名空间 |
+| `pod` | Pod 名称 |
+| `container` | 容器名称 |
+| `node` | 可选，前端展示所在节点 |
+
+### 6.4 配置 Prometheus 访问
+
+方式 A：环境变量，适合首次验证。
+
+```powershell
+$env:K8S_PROMETHEUS_URL="http://127.0.0.1:9090"
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe generate_k8s_pods.py
+```
+
+内网地址示例：
+
+```powershell
+$env:K8S_PROMETHEUS_URL="http://prometheus-k8s.monitoring.svc:9090"
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe generate_k8s_pods.py
+```
+
+如需鉴权：
+
+```powershell
+$env:K8S_PROMETHEUS_BEARER_TOKEN="xxxxx"
+# 或 Basic Auth，值为 base64 后的 user:password
+$env:K8S_PROMETHEUS_BASIC_AUTH="dXNlcjpwYXNz"
+```
+
+方式 B：固定写入 `resource_predict/settings.py`。
+
+```python
+@dataclass(frozen=True)
+class K8SPrometheusConfig:
+    prometheus_url: str = "http://prometheus-k8s.monitoring.svc:9090"
+    cluster: str = "cluster-k8s-a"
+    history_days: int = 7
+    step_seconds: int = 300
+    namespace_regex: str = ""
+    request_timeout_seconds: int = 30
+```
+
+| 配置 | 说明 |
+| --- | --- |
+| `prometheus_url` / `K8S_PROMETHEUS_URL` | Prometheus HTTP API 地址 |
+| `cluster` | 集群标识，写入 `resource_id` |
+| `history_days` | 默认拉取最近 7 天 |
+| `step_seconds` | 默认 300 秒，即 5 分钟 |
+| `namespace_regex` | 可选，只接入部分命名空间，如 `default|prod` |
+| `request_timeout_seconds` | HTTP 查询超时 |
+
+### 6.5 首次生成与查看
+
+推荐用默认 upsert 模式接入。它会先拉取 Prometheus Pod 数据，再合并到现有 `outputs/raw_data.json`：
+
+- 已有 VM 资源会保留。
+- 已有 Pod 会按 `resource_id` 更新 `spec/data_quality`，并合并 `cpu/memory` 时间序列。
+- 不存在的 Pod 会新增。
+- 写入前会自动备份当前 raw 到 `outputs/backups/`。
+- 如果 `raw_data.json` 不存在，则会初始化一个仅包含 K8S Pod 的 raw。
+
+执行：
+
+```powershell
+$env:K8S_PROMETHEUS_URL="http://你的-prometheus:9090"
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe generate_k8s_pods.py
+```
+
+可选模式：
+
+```powershell
+# 默认：合并 Pod，不覆盖 VM
+.\.venv\Scripts\python.exe generate_k8s_pods.py --mode upsert
+
+# 仅替换已有 K8S Pod 集合，VM 保留
+.\.venv\Scripts\python.exe generate_k8s_pods.py --mode replace-k8s
+
+# 初始化 raw；raw 已存在时会先备份
+.\.venv\Scripts\python.exe generate_k8s_pods.py --mode init
+```
+
+不要用 `generate_all_images(data_provider=k8s_pod_prometheus_provider)` 直接接入生产 Pod，因为它属于全量生成，会重写 raw。真实环境推荐使用 `generate_k8s_pods.py` 默认 upsert，或使用 `/api/upsert-data`。
+
+启动 Web：
+
+```powershell
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe app.py
+```
+
+打开：
+
+```text
+http://127.0.0.1:5000
+```
+
+切到 **K8S Pod负载**。如果列表为空，先看 [10. 常见问题](#10-常见问题)。
+
+### 6.6 小范围验证建议
+
+首次接入不要直接拉全量集群，建议先限制命名空间：
+
+```python
+namespace_regex: str = "default"
+```
+
+验证顺序：
+
+1. Prometheus UI 中确认 CPU、内存、request、limit 查询均有数据。
+2. 运行 `generate_k8s_pods.py`。
+3. 打开 `outputs/raw_data.json`，确认存在 `resource_type: "k8s_pod"`。
+4. 启动 Web，切到“K8S Pod负载”。
+5. 任选一个 Pod，与 Prometheus UI 曲线对比量级。
+
+### 6.7 无法直连 Prometheus 时
+
+如果本项目机器不能访问 Prometheus，可以由内网定时任务查询 Prometheus，再按 `k8s_pod` 数据结构推送：
+
+```text
+POST /api/upsert-data
+```
+
+这种方式适合网络隔离严格、只能单向推送数据的环境。
+
+---
+
+## 7. API 参考
+
+### 7.1 资源与详情
 
 | 路径 | 说明 |
 | --- | --- |
 | `GET /` | 首页 |
-| `GET /api/resources` | 资源列表（搜索、筛选、分页、排序） |
+| `GET /api/resources` | 资源列表 |
 | `GET /api/resources/details?ids=a,b` | 批量详情 |
 | `GET /api/resources/<id>` | 单资源详情 |
-| `GET /api/resources/advice-summary` | 扩缩容建议统计 |
+| `GET /api/resources/advice-summary` | 建议统计 |
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `resource_type=openstack_vm` | 只看 VM |
+| `resource_type=k8s_pod` | 只看 K8S Pod |
+| `q=xxx` | 搜索资源 ID、IP、集群、namespace、pod、container、node |
+| `action=scale_out` | 筛选 VM 扩容 |
+| `action=scale_out_candidate` | 筛选 Pod 扩容候选 |
+| `page/page_size` | 分页 |
+| `top_n` | TopN |
+| `sort_by=urgency_score` | 按紧迫度排序 |
+
+示例：
+
+```text
+GET /api/resources?resource_type=k8s_pod&page=1&page_size=20
+GET /api/resources?resource_type=openstack_vm&action=scale_out
+```
+
+### 7.2 数据更新
+
+| 路径 | 说明 |
+| --- | --- |
 | `GET /api/update-status` | 后台更新状态 |
 | `POST /api/update-trigger` | Pull 增量更新 |
-| `POST /api/update-data` | Push 增量（仅更新已有资源） |
-| `POST /api/upsert-data` | Push upsert（可插入新资源） |
-| `POST /api/resources/<id>/scale` | 调配预检/执行 → [6.3](#63-调配-api) |
-| `GET /api/scaling-tasks/<task_id>` | 调配任务状态 |
-| `GET /api/resources/<id>/scaling-history` | 调配历史 |
+| `POST /api/update-data` | Push 增量，仅更新已有资源 |
+| `POST /api/upsert-data` | Push upsert，可插入新资源 |
 
-`POST /api/update-data` 合法 JSON 后立即 **202**，预测在后台执行；可轮询 `/api/update-status`。
-
-### 5.2 增量数据格式
-
-请求体为非空 JSON 数组：
+VM 增量示例：
 
 ```json
 [
@@ -272,36 +636,68 @@ flowchart TD
 ]
 ```
 
-| 规则 | 说明 |
+K8S Pod upsert 示例：
+
+```json
+[
+  {
+    "resource_id": "k8s:cluster-k8s-a:default:demo-pod:main",
+    "resource_type": "k8s_pod",
+    "spec": {
+      "cluster": "cluster-k8s-a",
+      "namespace": "default",
+      "pod": "demo-pod",
+      "container": "main",
+      "cpu_request_cores": 1,
+      "memory_limit_gb": 2
+    },
+    "metrics": {
+      "cpu": { "timestamps": [1730000000000], "values": [0.55] },
+      "memory": { "timestamps": [1730000000000], "values": [0.48] }
+    }
+  }
+]
+```
+
+规则：
+
+- 时间戳支持秒、毫秒或可解析字符串。
+- `values` 使用小数，不是百分号。
+- VM 新资源需要 `cpu/memory/disk`。
+- K8S Pod 新资源只需要 `cpu/memory`。
+- Pod 必须带顶层 `resource_type: "k8s_pod"`，否则会按 VM 默认规则校验。
+- Upsert 会合并到现有 `raw_data.json`，不会整体覆盖；写入前会自动备份。
+- 合法请求立即返回 `202`，后台重预测；轮询 `/api/update-status`。
+
+### 7.3 调配 API
+
+| 路径 | 说明 |
 | --- | --- |
-| 时间戳 | 秒/毫秒 Unix 或 pandas 可解析字符串；落盘统一为毫秒 |
-| 数值 | 0～1 使用率小数 |
-| 不更新某指标 | `timestamps` 与 `values` 均为 `[]` |
-| 有数据时 | 两数组长度必须一致 |
-| `update-data` | 仅更新 `raw_data.json` 中已存在的资源 |
-| `upsert-data` | 已存在则增量更新；新资源需 cpu/memory/disk 完整序列，建议带 `vm_spec` |
+| `POST /api/resources/<id>/scale` | 调配预检/执行 |
+| `GET /api/scaling-tasks/<task_id>` | 调配任务状态 |
+| `GET /api/resources/<id>/scaling-history` | 调配历史 |
+
+Pod 视图 v1 不展示调配按钮，不会调用调配 API。
 
 ---
 
-## 6. 资源调配
+## 8. 资源调配
 
-根据 `scaling_advice` 在集群**控制节点**生成白名单命令，支持预检（`dry_run`）或 SSH 执行（`execute`）。实现：`resource_predict/services/scaling/`；任务文件：`outputs/scaling_tasks.json`。
+调配根据 `scaling_advice` 在集群控制节点生成白名单命令，支持预检 `dry_run` 和执行 `execute`。实现位于 `resource_predict/services/scaling/`。
 
-**安全原则**：不接受前端任意 shell，仅执行后台模板拼出的命令。
-
-### 6.1 与预测的关系
+### 8.1 调配数据流
 
 ```mermaid
 flowchart LR
     Pipeline["pipeline"] --> Advice["scaling_advice"]
     Advice --> Frontend["前端预检或调配"]
-    Frontend --> Api["POST resource scale"]
+    Frontend --> Api["POST /api/resources/<id>/scale"]
     Api --> Task["后台任务"]
     Task --> Control["SSH 控制节点"]
     Control --> Command["openstack resize 或 kubectl"]
 ```
 
-### 6.2 调配流程
+### 8.2 调配流程
 
 ```mermaid
 flowchart TB
@@ -318,42 +714,13 @@ flowchart TB
     SSH --> Done["success 或 failed"]
 ```
 
-**预检 vs 执行**
-
-| 模式 | 请求 | 行为 |
-| --- | --- | --- |
-| `dry_run` | `{"mode": "dry_run"}` | 生成命令，不执行改配 |
-| `execute` | `{"mode": "execute", "confirm": true}` | 依次执行 `plan.commands` |
-
-```mermaid
-sequenceDiagram
-    participant U as 前端
-    participant API as api/scaling
-    participant T as tasks
-    participant S as SSH
-
-    U->>API: POST resource scale
-    API-->>U: 202 + task_id
-    API->>T: 后台线程
-    T->>T: build_scaling_plan
-    alt dry_run
-        T-->>U: 轮询 success
-    else execute
-        loop commands
-            T->>S: run_ssh_command
-        end
-    end
-```
-
-前端 `static/js/scaling.js` 执行前二次确认；OpenStack 无 flavor 时可传 `confirm_create_flavor`（预检不真正创建）。
-
-### 6.3 调配 API
-
-请求示例：
+请求：
 
 ```json
 { "mode": "dry_run" }
+```
 
+```json
 {
   "mode": "execute",
   "confirm": true,
@@ -361,109 +728,28 @@ sequenceDiagram
 }
 ```
 
-**任务状态**
+任务状态：
 
 | status | 含义 |
 | --- | --- |
 | `queued` | 已入队 |
 | `running` | 计划中或 SSH 执行中 |
-| `success` | 预检完成或命令全部成功 |
-| `failed` | 计划失败或某条命令非 0 退出 |
+| `waiting_confirm` | OpenStack resize 后等待确认 |
+| `confirming` | 正在确认 OpenStack resize |
+| `success` | 成功 |
+| `failed` | 失败 |
 
-同一资源同时仅允许一个 `queued` / `running` 任务（否则 **409**）。
+### 8.3 OpenStack VM
 
-### 6.4 OpenStack 与 K8S
+`resource_type=openstack_vm` 时，后台读取 OpenStack flavor 并选择合适规格：
 
-```mermaid
-flowchart TD
-    Plan["build_scaling_plan"] --> Type{"resource_type"}
-    Type -->|openstack_vm| OpenStack["cluster + instance_id"]
-    Type -->|k8s_container| K8S["cluster + namespace + workload"]
-    OpenStack --> Flavor["选择 flavor"]
-    Flavor --> Resize["openstack server resize"]
-    K8S --> Kubectl["kubectl set resources"]
-```
-
-**OpenStack flavor 策略**：
-
-- 不需要手工维护 `flavor_map`。
-- 预检/调配时，后台会 SSH 到控制节点执行 `openstack flavor list -f json` 读取 flavor。
 - 扩容：选择 CPU、内存、磁盘都不低于目标规格的最小 flavor。
 - 缩容：选择 CPU、内存不高于目标规格，且磁盘不低于当前磁盘的最大 flavor。
-- 如果没有完全匹配但存在符合策略的 flavor，会在任务结果和 `outputs/resource_predict.log` 记录实际选择的 flavor 及规格偏差。
-- 如果没有任何符合策略的 flavor，前端点击“调配”时会弹窗二次确认是否允许后台创建新 flavor。
-- 只有用户确认后，后台才会先执行 `openstack flavor create`，再执行 `openstack server resize`。
-- 当 `auto_confirm_resize=false` 时，后台执行 resize 后任务进入 `waiting_confirm`，前端显示“确认生效”按钮；点击确认成功后才会更新本地规格快照和调配建议。
-- 当 `auto_confirm_resize=true` 时，后台会等待实例进入 `VERIFY_RESIZE` 后自动执行 `openstack server resize --confirm`。
-- 点击“预检”不会真正创建 flavor，只会生成并展示计划执行的 `openstack flavor create` 命令。
+- 无合适 flavor 时，可在用户确认后自动创建 flavor。
+- 磁盘缩容不自动执行。
+- 磁盘扩容只 resize flavor，不自动处理文件系统扩容。
 
-**限制**：
-
-- 单次只调配当前点击的单个资源。
-- `hold` 建议不会创建调配任务。
-- 同一资源已有 `queued` / `running` / `waiting_confirm` / `confirming` 任务时拒绝重复提交。
-- K8S 磁盘缩容不执行。
-- OpenStack 磁盘扩容和 K8S 存储调整当前只给出 warnings，不直接处理。
-
-### 6.5 集群与 vm_spec
-
-```bash
-cp deploy/clusters.example.json deploy/clusters.json
-```
-
-要使用资源调配，预测数据源必须提供足够的 `vm_spec`，否则后台只能生成扩缩容建议，无法定位控制节点或具体资源。
-
-`data_provider` 返回值必须是非空 list，每个元素格式如下：
-
-```python
-[
-    {
-        "resource_id": "vm-001",
-        "vm_spec": {
-            "resource_type": "openstack_vm",
-            "cluster": "cluster-openstack-a",
-            "ip": "10.0.10.11",
-            "instance_id": "server-uuid",
-            "cpu_cores": 4,
-            "memory_gb": 16,
-            "disk_gb": 100
-        },
-        "metrics": {
-            "cpu": {
-                "timestamps": [1730000000000, 1730003600000],
-                "values": [0.42, 0.51]
-            },
-            "memory": {
-                "timestamps": [1730000000000, 1730003600000],
-                "values": [0.58, 0.61]
-            },
-            "disk": {
-                "timestamps": [1730000000000, 1730003600000],
-                "values": [0.32, 0.33]
-            }
-        }
-    }
-]
-```
-
-字段规则：
-
-| 字段 | 是否必填 | 说明 |
-| --- | --- | --- |
-| `resource_id` | 是 | 资源唯一 ID，前端列表、详情和调配任务都用它定位资源 |
-| `metrics.cpu/memory/disk` | 是 | 三个指标都必须提供完整历史序列 |
-| `timestamps` | 是 | 可为秒/毫秒 Unix 时间戳、pandas 可解析字符串或 `DatetimeIndex` 中的时间值 |
-| `values` | 是 | 使用率小数，建议范围 `[0, 1]` |
-| `vm_spec.cluster` | 调配必填 | 必须与 `deploy/clusters.json` 中的集群 key 一致 |
-| `vm_spec.cpu_cores` | 调配必填 | 当前 CPU 核数，用于计算目标规格和匹配 flavor |
-| `vm_spec.memory_gb` | 调配必填 | 当前内存 GB |
-| `vm_spec.disk_gb` | 调配必填 | 当前磁盘 GB；缩容时不会选择低于当前磁盘的 OpenStack flavor |
-| `vm_spec.resource_type` | 建议填写 | `openstack_vm` 或 `k8s_container`；不填时后台会按字段尝试推断 |
-| `vm_spec.ip` | 建议填写 | 前端展示和搜索使用；调配不依赖 IP |
-
-`vm_spec.cluster` 须与 `clusters.json` 的 key 一致。预检/调配时按资源类型还需提供以下字段：
-
-**OpenStack**
+OpenStack 必填：
 
 ```json
 {
@@ -476,14 +762,17 @@ cp deploy/clusters.example.json deploy/clusters.json
 }
 ```
 
-OpenStack 必填定位字段：
+### 8.4 K8S Workload
 
-| 字段 | 说明 |
-| --- | --- |
-| `instance_id` 或 `server_id` | OpenStack server ID，用于执行 `openstack server resize` |
-| `cluster` | 对应 `deploy/clusters.json` 中 `cloud_type=openstack` 的配置 |
+`resource_type=k8s_container` 时，后台生成：
 
-**K8S**
+```bash
+kubectl -n <namespace> set resources deployment/<name> -c <container> \
+  --requests=cpu=<cpu>,memory=<memory> \
+  --limits=cpu=<cpu>,memory=<memory>
+```
+
+K8S workload 必填：
 
 ```json
 {
@@ -498,96 +787,152 @@ OpenStack 必填定位字段：
 }
 ```
 
-K8S 必填定位字段：
+说明：
 
-| 字段 | 说明 |
-| --- | --- |
-| `namespace` | Kubernetes 命名空间，不填时后台默认 `default` |
-| `deployment` 或 `statefulset` | 二选一，用于定位工作负载 |
-| `container` | 可选；不填时 `kubectl set resources` 不指定容器名 |
-| `cluster` | 对应 `deploy/clusters.json` 中 `cloud_type=k8s` 的配置 |
+- `deployment` 或 `statefulset` 二选一。
+- `container` 可选；不填则 `kubectl set resources` 不指定容器。
+- K8S 存储不自动调整。
+- `k8s_pod` 当前只是分析对象，不进入调配执行。
 
-`resource_type` 可据 `instance_id/server_id` 或 `namespace + deployment/statefulset` 推断，但生产数据建议显式填写。
+### 8.5 集群配置
+
+复制配置：
+
+```bash
+cp deploy/clusters.example.json deploy/clusters.json
+```
+
+OpenStack 示例：
+
+```json
+{
+  "cluster-openstack-a": {
+    "cloud_type": "openstack",
+    "control_host": "192.168.1.10",
+    "ssh_user": "root",
+    "ssh_port": 22,
+    "ssh_key": "C:/path/to/id_rsa",
+    "openstack_rc": "/root/admin-openrc",
+    "auto_confirm_resize": false
+  }
+}
+```
+
+K8S 示例：
+
+```json
+{
+  "cluster-k8s-a": {
+    "cloud_type": "k8s",
+    "control_host": "192.168.1.20",
+    "ssh_user": "root",
+    "ssh_port": 22,
+    "ssh_key": "C:/path/to/id_rsa",
+    "kubeconfig": "/root/.kube/config",
+    "command_timeout_seconds": 300
+  }
+}
+```
 
 ---
 
-## 7. 配置与运维
+## 9. 配置与运维
 
-### 7.1 应用配置
+### 9.1 主要配置
 
-- 主配置：`resource_predict/settings.py`（`GenerationConfig`、`UpdateConfig` 等）。
-- 集群凭证：`deploy/clusters.json`（勿提交 Git）。
-- `settings.app.out_dir` 与 `settings.generation.out_dir` 须指向同一 `outputs/` 目录。
+| 配置类 | 文件 | 说明 |
+| --- | --- | --- |
+| `AppConfig` | `resource_predict/settings.py` | Web、输出目录、日志 |
+| `GenerationConfig` | `resource_predict/settings.py` | 资源数量、测试窗口、并行、分页 |
+| `ForecastConfig` | `resource_predict/settings.py` | ARIMA/SARIMA/Prophet 开关和参数 |
+| `DecisionConfig` | `resource_predict/settings.py` | VM 扩缩容阈值和紧迫度参数 |
+| `UpdateConfig` | `resource_predict/settings.py` | 增量更新、定时更新 |
+| `K8SPrometheusConfig` | `resource_predict/settings.py` | K8S Pod Prometheus 接入 |
+| `clusters.json` | `deploy/clusters.json` | 调配控制节点和 kubeconfig/openrc |
 
-`deploy/clusters.json` 由 `deploy/clusters.example.json` 复制后修改，按集群填写控制节点 SSH、云平台类型和命令参数。后台不会接受前端传入的原始 shell，只会根据资源类型和目标规格生成白名单命令。
+### 9.2 日志
 
-OpenStack 集群常用配置：
+默认日志：
 
-| 配置项 | 说明 |
-| --- | --- |
-| `cloud_type` | 固定为 `openstack` |
-| `control_host` / `ssh_user` / `ssh_port` / `ssh_key` | 控制节点 SSH 信息 |
-| `openstack_rc` | 控制节点上的 OpenStack 环境变量文件，如 `/root/admin-openrc` |
-| `auto_confirm_resize` | 是否在 resize 后自动等待 `VERIFY_RESIZE` 并执行 `openstack server resize --confirm` |
-| `resize_confirm_poll_interval_seconds` | 自动确认前查询实例状态的间隔；默认 15 秒，最小 5 秒 |
-| `resize_confirm_wait_seconds` | 自动确认前等待 `VERIFY_RESIZE` 的最长时间；默认 240 秒 |
-| `command_timeout_seconds` | 调配命令执行超时时间 |
-| `flavor_discovery` | flavor 发现方式，当前使用 `remote` 从控制节点读取 |
-| `flavor_cache_seconds` | flavor 列表缓存秒数，默认建议 300 |
-| `flavor_discovery_timeout_seconds` | 远程读取 flavor 的超时时间 |
-| `auto_flavor_name_prefix` | 自动创建 flavor 时的名称前缀，默认建议 `rp` |
-| `allowed_flavors` | 可选白名单；空数组表示允许从集群读取到的全部 flavor 中选择 |
+```text
+outputs/resource_predict.log
+```
 
-K8S 集群常用配置：
+Windows 下如果日志文件删不掉，先停止 Flask/Python 进程。
 
-| 配置项 | 说明 |
-| --- | --- |
-| `cloud_type` | 固定为 `k8s` |
-| `control_host` / `ssh_user` / `ssh_port` / `ssh_key` | 控制节点 SSH 信息 |
-| `kubeconfig` | 控制节点上的 kubeconfig 路径 |
-| `command_timeout_seconds` | `kubectl` 命令执行超时时间 |
+### 9.3 后台更新
 
-### 7.2 日志
+`UpdateConfig.enabled=False` 时，不自动定时更新，只支持手动触发：
 
-默认路径：`outputs/resource_predict.log`。Windows 下若文件被占用，需先停止 Flask/Python 进程。
+```text
+POST /api/update-trigger
+POST /api/update-data
+POST /api/upsert-data
+```
 
-### 7.3 真实数据接入
+要开启自动 Pull 更新，需要配置：
 
-全量 provider 格式见 `resource_predict/pipeline/prepare.py`；指标可为 `pd.Series`（`DatetimeIndex`）。
+```python
+enabled = True
+interval_minutes = 60
+incremental_provider_path = "your_module:provider"
+```
 
-Pull 增量 provider 签名：
+provider 签名：
 
 ```python
 def provider(prepared_resources, points_to_add):
-    return incremental_items  # 与 update-data 数组项同结构
+    return incremental_items
 ```
 
-在 `UpdateConfig` 中配置：
+### 9.4 验证命令
 
-```python
-incremental_provider_path = "your_module:provider"
-# 留空则用 resource_predict.providers.mock:mock_incremental_provider
+Python 编译检查：
+
+```powershell
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe -m compileall resource_predict app.py generate_images.py generate_k8s_pods.py
 ```
 
-也可仅用 `POST /api/update-data` / `upsert-data` 推送，无需 provider。
+前端 JS 语法检查：
+
+```powershell
+node --check static\js\app-state.js
+node --check static\js\resource-list.js
+node --check static\js\charts.js
+node --check static\js\index.js
+```
+
+VM 回归预测：
+
+```powershell
+$env:PYTHONUTF8="1"
+.\.venv\Scripts\python.exe generate_images.py predict
+```
 
 ---
 
-## 8. 常见问题
+## 10. 常见问题
 
 | 现象 | 处理 |
 | --- | --- |
-| 页面无数据 | 先 `python generate_images.py`，确认 `outputs/summary_index.json` 存在 |
-| `predict` 失败 | 需先有全量生成或合法 `raw_data.json` |
-| 更新接口 409 | 已有更新任务，查 `GET /api/update-status` |
-| `update-data` 长时间阻塞 | 应立刻 202；确认服务已重启并加载最新代码 |
-| 详情 prediction_pending | 后台预测中，完成后刷新 |
+| 页面无数据 | 先生成预测产物，确认 `outputs/summary_index.json` 存在 |
+| VM 页有数据，Pod 页为空 | 尚未运行 `generate_k8s_pods.py`，或 Prometheus 查询无结果 |
+| `请配置 K8S_PROMETHEUS_URL` | 设置环境变量或写入 `settings.k8s_prometheus.prometheus_url` |
+| Prometheus 连接超时 | 本项目机器不能访问 Prometheus；先用浏览器/curl/Invoke-WebRequest 验证 URL |
+| CPU/内存有曲线但建议“数据不足” | 缺少 request/limit 指标，检查 kube-state-metrics |
+| 指标有数据但没有 Pod/Container | Prometheus 标签不符合 provider 当前查询逻辑，需要按实际标签调整 |
+| `predict` 失败：缺少 raw | 先全量生成或使用 upsert/provider 创建 `raw_data.json` |
+| CmdStanPy 在中文路径下报解码错误 | 运行前设置 `$env:PYTHONUTF8="1"` |
+| 更新接口返回 409 | 已有更新任务，查看 `GET /api/update-status` |
+| 详情返回 `prediction_pending` | 后台正在预测，完成后刷新 |
+| 调配返回 409 | 同一资源已有进行中的调配任务 |
 | 日志删不掉 | 停止 Flask/Python 后再删 |
-| 调配 409 | 同资源已有进行中的调配任务 |
 
-**维护建议**
+维护建议：
 
-- 勿提交 `__pycache__`、日志、截图等；`outputs/` 由 `.gitignore` 忽略。
-- 改预测/决策逻辑后：`python generate_images.py predict` 验证产物结构。
-- 改前端后检查桌面/移动端布局与图表高度。
-- 调配流程见 [6. 资源调配](#6-资源调配)。
+- 不要提交 `outputs/`、日志、缓存、`__pycache__`。
+- 修改预测或决策逻辑后，运行 `generate_images.py predict` 回归。
+- 修改 K8S provider 后，先用单 namespace 小范围验证。
+- 修改前端后，检查 VM 与 K8S Pod 两个主视图。
+

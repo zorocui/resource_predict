@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
 from pathlib import Path
@@ -8,6 +8,7 @@ import numpy as np
 
 from resource_predict.settings import settings
 from resource_predict.data.io import atomic_write_json, index_prepared_by_id, merge_manifest_resources
+from resource_predict.resource_types import metric_names_for_resource, resource_type_of
 
 
 def write_prediction_outputs(
@@ -52,7 +53,7 @@ def write_prediction_outputs(
         metric_vals: List[float] = []
         metrics_by_kind = item.get("metrics", {})
         if isinstance(metrics_by_kind, dict):
-            for kind in ("cpu", "memory", "disk"):
+            for kind in metric_names_for_resource(item):
                 kind_metrics = metrics_by_kind.get(kind, {})
                 if isinstance(kind_metrics, dict):
                     for method_name in active_methods:
@@ -60,16 +61,18 @@ def write_prediction_outputs(
                         if isinstance(metric_obj, dict) and "rmse" in metric_obj:
                             metric_vals.append(float(metric_obj["rmse"]))
         anomaly_score = float(np.mean(metric_vals)) if metric_vals else float("inf")
-        summary_resources.append(
-            {
+        row = {
                 "resource_id": rid,
-                "vm_spec": item.get("vm_spec", {}),
+                "resource_type": resource_type_of(item),
+                "spec": item.get("spec", {}),
                 "best_methods": item.get("best_methods", {}),
                 "anomaly_score": anomaly_score,
                 "scaling_advice": item.get("scaling_advice", {}),
                 "detail_ref": details_lookup.get(rid, {}),
-            }
-        )
+        }
+        if isinstance(item.get("data_quality"), dict):
+            row["data_quality"] = item["data_quality"]
+        summary_resources.append(row)
 
     summary_resources.sort(
         key=lambda x: (
@@ -143,3 +146,4 @@ def write_prediction_outputs(
         indent=2,
     )
     return manifest_items
+

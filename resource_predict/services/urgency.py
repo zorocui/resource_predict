@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 from typing import Any, Dict, List
@@ -13,6 +13,8 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     confidence = str(advice.get("confidence", "medium")).lower()
     if action == "hold":
         return 0.0
+    if action == "insufficient_data":
+        return 1.0
     stats = advice.get("stats", {})
     if not isinstance(stats, dict):
         stats = {}
@@ -43,13 +45,13 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         return _clamp((threshold - value) / threshold)
 
     def _target_change_score() -> float:
-        vm_spec = item.get("vm_spec", {})
-        target = advice.get("target_vm_spec", {})
-        if not isinstance(vm_spec, dict) or not isinstance(target, dict):
+        spec = item.get("spec", {})
+        target = advice.get("target_spec", {})
+        if not isinstance(spec, dict) or not isinstance(target, dict):
             return 0.0
         ratios = []
         for dim in ("cpu_cores", "memory_gb", "disk_gb"):
-            cur = _num(vm_spec.get(dim), 0.0)
+            cur = _num(spec.get(dim), 0.0)
             nxt = _num(target.get(dim), 0.0)
             if cur <= 0 or nxt <= 0:
                 continue
@@ -78,7 +80,7 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         slope = _num(st.get("slope"))
         delta = _num(st.get("window_mean_delta"))
 
-        if metric_action == "scale_out":
+        if metric_action in {"scale_out", "scale_out_candidate"}:
             trend_pressure = 0.0
             if slope > 0:
                 trend_pressure += min(1.0, slope / max(float(cfg.uptrend_slope_threshold), 0.0001))
@@ -91,7 +93,7 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
                 + 6.0 * trend_pressure
                 + 4.0 * min(1.0, gap / max(float(cfg.peak_valley_gap_threshold), 0.0001))
             )
-        elif metric_action == "scale_in":
+        elif metric_action in {"scale_in", "scale_in_candidate"}:
             trend_pressure = 0.0
             if slope < 0:
                 trend_pressure += min(1.0, abs(slope) / max(abs(float(cfg.downtrend_slope_threshold)), 0.0001))
@@ -108,7 +110,7 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         return confidence_bonus
 
     return round(
-        (35.0 if action == "scale_out" else 18.0)
+        (35.0 if action in {"scale_out", "scale_out_candidate"} else 18.0)
         + confidence_bonus
         + max(metric_scores)
         + 0.25 * sum(sorted(metric_scores, reverse=True)[1:])
@@ -117,3 +119,4 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         + _target_change_score(),
         3,
     )
+

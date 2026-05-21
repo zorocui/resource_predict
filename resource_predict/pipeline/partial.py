@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -9,7 +9,8 @@ import numpy as np
 
 from resource_predict.settings import settings
 from resource_predict.core.decision import build_scaling_advice
-from resource_predict.pipeline.constants import METRIC_NAMES
+from resource_predict.core.k8s_pod_decision import build_k8s_pod_advice
+from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resource, resource_type_of
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,8 @@ def merge_partial_forecast_items(
         if not isinstance(charts, dict):
             return
         future_by_metric: Dict[str, np.ndarray] = {}
-        for metric in METRIC_NAMES:
+        metric_names = metric_names_for_resource(item)
+        for metric in metric_names:
             block = charts.get(metric, {})
             if not isinstance(block, dict):
                 return
@@ -87,18 +89,23 @@ def merge_partial_forecast_items(
             if not best or not isinstance(futures, dict) or best not in futures:
                 return
             future_by_metric[metric] = np.asarray(futures.get(best) or [], dtype=float)
-        if len(future_by_metric) == len(METRIC_NAMES):
+        if resource_type_of(item) == "k8s_pod" and len(future_by_metric) == len(metric_names):
+            item["scaling_advice"] = build_k8s_pod_advice(
+                future_by_metric,
+                resource=item,
+            )
+        elif len(future_by_metric) == len(METRIC_NAMES):
             item["scaling_advice"] = build_scaling_advice(
                 future_by_metric,
-                current_vm_spec=item.get("vm_spec", {}),
+                current_spec=item.get("spec", {}),
             )
 
     def _merge_one(old: Dict[str, Any], new: Dict[str, Any], metrics: Set[str]) -> Dict[str, Any]:
         if not metrics:
             return new
         merged = dict(old)
-        if isinstance(new.get("vm_spec"), dict):
-            merged["vm_spec"] = new.get("vm_spec", {})
+        if isinstance(new.get("spec"), dict):
+            merged["spec"] = new.get("spec", {})
         for field in ("best_methods", "metrics", "charts_forecast"):
             old_obj = old.get(field, {})
             new_obj = new.get(field, {})
@@ -129,3 +136,4 @@ def merge_partial_forecast_items(
         if rid and rid not in seen:
             merged.append(item)
     return merged
+

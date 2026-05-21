@@ -319,6 +319,7 @@ def forecast_prophet(
     t0 = time.perf_counter()
     train_df = pd.DataFrame({"ds": y_train.index, "y": y_train.values})
     model = Prophet(
+        stan_backend="CMDSTANPY",
         seasonality_mode=seasonality_mode,
         daily_seasonality=daily_seasonality,
         weekly_seasonality=weekly_seasonality,

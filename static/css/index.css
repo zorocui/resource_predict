@@ -27,11 +27,18 @@ h1 { margin: 0; font-size: 22px; letter-spacing: 0; color: #fff; }
 header .sub { color: rgba(226,232,240,.82); }
 .toolbar {
   position: sticky; top: 8px; z-index: 9; display: grid;
-  grid-template-columns: minmax(360px,1.4fr) auto auto; gap: 10px 12px; align-items: center;
+  grid-template-columns: auto minmax(320px,1.4fr) auto auto; gap: 10px 12px; align-items: center;
   margin-bottom: 12px; padding: 12px; border: 1px solid rgba(15,23,42,.1);
   border-radius: 10px; background: rgba(255,255,255,.94); backdrop-filter: blur(10px); box-shadow: var(--shadow-sm);
 }
 .toolbar-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.toolbar-group.resource-tabs { justify-content: flex-start; }
+.resource-type-tab.active {
+  color: #fff;
+  border-color: #0f766e;
+  background: #0f766e;
+}
+.resource-type-tab.active:hover { background: #115e59; }
 .toolbar-group.view { justify-content: center; }
 .toolbar-group.page { justify-content: flex-end; }
 .toolbar input {
@@ -72,6 +79,12 @@ header .sub { color: rgba(226,232,240,.82); }
   gap: 12px;
   align-items: stretch;
   min-width: 0;
+}
+.row.is-k8s-pod .grid {
+  grid-template-columns: minmax(380px,460px) repeat(2,minmax(320px,1fr));
+}
+.row.is-k8s-pod .pod-hidden {
+  display: none;
 }
 .head { display: none; }
 .row {
@@ -188,6 +201,15 @@ header .sub { color: rgba(226,232,240,.82); }
 .advice-pill, .metric-pill, .target-pill { border-radius: 8px; font-weight: 700; }
 .advice-pill { display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px; box-sizing: border-box; }
 .advice-target { margin: 0; padding-top: 0; min-width: 0; align-self: center; }
+.analysis-only {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 8px;
+  border: 1px solid rgba(15,23,42,.1);
+  border-radius: 8px;
+  background: #f8fafc;
+}
 .target-pill {
   min-height: 32px; padding: 5px 8px; font-size: 12px;
   line-height: 1.35; max-width: 100%; box-sizing: border-box; white-space: normal;

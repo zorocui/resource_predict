@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -104,6 +104,8 @@ class ForecastStore:
             output.append(
                 {
                     "resource_id": item.get("resource_id"),
+                    "resource_type": item.get("resource_type"),
+                    "spec": item.get("spec", {}),
                     "best_methods": item.get("best_methods", {}),
                     "metrics": item.get("metrics", {}),
                     "anomaly_score": 0.0,
@@ -185,3 +187,4 @@ class ForecastStore:
             if isinstance(item, dict) and str(item.get("resource_id")) == resource_id:
                 return item
         return None
+

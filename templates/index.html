@@ -39,6 +39,10 @@
       {% endif %}
 
       <div class="toolbar">
+        <div class="toolbar-group resource-tabs">
+          <button class="resource-type-tab active" type="button" data-resource-type-tab="openstack_vm">VM资源</button>
+          <button class="resource-type-tab" type="button" data-resource-type-tab="k8s_pod">K8S Pod负载</button>
+        </div>
         <div class="toolbar-group search">
           <input id="search-input" type="text" placeholder="输入资源名称或IP搜索，如 vm-001 / 10.0.10.10" />
           <button id="search-btn" class="btn-primary" type="button">搜索</button>

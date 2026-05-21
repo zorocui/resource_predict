@@ -1,4 +1,4 @@
-(function () {
+﻿(function () {
   const app = window.ResourcePredictApp;
   const api = window.ResourceApi;
   const CHART_TIME_ZONE = "UTC";
@@ -268,7 +268,10 @@
     if (!rid) return;
     app.resourcePayloadCache.set(rid, payload);
     const charts = resource.charts || {};
-    for (const mk of ["cpu", "memory", "disk"]) {
+    const spec = resource.spec || {};
+    const resourceType = String(resource.resource_type || "").toLowerCase().replaceAll("-", "_");
+    const metricKeys = resourceType === "k8s_pod" ? app.viewMetricMap.k8s_pod : app.viewMetricMap.openstack_vm;
+    for (const mk of metricKeys) {
       if (charts[mk]) app.chartDataByKey.set(`${rid}:${mk}`, charts[mk]);
     }
   }
@@ -478,3 +481,4 @@
     toggleChartAuxiliary,
   };
 })();
+

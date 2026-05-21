@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any, Callable, Dict, List
 
@@ -22,6 +22,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         resources = summary.get("resources", []) if isinstance(summary, dict) else []
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
+        resource_type_filter = (request.args.get("resource_type") or "").strip().lower().replace("-", "_")
         sort_by = (request.args.get("sort_by") or "urgency_score").strip().lower()
         top_n = safe_int(request.args.get("top_n"), 0)
         page = max(1, safe_int(request.args.get("page"), 1))
@@ -29,9 +30,11 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         page_size = max(1, min(page_size, settings.generation.api_page_size_max))
 
         rows = [x for x in resources if isinstance(x, dict)]
+        if resource_type_filter:
+            rows = [x for x in rows if _resource_type_of(x) == resource_type_filter]
         if q:
             rows = [x for x in rows if matches_query(x, q)]
-        if action_filter in {"scale_out", "scale_in", "hold", "mixed"}:
+        if action_filter in {"scale_out", "scale_in", "hold", "mixed", "scale_out_candidate", "scale_in_candidate", "insufficient_data"}:
             if action_filter == "mixed":
                 rows = [
                     x for x in rows
@@ -78,17 +81,28 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         resources = summary.get("resources", []) if isinstance(summary, dict) else []
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
+        resource_type_filter = (request.args.get("resource_type") or "").strip().lower().replace("-", "_")
         rows = [x for x in resources if isinstance(x, dict)]
+        if resource_type_filter:
+            rows = [x for x in rows if _resource_type_of(x) == resource_type_filter]
         if q:
             rows = [x for x in rows if matches_query(x, q)]
-        if action_filter in {"scale_out", "scale_in", "hold"}:
+        if action_filter in {"scale_out", "scale_in", "hold", "scale_out_candidate", "scale_in_candidate", "insufficient_data"}:
             rows = [
                 x
                 for x in rows
                 if str((x.get("scaling_advice", {}) or {}).get("action", "hold")).lower() == action_filter
             ]
 
-        counts = {"scale_out": 0, "scale_in": 0, "hold": 0, "mixed": 0}
+        counts = {
+            "scale_out": 0,
+            "scale_in": 0,
+            "hold": 0,
+            "mixed": 0,
+            "scale_out_candidate": 0,
+            "scale_in_candidate": 0,
+            "insufficient_data": 0,
+        }
         confidence_counts = {"high": 0, "medium": 0, "low": 0}
         for item in rows:
             advice = item.get("scaling_advice", {})
@@ -111,7 +125,6 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                 "confidence_counts": confidence_counts,
             }
         )
-
     @app.get("/api/resources/<resource_id>")
     def api_resource_detail(resource_id: str):
         pending_status = prediction_pending_for(resource_id)
@@ -152,3 +165,13 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             if detail is not None:
                 items.append(detail)
         return jsonify({"resources": items})
+
+
+def _resource_type_of(item: Dict[str, Any]) -> str:
+    raw = str(item.get("resource_type") or "").strip().lower().replace("-", "_")
+    if raw in {"pod", "k8s_pod"}:
+        return "k8s_pod"
+    if raw in {"k8s", "kubernetes", "k8s_container", "container"}:
+        return "k8s_container"
+    return raw or "openstack_vm"
+

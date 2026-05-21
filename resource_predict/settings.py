@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -176,6 +176,22 @@ class UpdateConfig:
 
 
 @dataclass(frozen=True)
+class K8SPrometheusConfig:
+    # Prometheus HTTP API 地址；留空时 provider 会从环境变量 K8S_PROMETHEUS_URL 读取。
+    prometheus_url: str = ""
+    # 集群标识，写入 resource_id 与 spec.cluster。
+    cluster: str = "cluster-k8s-a"
+    # 默认拉取最近 7 天。
+    history_days: int = 7
+    # query_range 与重采样步长，默认 5 分钟。
+    step_seconds: int = 300
+    # 可选 namespace 正则，用于缩小首批接入范围。
+    namespace_regex: str = ""
+    # request/limit 静态指标查询时间点默认取 now。
+    request_timeout_seconds: int = 30
+
+
+@dataclass(frozen=True)
 class DecisionConfig:
     # 多数阈值为 [0,1] 小数（0.8 表示 80%）；预测序列在部分口径下可超过 1（>100%），见 scale_out_capacity_load_threshold。
     # 扩容阈值：未来窗口 P95 超过该值触发高负载信号
@@ -249,6 +265,8 @@ class Settings:
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     # 定时数据更新相关配置集合
     update: UpdateConfig = field(default_factory=UpdateConfig)
+    # K8S Pod Prometheus 接入配置。
+    k8s_prometheus: K8SPrometheusConfig = field(default_factory=K8SPrometheusConfig)
 
 
 # 全局配置入口：后续只改这里即可统一生效

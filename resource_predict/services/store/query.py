@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
@@ -17,9 +17,9 @@ def action_priority(item: Dict[str, Any]) -> int:
     if not isinstance(advice, dict):
         return 0
     action = str(advice.get("action", "hold")).lower()
-    if action == "scale_out":
+    if action in {"scale_out", "scale_out_candidate"}:
         return 2
-    if action == "scale_in":
+    if action in {"scale_in", "scale_in_candidate"}:
         return 1
     return 0
 
@@ -29,12 +29,22 @@ def matches_query(item: Dict[str, Any], q: str) -> bool:
     if not q:
         return True
     qv = q.lower()
-    vm_spec = item.get("vm_spec", {}) if isinstance(item, dict) else {}
+    spec = item.get("spec", {}) if isinstance(item, dict) else {}
     ip = ""
     cluster = ""
-    if isinstance(vm_spec, dict):
-        ip = str(vm_spec.get("ip", ""))
-        cluster = str(vm_spec.get("cluster", ""))
+    if isinstance(spec, dict):
+        ip = str(spec.get("ip", ""))
+        cluster = str(spec.get("cluster", ""))
+        candidates_extra = [
+            str(spec.get("namespace", "")),
+            str(spec.get("pod", "")),
+            str(spec.get("container", "")),
+            str(spec.get("node", "")),
+            str(spec.get("owner_kind", "")),
+            str(spec.get("owner_name", "")),
+        ]
+    else:
+        candidates_extra = []
 
     candidates = [
         str(item.get("resource_id", "")),
@@ -42,6 +52,7 @@ def matches_query(item: Dict[str, Any], q: str) -> bool:
         str(item.get("name", "")),
         ip,
         cluster,
+        *candidates_extra,
     ]
     return any(qv in c.lower() for c in candidates if c)
 
@@ -57,3 +68,4 @@ def prediction_pending_for(resource_id: str) -> Optional[Dict[str, Any]]:
     if str(resource_id) not in ids:
         return None
     return status
+

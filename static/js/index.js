@@ -11,6 +11,14 @@
     }
   }
 
+  function syncResourceTypeTabs() {
+    for (const tab of app.viewTabs || []) {
+      const active = tab.dataset.resourceTypeTab === app.state.resourceType;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-pressed", active ? "true" : "false");
+    }
+  }
+
   function updatePager() {
     if (app.state.mode === "topn") {
       app.prevPageBtn.disabled = true;
@@ -43,6 +51,7 @@
       top_n: app.TOP_N_DEFAULT,
       sort_by: "urgency_score",
       action: app.state.actionFilter,
+      resource_type: app.state.resourceType,
     }));
     renderFromPayload(payload, `默认展示 Top${app.TOP_N_DEFAULT}`);
     await resourceList.refreshAdviceSummary();
@@ -58,6 +67,7 @@
       page_size: app.state.pageSize,
       sort_by: "urgency_score",
       action: app.state.actionFilter,
+      resource_type: app.state.resourceType,
     }));
     renderFromPayload(payload, "全部资源分页浏览");
     await resourceList.refreshAdviceSummary();
@@ -73,6 +83,7 @@
       page_size: app.state.pageSize,
       sort_by: "urgency_score",
       action: app.state.actionFilter,
+      resource_type: app.state.resourceType,
     }));
     renderFromPayload(payload, `搜索 "${app.state.q}"`);
     await resourceList.refreshAdviceSummary();
@@ -124,6 +135,17 @@
 
   function bindEvents() {
     app.searchBtn?.addEventListener("click", () => searchResources());
+    for (const tab of app.viewTabs || []) {
+      tab.addEventListener("click", () => {
+        const resourceType = tab.dataset.resourceTypeTab || "openstack_vm";
+        if (resourceType === app.state.resourceType) return;
+        app.state.resourceType = resourceType;
+        app.state.actionFilter = "";
+        app.searchInput.value = "";
+        syncResourceTypeTabs();
+        loadPage(1);
+      });
+    }
     app.resetBtn?.addEventListener("click", () => {
       app.searchInput.value = "";
       loadPage(1);
@@ -209,6 +231,7 @@
   async function bootstrap() {
     if (charts.showEchartsError()) return;
     syncChartGuideButton();
+    syncResourceTypeTabs();
     bindEvents();
     try {
       await loadPage(1);
