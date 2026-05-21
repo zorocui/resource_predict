@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Local scratch / generated checks
+.tmp_*/
+.tmp_upsert_check/
+.playwright-cli/
+*.tmp
+*.temp
+
+# Runtime outputs (regenerate via generate_images.py)
+outputs/*
+!outputs/.gitkeep
+
+# Local cluster credentials (copy from deploy/clusters.example.json)
+deploy/clusters.json
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

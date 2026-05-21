@@ -1,0 +1,171 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>云资源使用预测分析</title>
+    <!-- 内网部署请使用本地静态资源，不依赖公网 CDN -->
+    <script src="{{ url_for('static', filename='vendor/echarts/echarts.min.js') }}"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/index.css') }}" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <div>
+          <h1>云资源使用预测分析</h1>
+          <div class="sub">每个云资源一行：分别展示 CPU/内存/硬盘三张图（每张图内包含ARIMA/SARIMA/Prophet三种方法预测，并按 RMSE 最小标出最准确）。</div>
+        </div>
+      </header>
+
+      <div class="head">
+        <div class="grid">
+          <div>云资源</div>
+          <div>CPU预测图</div>
+          <div class="hide-sm">内存预测图</div>
+          <div class="hide-sm">硬盘预测图</div>
+        </div>
+      </div>
+
+      {% if error %}
+      <div class="row" style="border-color: rgba(239, 68, 68, 0.45);">
+        <div style="color: rgba(239, 68, 68, 0.95); font-weight: 600; margin-bottom: 6px;">生成图片失败</div>
+        <div style="color: var(--muted); font-size: 13px; line-height: 1.6;">
+          {{ error }}
+          <div style="margin-top: 10px;">
+            常见原因：未安装依赖（statsmodels / prophet）或未生成 <code>outputs/manifest.json</code>。
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="toolbar">
+        <div class="toolbar-group search">
+          <input id="search-input" type="text" placeholder="输入资源名称或IP搜索，如 vm-001 / 10.0.10.10" />
+          <button id="search-btn" class="btn-primary" type="button">搜索</button>
+          <button id="reset-btn" type="button">重置</button>
+        </div>
+        <div class="toolbar-group view">
+          <button id="browse-btn" type="button">浏览全部</button>
+          <button id="topn-btn" type="button">TopN模式</button>
+          <button
+            id="chart-guide-btn"
+            class="chart-guide-btn is-active"
+            type="button"
+            aria-pressed="true"
+            title="切换红/绿阈值线与未来预测区域"
+          >辅助线：开</button>
+        </div>
+        <div class="toolbar-group page">
+          <button id="prev-page-btn" class="page-btn" type="button">上一页</button>
+          <span class="muted" id="pager-text">第 1 页</span>
+          <button id="next-page-btn" class="page-btn" type="button">下一页</button>
+        </div>
+      </div>
+      <div class="sub" id="summary-text">加载中...</div>
+      <div class="summary-board">
+        <div class="summary-item" data-action-filter="scale_out">
+          <div class="k">建议扩容</div>
+          <div class="v v-out" id="sum-out">-</div>
+        </div>
+        <div class="summary-item" data-action-filter="scale_in">
+          <div class="k">建议缩容</div>
+          <div class="v v-in" id="sum-in">-</div>
+        </div>
+        <div class="summary-item" data-action-filter="hold">
+          <div class="k">建议保持</div>
+          <div class="v v-hold" id="sum-hold">-</div>
+        </div>
+        <div class="summary-item" data-action-filter="mixed">
+          <div class="k">混合调整</div>
+          <div class="v v-mixed" id="sum-mixed">-</div>
+        </div>
+        <div class="summary-item">
+          <div class="k">统计资源数</div>
+          <div class="v" id="sum-total">-</div>
+        </div>
+      </div>
+
+      <div id="rows-root"></div>
+      <div
+        id="ui-config"
+        data-top-n-default="{{ top_n_default }}"
+        data-page-size-default="{{ api_page_size_default }}"
+        style="display:none;"
+      ></div>
+      <div id="chart-modal" class="chart-modal" hidden>
+        <div class="chart-modal-backdrop" data-chart-modal-dismiss></div>
+        <div class="chart-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="chart-modal-title">
+          <div class="chart-modal-header">
+            <span id="chart-modal-title" class="chart-modal-title"></span>
+            <button type="button" class="chart-modal-close" data-chart-modal-dismiss>关闭</button>
+          </div>
+          <div id="chart-modal-canvas" class="chart-modal-canvas"></div>
+        </div>
+      </div>
+      <div id="scaling-modal" class="scaling-modal" hidden>
+        <div class="scaling-modal-backdrop" data-scaling-modal-dismiss></div>
+        <div class="scaling-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="scaling-modal-title">
+          <div class="scaling-modal-header">
+            <div>
+              <div id="scaling-modal-title" class="scaling-modal-title">调配进度</div>
+              <div id="scaling-modal-subtitle" class="scaling-modal-subtitle"></div>
+            </div>
+            <button type="button" class="chart-modal-close" data-scaling-modal-dismiss>关闭</button>
+          </div>
+          <div class="scaling-progress-track" id="scaling-progress-track"></div>
+          <div class="scaling-modal-body">
+            <div class="scaling-progress-list" id="scaling-progress-list"></div>
+            <pre class="scaling-log-view" id="scaling-log-view"></pre>
+          </div>
+        </div>
+      </div>
+      <template id="row-template">
+        <div class="row">
+          <div class="grid">
+            <div class="resource-meta">
+              <div class="resource-topline">
+                <div class="resource-id" data-role="resource-id"></div>
+                <div class="resource-score" data-role="resource-score"></div>
+              </div>
+              <div class="resource-spec" data-role="resource-spec"></div>
+              <div class="resource-advice" data-role="resource-advice"></div>
+              <div class="mobile-metric-tabs" data-role="mobile-metric-tabs"></div>
+            </div>
+            <div class="img-wrap">
+              <button type="button" class="chart-expand-btn" title="放大查看" aria-label="放大查看">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+              <div class="chart" data-metric="cpu"></div>
+            </div>
+            <div class="img-wrap hide-sm">
+              <button type="button" class="chart-expand-btn" title="放大查看" aria-label="放大查看">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+              <div class="chart" data-metric="memory"></div>
+            </div>
+            <div class="img-wrap hide-sm">
+              <button type="button" class="chart-expand-btn" title="放大查看" aria-label="放大查看">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+              <div class="chart" data-metric="disk"></div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+    <script src="{{ url_for('static', filename='js/scaling.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app-state.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/api.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/resource-list.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/index.js') }}"></script>
+  </body>
+</html>
+
+
