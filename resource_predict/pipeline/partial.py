@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
-from resource_predict.settings import settings
+from resource_predict.pipeline.constants import DETAILS_DIRNAME, SUMMARY_INDEX_FILENAME
 from resource_predict.core.decision import build_scaling_advice
 from resource_predict.core.k8s_pod_decision import build_k8s_pod_advice
 from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resource, resource_type_of
@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 
 def load_existing_forecast_items(out_base: Path) -> List[Dict[str, Any]]:
-    summary_path = out_base / settings.app.summary_index_filename
-    details_dir = out_base / settings.app.details_dirname
+    summary_path = out_base / SUMMARY_INDEX_FILENAME
+    details_dir = out_base / DETAILS_DIRNAME
     if not summary_path.exists():
         return []
     try:
@@ -89,7 +89,7 @@ def merge_partial_forecast_items(
             if not best or not isinstance(futures, dict) or best not in futures:
                 return
             future_by_metric[metric] = np.asarray(futures.get(best) or [], dtype=float)
-        if resource_type_of(item) == "k8s_pod" and len(future_by_metric) == len(metric_names):
+        if resource_type_of(item) in {"k8s_pod", "k8s_workload"} and len(future_by_metric) == len(metric_names):
             item["scaling_advice"] = build_k8s_pod_advice(
                 future_by_metric,
                 resource=item,
@@ -136,4 +136,3 @@ def merge_partial_forecast_items(
         if rid and rid not in seen:
             merged.append(item)
     return merged
-

@@ -1,111 +1,225 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>云资源使用预测分析</title>
-    <!-- 内网部署请使用本地静态资源，不依赖公网 CDN -->
+    <title>资源预测风险工作台</title>
     <script src="{{ url_for('static', filename='vendor/echarts/echarts.min.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/index.css') }}" />
   </head>
   <body>
-    <div class="container">
-      <header>
+    <div class="app-shell">
+      <header class="app-header">
         <div>
-          <h1>云资源使用预测分析</h1>
-          <div class="sub">每个云资源一行：分别展示 CPU/内存/硬盘三张图（每张图内包含ARIMA/SARIMA/Prophet三种方法预测，并按 RMSE 最小标出最准确）。</div>
+          <div class="eyebrow">Resource Prediction</div>
+          <h1>资源预测风险工作台</h1>
+          <p>统一查看 VM 与 K8S Workload 的预测风险、建议动作和调配状态。</p>
         </div>
+        <nav class="top-nav" aria-label="主导航">
+          <button class="nav-tab active" type="button" data-view="risk">风险队列</button>
+          <button class="nav-tab" type="button" data-view="overview">概览</button>
+          <button class="nav-tab" type="button" data-view="tasks">调配任务</button>
+          <button class="nav-tab" type="button" data-view="updates">数据更新</button>
+        </nav>
       </header>
 
-      <div class="head">
-        <div class="grid">
-          <div>云资源</div>
-          <div>CPU预测图</div>
-          <div class="hide-sm">内存预测图</div>
-          <div class="hide-sm">硬盘预测图</div>
-        </div>
-      </div>
-
       {% if error %}
-      <div class="row" style="border-color: rgba(239, 68, 68, 0.45);">
-        <div style="color: rgba(239, 68, 68, 0.95); font-weight: 600; margin-bottom: 6px;">生成图片失败</div>
-        <div style="color: var(--muted); font-size: 13px; line-height: 1.6;">
-          {{ error }}
-          <div style="margin-top: 10px;">
-            常见原因：未安装依赖（statsmodels / prophet）或未生成 <code>outputs/manifest.json</code>。
-          </div>
-        </div>
-      </div>
+      <section class="notice is-error">
+        <strong>预测产物加载失败</strong>
+        <span>{{ error }}</span>
+      </section>
       {% endif %}
 
-      <div class="toolbar">
-        <div class="toolbar-group resource-tabs">
-          <button class="resource-type-tab active" type="button" data-resource-type-tab="openstack_vm">VM资源</button>
-          <button class="resource-type-tab" type="button" data-resource-type-tab="k8s_pod">K8S Pod负载</button>
-        </div>
-        <div class="toolbar-group search">
-          <input id="search-input" type="text" placeholder="输入资源名称或IP搜索，如 vm-001 / 10.0.10.10" />
-          <button id="search-btn" class="btn-primary" type="button">搜索</button>
-          <button id="reset-btn" type="button">重置</button>
-        </div>
-        <div class="toolbar-group view">
-          <button id="browse-btn" type="button">浏览全部</button>
-          <button id="topn-btn" type="button">TopN模式</button>
-          <button
-            id="chart-guide-btn"
-            class="chart-guide-btn is-active"
-            type="button"
-            aria-pressed="true"
-            title="切换红/绿阈值线与未来预测区域"
-          >辅助线：开</button>
-        </div>
-        <div class="toolbar-group page">
-          <button id="prev-page-btn" class="page-btn" type="button">上一页</button>
-          <span class="muted" id="pager-text">第 1 页</span>
-          <button id="next-page-btn" class="page-btn" type="button">下一页</button>
-        </div>
-      </div>
-      <div class="sub" id="summary-text">加载中...</div>
-      <div class="summary-board">
-        <div class="summary-item" data-action-filter="scale_out">
-          <div class="k">建议扩容</div>
-          <div class="v v-out" id="sum-out">-</div>
-        </div>
-        <div class="summary-item" data-action-filter="scale_in">
-          <div class="k">建议缩容</div>
-          <div class="v v-in" id="sum-in">-</div>
-        </div>
-        <div class="summary-item" data-action-filter="hold">
-          <div class="k">建议保持</div>
-          <div class="v v-hold" id="sum-hold">-</div>
-        </div>
-        <div class="summary-item" data-action-filter="mixed">
-          <div class="k">混合调整</div>
-          <div class="v v-mixed" id="sum-mixed">-</div>
-        </div>
-        <div class="summary-item">
-          <div class="k">统计资源数</div>
-          <div class="v" id="sum-total">-</div>
-        </div>
-      </div>
+      <main class="workbench">
+        <aside class="filter-panel" aria-label="筛选器">
+          <div class="panel-head">
+            <div>
+              <h2>筛选器</h2>
+              <p>收窄需要处理的风险对象</p>
+            </div>
+            <button id="mobile-filter-close" class="icon-text-btn mobile-only" type="button">收起</button>
+          </div>
 
-      <div id="rows-root"></div>
+          <label class="field-label" for="search-input">搜索</label>
+          <div class="search-row">
+            <input id="search-input" type="search" placeholder="资源、IP、集群、Namespace、Workload" />
+            <button id="search-btn" type="button">搜索</button>
+          </div>
+
+          <div class="filter-section">
+            <div class="field-label">资源类型</div>
+            <div class="segmented" data-filter-group="resource-type">
+              <button class="active" type="button" data-value="">全部</button>
+              <button type="button" data-value="openstack_vm">VM</button>
+              <button type="button" data-value="k8s_workload">Workload</button>
+            </div>
+          </div>
+
+          <div class="filter-section">
+            <div class="field-label">建议动作</div>
+            <div class="filter-list" data-filter-group="action">
+              <button type="button" data-value="">全部动作</button>
+              <button type="button" data-value="scale_out">扩容</button>
+              <button type="button" data-value="scale_in">缩容</button>
+              <button type="button" data-value="hold">保持</button>
+              <button type="button" data-value="mixed">混合信号</button>
+              <button type="button" data-value="insufficient_data">数据不足</button>
+            </div>
+          </div>
+
+          <div class="filter-section">
+            <div class="field-label">置信度</div>
+            <div class="segmented" data-filter-group="confidence">
+              <button class="active" type="button" data-value="">全部</button>
+              <button type="button" data-value="high">High</button>
+              <button type="button" data-value="medium">Medium</button>
+              <button type="button" data-value="low">Low</button>
+            </div>
+          </div>
+
+          <div class="filter-actions">
+            <button id="reset-btn" class="secondary-btn" type="button">重置筛选</button>
+            <button id="refresh-btn" class="primary-btn" type="button">刷新队列</button>
+          </div>
+        </aside>
+
+        <section class="main-panel">
+          <div id="risk-view" class="view-panel active">
+            <div class="queue-toolbar">
+              <button id="mobile-filter-open" class="secondary-btn mobile-only" type="button">筛选</button>
+              <div>
+                <h2>风险队列</h2>
+                <p id="summary-text">正在加载资源...</p>
+              </div>
+              <div class="pager">
+                <button id="prev-page-btn" type="button">上一页</button>
+                <span id="pager-text">第 1 页</span>
+                <button id="next-page-btn" type="button">下一页</button>
+              </div>
+            </div>
+
+            <div class="summary-board" aria-label="风险摘要">
+              <button class="summary-item" type="button" data-summary-action="scale_out">
+                <span>需扩容</span><strong id="sum-out">-</strong>
+              </button>
+              <button class="summary-item" type="button" data-summary-action="scale_in">
+                <span>需缩容</span><strong id="sum-in">-</strong>
+              </button>
+              <button class="summary-item" type="button" data-summary-action="mixed">
+                <span>混合信号</span><strong id="sum-mixed">-</strong>
+              </button>
+              <button class="summary-item" type="button" data-summary-action="hold">
+                <span>保持</span><strong id="sum-hold">-</strong>
+              </button>
+              <button class="summary-item" type="button" data-summary-action="">
+                <span>当前范围</span><strong id="sum-total">-</strong>
+              </button>
+            </div>
+
+            <div id="rows-root" class="risk-list" aria-live="polite"></div>
+          </div>
+
+          <div id="overview-view" class="view-panel">
+            <section class="empty-state">
+              <h2>概览</h2>
+              <p>这里汇总当前筛选范围内的资源数量、动作分布和置信度分布。默认入口仍是风险队列，概览用于解释整体态势。</p>
+              <div id="overview-grid" class="overview-grid"></div>
+            </section>
+          </div>
+
+          <div id="tasks-view" class="view-panel">
+            <section class="empty-state">
+              <h2>调配任务</h2>
+              <p>围绕当前选中资源展示最近调配记录。VM 可在右侧详情里发起预检或调配，K8S Workload 仅分析不执行。</p>
+              <div class="status-board" id="task-status-board">
+                <div class="status-card">
+                  <span>当前资源</span>
+                  <strong id="task-resource">未选择</strong>
+                </div>
+                <div class="status-card">
+                  <span>调配能力</span>
+                  <strong id="task-capability">-</strong>
+                </div>
+              </div>
+              <div id="task-history" class="task-history"></div>
+            </section>
+          </div>
+
+          <div id="updates-view" class="view-panel">
+            <section class="empty-state">
+              <h2>数据更新</h2>
+              <p>展示现有更新任务状态，便于确认预测数据是否正在刷新。</p>
+              <div class="status-board" id="update-status-board">
+                <div class="status-card">
+                  <span>运行状态</span>
+                  <strong id="update-running">读取中</strong>
+                </div>
+                <div class="status-card">
+                  <span>阶段</span>
+                  <strong id="update-phase">-</strong>
+                </div>
+                <div class="status-card">
+                  <span>最近开始</span>
+                  <strong id="update-started">-</strong>
+                </div>
+                <div class="status-card">
+                  <span>最近结束</span>
+                  <strong id="update-finished">-</strong>
+                </div>
+              </div>
+              <pre id="update-message" class="status-message"></pre>
+            </section>
+          </div>
+        </section>
+
+        <aside id="detail-panel" class="detail-panel" data-resource-id="" aria-label="资源详情">
+          <div id="detail-empty" class="detail-empty">
+            <h2>选择资源</h2>
+            <p>从风险队列中选择一项，查看建议、图表、规格和调配操作。</p>
+          </div>
+          <div id="detail-content" class="detail-content" hidden>
+            <div class="detail-header">
+              <div>
+                <div id="detail-type" class="resource-type-badge">-</div>
+                <h2 id="detail-title">-</h2>
+                <p id="detail-subtitle">-</p>
+              </div>
+              <button id="detail-close" class="mobile-only icon-text-btn" type="button">关闭</button>
+            </div>
+
+            <section class="detail-card">
+              <div class="detail-card-head">
+                <h3>建议结论</h3>
+                <span id="detail-confidence" class="confidence-chip">-</span>
+              </div>
+              <div id="detail-advice" class="detail-advice"></div>
+              <div id="detail-actions" class="detail-actions"></div>
+            </section>
+
+            <section class="detail-card">
+              <div class="detail-card-head">
+                <h3>指标预测</h3>
+                <button id="chart-guide-btn" class="link-btn" type="button" aria-pressed="true">辅助线：开</button>
+              </div>
+              <div id="metric-tabs" class="metric-tabs"></div>
+              <div id="detail-chart" class="detail-chart"></div>
+            </section>
+
+            <section class="detail-card">
+              <h3>资源规格</h3>
+              <div id="detail-spec" class="spec-grid"></div>
+            </section>
+          </div>
+        </aside>
+      </main>
+
       <div
         id="ui-config"
         data-top-n-default="{{ top_n_default }}"
         data-page-size-default="{{ api_page_size_default }}"
         style="display:none;"
       ></div>
-      <div id="chart-modal" class="chart-modal" hidden>
-        <div class="chart-modal-backdrop" data-chart-modal-dismiss></div>
-        <div class="chart-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="chart-modal-title">
-          <div class="chart-modal-header">
-            <span id="chart-modal-title" class="chart-modal-title"></span>
-            <button type="button" class="chart-modal-close" data-chart-modal-dismiss>关闭</button>
-          </div>
-          <div id="chart-modal-canvas" class="chart-modal-canvas"></div>
-        </div>
-      </div>
+
       <div id="scaling-modal" class="scaling-modal" hidden>
         <div class="scaling-modal-backdrop" data-scaling-modal-dismiss></div>
         <div class="scaling-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="scaling-modal-title">
@@ -114,7 +228,7 @@
               <div id="scaling-modal-title" class="scaling-modal-title">调配进度</div>
               <div id="scaling-modal-subtitle" class="scaling-modal-subtitle"></div>
             </div>
-            <button type="button" class="chart-modal-close" data-scaling-modal-dismiss>关闭</button>
+            <button type="button" class="icon-text-btn" data-scaling-modal-dismiss>关闭</button>
           </div>
           <div class="scaling-progress-track" id="scaling-progress-track"></div>
           <div class="scaling-modal-body">
@@ -123,53 +237,13 @@
           </div>
         </div>
       </div>
-      <template id="row-template">
-        <div class="row">
-          <div class="grid">
-            <div class="resource-meta">
-              <div class="resource-topline">
-                <div class="resource-id" data-role="resource-id"></div>
-                <div class="resource-score" data-role="resource-score"></div>
-              </div>
-              <div class="resource-spec" data-role="resource-spec"></div>
-              <div class="resource-advice" data-role="resource-advice"></div>
-              <div class="mobile-metric-tabs" data-role="mobile-metric-tabs"></div>
-            </div>
-            <div class="img-wrap">
-              <button type="button" class="chart-expand-btn" title="放大查看" aria-label="放大查看">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              <div class="chart" data-metric="cpu"></div>
-            </div>
-            <div class="img-wrap hide-sm">
-              <button type="button" class="chart-expand-btn" title="放大查看" aria-label="放大查看">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              <div class="chart" data-metric="memory"></div>
-            </div>
-            <div class="img-wrap hide-sm">
-              <button type="button" class="chart-expand-btn" title="放大查看" aria-label="放大查看">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              <div class="chart" data-metric="disk"></div>
-            </div>
-          </div>
-        </div>
-      </template>
     </div>
-    <script src="{{ url_for('static', filename='js/scaling.js') }}"></script>
+
     <script src="{{ url_for('static', filename='js/app-state.js') }}"></script>
     <script src="{{ url_for('static', filename='js/api.js') }}"></script>
-    <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
     <script src="{{ url_for('static', filename='js/resource-list.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/scaling.js') }}"></script>
     <script src="{{ url_for('static', filename='js/index.js') }}"></script>
   </body>
 </html>
-
-

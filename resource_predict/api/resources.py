@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any, Callable, Dict, List
 
@@ -23,6 +23,8 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
         resource_type_filter = (request.args.get("resource_type") or "").strip().lower().replace("-", "_")
+        if resource_type_filter in {"workload", "controller", "k8s_controller"}:
+            resource_type_filter = "k8s_workload"
         sort_by = (request.args.get("sort_by") or "urgency_score").strip().lower()
         top_n = safe_int(request.args.get("top_n"), 0)
         page = max(1, safe_int(request.args.get("page"), 1))
@@ -82,6 +84,8 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
         resource_type_filter = (request.args.get("resource_type") or "").strip().lower().replace("-", "_")
+        if resource_type_filter in {"workload", "controller", "k8s_controller"}:
+            resource_type_filter = "k8s_workload"
         rows = [x for x in resources if isinstance(x, dict)]
         if resource_type_filter:
             rows = [x for x in rows if _resource_type_of(x) == resource_type_filter]
@@ -169,9 +173,10 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
 
 def _resource_type_of(item: Dict[str, Any]) -> str:
     raw = str(item.get("resource_type") or "").strip().lower().replace("-", "_")
+    if raw in {"workload", "controller", "k8s_workload", "k8s_controller"}:
+        return "k8s_workload"
     if raw in {"pod", "k8s_pod"}:
         return "k8s_pod"
     if raw in {"k8s", "kubernetes", "k8s_container", "container"}:
         return "k8s_container"
     return raw or "openstack_vm"
-

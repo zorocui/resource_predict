@@ -1,4 +1,4 @@
-﻿"""
+"""
 原始监控数据与预测产物的读写、合并。
 
 - raw_data.json：仅保存观测序列（resource_id / spec / metrics），可长期固定。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -9,32 +10,92 @@ from resource_predict.data.io import read_raw_dataset, write_raw_dataset
 from resource_predict.data.updater import backup_raw_dataset, run_upsert_with_data
 from resource_predict.logging_setup import setup_application_logging
 from resource_predict.pipeline import generate_all_images
-from resource_predict.providers.k8s_prometheus import k8s_pod_prometheus_provider
+from resource_predict.pipeline.constants import RAW_DATA_FILENAME
+from resource_predict.providers.k8s_prometheus import (
+    diagnose_k8s_prometheus,
+    k8s_workload_prometheus_provider,
+)
 from resource_predict.resource_types import resource_type_of
 from resource_predict.settings import settings
 
 
+K8S_ANALYSIS_TYPES = {"k8s_pod", "k8s_workload"}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch K8S Pod metrics from Prometheus and merge them into raw_data.json."
+        description="Fetch K8S workload metrics from Prometheus and merge them into raw_data.json."
     )
     parser.add_argument(
         "--mode",
         choices=("upsert", "replace-k8s", "init"),
         default="upsert",
         help=(
-            "upsert: merge Pod data into existing raw_data.json; "
-            "replace-k8s: remove existing k8s_pod rows first, then merge; "
+            "upsert: merge K8S workload data into existing raw_data.json; "
+            "replace-k8s: remove existing K8S rows first, then merge; "
             "init: initialize raw_data.json when it does not exist."
         ),
+    )
+    parser.add_argument(
+        "--cluster",
+        action="append",
+        default=[],
+        help="只拉取指定 K8S 集群；可重复传入。默认拉取全部已配置集群。",
+    )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="只诊断 Prometheus 指标与 Workload 聚合条件，不写 raw、不触发预测。",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="与 --diagnose 配合使用，输出机器可读 JSON。",
     )
     return parser.parse_args()
 
 
-def _fetch_pod_items() -> List[Dict[str, Any]]:
-    items = k8s_pod_prometheus_provider(resources=0, n=0, freq="5min")
+def _print_diagnosis(report: Dict[str, Any]) -> None:
+    status = "通过" if report.get("ok") else "失败"
+    print(f"K8S Prometheus 诊断: {status}，检查集群 {report.get('clusters_checked', 0)} 个")
+    for cluster in report.get("clusters", []):
+        ok = "OK" if cluster.get("ok") else "FAIL"
+        print(f"\n[{ok}] {cluster.get('cluster')} - {cluster.get('prometheus_url')}")
+        counts = cluster.get("counts", {})
+        for key in (
+            "cpu_usage_series",
+            "memory_usage_series",
+            "pod_owner_rows",
+            "replicaset_owner_rows",
+            "container_series",
+            "workloads_resolved",
+            "orphan_container_series",
+            "cpu_request_series",
+            "cpu_limit_series",
+            "memory_request_series",
+            "memory_limit_series",
+        ):
+            print(f"  {key}: {counts.get(key, 0)}")
+        samples = cluster.get("sample_workloads") or []
+        if samples:
+            print("  sample_workloads:")
+            for item in samples:
+                print(
+                    "   - "
+                    f"{item.get('namespace')}/"
+                    f"{item.get('workload_kind')}/"
+                    f"{item.get('workload_name')}"
+                )
+        for warning in cluster.get("warnings") or []:
+            print(f"  WARNING: {warning}")
+        for error in cluster.get("errors") or []:
+            print(f"  ERROR: {error}")
+
+
+def _fetch_pod_items(clusters: List[str]) -> List[Dict[str, Any]]:
+    items = k8s_workload_prometheus_provider(resources=0, n=0, freq="5min", clusters=clusters)
     if not isinstance(items, list) or not items:
-        raise RuntimeError("Prometheus provider returned no K8S Pod resources")
+        raise RuntimeError("Prometheus provider returned no K8S workload resources")
     return items
 
 
@@ -48,7 +109,7 @@ def _initialize_raw(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _remove_existing_k8s(raw_path: Path) -> tuple[int, int]:
     prepared, meta = read_raw_dataset(raw_path)
-    kept = [item for item in prepared if resource_type_of(item) != "k8s_pod"]
+    kept = [item for item in prepared if resource_type_of(item) not in K8S_ANALYSIS_TYPES]
     removed = len(prepared) - len(kept)
     if removed <= 0:
         return 0, len(kept)
@@ -65,8 +126,16 @@ def main() -> int:
     setup_application_logging()
 
     out_dir = Path(settings.app.out_dir)
-    raw_path = out_dir / settings.app.raw_data_filename
-    items = _fetch_pod_items()
+    raw_path = out_dir / RAW_DATA_FILENAME
+    if args.diagnose:
+        report = diagnose_k8s_prometheus(clusters=args.cluster)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            _print_diagnosis(report)
+        return 0 if report.get("ok") else 2
+
+    items = _fetch_pod_items(args.cluster)
 
     if args.mode == "init" or not raw_path.exists():
         if raw_path.exists() and args.mode == "init":
@@ -74,23 +143,23 @@ def main() -> int:
             if backup_path is not None:
                 print(f"已备份 raw_data.json: {backup_path}")
         out = _initialize_raw(items)
-        print(f"已初始化 K8S Pod 预测 {len(out)} 个资源，目录: {out_dir}")
+        print(f"已初始化 K8S Workload 预测 {len(out)} 个资源，目录: {out_dir}")
         return 0
 
     if args.mode == "replace-k8s":
         removed, kept = _remove_existing_k8s(raw_path)
-        print(f"已移除现有 K8S Pod 资源: {removed} 个，VM 数据保留")
+        print(f"已移除现有 K8S 资源: {removed} 个，VM 数据保留")
         if kept == 0:
             out = _initialize_raw(items)
-            print(f"raw 中没有可保留的 VM 资源，已重新初始化 K8S Pod 预测 {len(out)} 个资源")
+            print(f"raw 中没有可保留的 VM 资源，已重新初始化 K8S Workload 预测 {len(out)} 个资源")
             return 0
 
     result = run_upsert_with_data(items, fail_if_busy=True)
     if not result.get("success"):
-        print(f"K8S Pod upsert 失败: {result.get('error')}", file=sys.stderr)
+        print(f"K8S Workload upsert 失败: {result.get('error')}", file=sys.stderr)
         return 1
     print(
-        "K8S Pod upsert 完成: "
+        "K8S Workload upsert 完成: "
         f"更新 {result.get('resources_updated', 0)} 个，"
         f"新增 {result.get('resources_created', 0)} 个，"
         f"数据点净增 {result.get('total_new_points', 0)}，"

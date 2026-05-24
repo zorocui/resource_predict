@@ -43,7 +43,7 @@ if __name__ == "__main__":
         "predict_only",
     }:
         out = generate_predictions_only()
-        print(f"已仅重算预测 {len(out)} 个资源，目录: {settings.generation.out_dir}")
+        print(f"已仅重算预测 {len(out)} 个资源，目录: {settings.app.out_dir}")
     else:
         out = generate_all_images(data_provider=provider)
-        print(f"已生成 {len(out)} 个云资源的预测结果，目录: {settings.generation.out_dir}")
+        print(f"已生成 {len(out)} 个云资源的预测结果，目录: {settings.app.out_dir}")

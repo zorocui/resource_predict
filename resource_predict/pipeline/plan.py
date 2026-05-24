@@ -39,13 +39,13 @@ def resolve_parallel_plan(
     cpu = max(1, os.cpu_count() or 4)
     if max_workers is not None:
         outer_workers = max(1, min(resources_ct, int(max_workers)))
-        inner_enabled = bool(getattr(cfg, "parallel_metrics", True)) and outer_workers == 1
+        inner_enabled = outer_workers == 1
     else:
         configured = getattr(cfg, "max_workers", None)
         if configured is not None:
             outer_workers = max(1, min(resources_ct, int(configured)))
-            inner_enabled = bool(getattr(cfg, "parallel_metrics", True)) and outer_workers == 1
-        elif bool(getattr(cfg, "parallel_metrics", True)) and resources_ct <= 2:
+            inner_enabled = outer_workers == 1
+        elif resources_ct <= 2:
             outer_workers = max(1, min(resources_ct, max(1, cpu // 2)))
             inner_enabled = True
         else:
@@ -54,5 +54,5 @@ def resolve_parallel_plan(
 
     inner_workers = 1
     if inner_enabled:
-        inner_workers = max(1, min(3, int(getattr(cfg, "parallel_metrics_max_workers", 3))))
+        inner_workers = 3
     return outer_workers, inner_enabled, inner_workers

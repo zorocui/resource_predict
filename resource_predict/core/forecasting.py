@@ -25,6 +25,20 @@ logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 logging.getLogger("prophet").setLevel(logging.WARNING)
 logging.getLogger("prophet.plot").setLevel(logging.CRITICAL)
 
+ARIMA_TREND = "t"
+ARIMA_AUTO_ORDER = True
+ARIMA_DEFAULT_ORDER: Tuple[int, int, int] = (1, 1, 1)
+ARIMA_CANDIDATE_ORDERS: Tuple[Tuple[int, int, int], ...] = ((1, 0, 1), (2, 0, 2))
+ARIMA_MAXITER = 25
+
+SARIMA_ORDER: Tuple[int, int, int] = (1, 1, 1)
+SARIMA_SEASONAL_PDQ: Tuple[int, int, int] = (1, 1, 1)
+SARIMA_MAX_SEASONAL_PERIOD = 24
+SARIMA_SIMPLE_DIFFERENCING = False
+SARIMA_OPTIMIZER = "lbfgs"
+SARIMA_MAXITER = 35
+SARIMA_RETRY_ON_CONVERGENCE = False
+
 
 @dataclass(frozen=True)
 class ForecastResult:
@@ -148,9 +162,9 @@ def forecast_arima(
 
     y_train = ensure_regular_freq(y_train)
     if trend is None:
-        trend = settings.forecast.arima_trend
+        trend = ARIMA_TREND
     if auto_order is None:
-        auto_order = settings.forecast.arima_auto_order
+        auto_order = ARIMA_AUTO_ORDER
 
     # --- 自动选择 order（AIC 最小）---
     # 只在少量候选里搜索，保证生成速度仍可接受。
@@ -159,7 +173,7 @@ def forecast_arima(
         # 为了既提升形状又避免太慢：
         # - 优先候选 d=0（再结合 trend='t' 吸收趋势），降低“塌成平线”的概率
         # - 候选阶数尽量少，配合较小 maxiter，避免生成被迫中断
-        candidate_orders: List[Tuple[int, int, int]] = list(settings.forecast.arima_candidate_orders)
+        candidate_orders: List[Tuple[int, int, int]] = list(ARIMA_CANDIDATE_ORDERS)
 
         best_aic: float = float("inf")
         best_order: Optional[Tuple[int, int, int]] = None
@@ -178,7 +192,7 @@ def forecast_arima(
                 # 这里主要通过 maxiter 限制每次搜索的耗时。
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always", ConvergenceWarning)
-                    res_try = model.fit(method_kwargs={"maxiter": settings.forecast.arima_maxiter})
+                    res_try = model.fit(method_kwargs={"maxiter": ARIMA_MAXITER})
                 has_conv_warn = any(issubclass(w.category, ConvergenceWarning) for w in caught)
                 if has_conv_warn or (not _is_converged(res_try)):
                     # 收敛告警时自动重试一次，保留首次结果作为兜底
@@ -186,7 +200,7 @@ def forecast_arima(
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", ConvergenceWarning)
                         res_try = model.fit(
-                            method_kwargs={"maxiter": settings.forecast.arima_maxiter * 2}
+                            method_kwargs={"maxiter": ARIMA_MAXITER * 2}
                         )
                     # 若重试后 AIC 更差（或同样未收敛），回退到首次结果
                     aic_retry = float(getattr(res_try, "aic", float("inf")))
@@ -202,10 +216,10 @@ def forecast_arima(
                 continue
 
         # 若都失败，回退到原先的 (1,1,1)
-        chosen_order = best_order if best_order is not None else settings.forecast.arima_default_order
+        chosen_order = best_order if best_order is not None else ARIMA_DEFAULT_ORDER
 
     if chosen_order is None:
-        chosen_order = settings.forecast.arima_default_order
+        chosen_order = ARIMA_DEFAULT_ORDER
 
     t0 = time.perf_counter()
     model = ARIMA(
@@ -218,13 +232,13 @@ def forecast_arima(
     # 最终用选好的 order + trend 进行拟合并预测
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConvergenceWarning)
-        res = model.fit(method_kwargs={"maxiter": settings.forecast.arima_maxiter})
+        res = model.fit(method_kwargs={"maxiter": ARIMA_MAXITER})
     has_conv_warn = any(issubclass(w.category, ConvergenceWarning) for w in caught)
     if has_conv_warn or (not _is_converged(res)):
         # 最终拟合出现收敛告警时，放宽迭代次数重试一次，并静默告警输出
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ConvergenceWarning)
-            res = model.fit(method_kwargs={"maxiter": settings.forecast.arima_maxiter * 2})
+            res = model.fit(method_kwargs={"maxiter": ARIMA_MAXITER * 2})
     cap = usage_forecast_upper_bound(y_train)
     yhat = clip_usage_range(res.forecast(steps=steps), upper=cap)
     seconds = time.perf_counter() - t0
@@ -246,35 +260,34 @@ def forecast_sarima(
         raise RuntimeError("未安装 statsmodels。请先执行: pip install statsmodels") from e
 
     y_train = ensure_regular_freq(y_train)
-    cfg = settings.forecast
     if order is None:
-        order = cfg.sarima_order
+        order = SARIMA_ORDER
     if seasonal_order is None:
         s = infer_steps_per_day(y_train.index)
-        s = max(1, min(int(s), int(cfg.sarima_max_seasonal_period)))
-        p_s, d_s, q_s = cfg.sarima_seasonal_pdq
+        s = max(1, min(int(s), int(SARIMA_MAX_SEASONAL_PERIOD)))
+        p_s, d_s, q_s = SARIMA_SEASONAL_PDQ
         seasonal_order = (p_s, d_s, q_s, s)
     t0 = time.perf_counter()
     model = SARIMAX(
         y_train,
         order=order,
         seasonal_order=seasonal_order,
-        simple_differencing=cfg.sarima_simple_differencing,
+        simple_differencing=SARIMA_SIMPLE_DIFFERENCING,
         enforce_stationarity=False,
         enforce_invertibility=False,
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConvergenceWarning)
-        res = model.fit(disp=False, method=cfg.sarima_optimizer, maxiter=cfg.sarima_maxiter)
+        res = model.fit(disp=False, method=SARIMA_OPTIMIZER, maxiter=SARIMA_MAXITER)
     has_conv_warn = any(issubclass(w.category, ConvergenceWarning) for w in caught)
-    if cfg.sarima_retry_on_convergence and (has_conv_warn or (not _is_converged(res))):
+    if SARIMA_RETRY_ON_CONVERGENCE and (has_conv_warn or (not _is_converged(res))):
         # SARIMA 对优化器较敏感：收敛告警时切到 powell 并增加迭代次数重试
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ConvergenceWarning)
             res = model.fit(
                 disp=False,
                 method="powell",
-                maxiter=cfg.sarima_maxiter * 2,
+                maxiter=SARIMA_MAXITER * 2,
             )
     cap = usage_forecast_upper_bound(y_train)
     yhat = clip_usage_range(res.get_forecast(steps=steps).predicted_mean, upper=cap)
@@ -336,3 +349,47 @@ def forecast_prophet(
     seconds = time.perf_counter() - t0
     return ForecastResult(yhat=yhat, seconds=seconds)
 
+
+def forecast_seasonal_naive(
+    y_train: pd.Series,
+    steps: int,
+    *,
+    season_length: Optional[int] = None,
+) -> ForecastResult:
+    """Forecast by replaying the most recent seasonal window."""
+    y_train = ensure_regular_freq(y_train)
+    t0 = time.perf_counter()
+    if season_length is None:
+        season_length = infer_steps_per_day(y_train.index)
+    season_length = max(1, min(int(season_length), len(y_train)))
+    pattern = y_train.iloc[-season_length:].to_numpy(dtype=float)
+    if pattern.size == 0:
+        pattern = np.array([0.0], dtype=float)
+    values = np.resize(pattern, int(steps))
+    freq = infer_pandas_freq(y_train.index)
+    idx = pd.date_range(y_train.index[-1], periods=int(steps) + 1, freq=freq)[1:]
+    cap = usage_forecast_upper_bound(y_train)
+    yhat = clip_usage_range(pd.Series(values, index=idx, name="yhat"), upper=cap)
+    seconds = time.perf_counter() - t0
+    return ForecastResult(yhat=yhat, seconds=seconds)
+
+
+def forecast_rolling_mean(
+    y_train: pd.Series,
+    steps: int,
+    *,
+    window: Optional[int] = None,
+) -> ForecastResult:
+    """Forecast with the recent rolling mean as a stable low-variance baseline."""
+    y_train = ensure_regular_freq(y_train)
+    t0 = time.perf_counter()
+    if window is None:
+        window = min(max(3, infer_steps_per_day(y_train.index) // 2), len(y_train))
+    window = max(1, min(int(window), len(y_train)))
+    value = float(y_train.iloc[-window:].mean()) if len(y_train) else 0.0
+    freq = infer_pandas_freq(y_train.index)
+    idx = pd.date_range(y_train.index[-1], periods=int(steps) + 1, freq=freq)[1:]
+    cap = usage_forecast_upper_bound(y_train)
+    yhat = clip_usage_range(pd.Series([value] * int(steps), index=idx, name="yhat"), upper=cap)
+    seconds = time.perf_counter() - t0
+    return ForecastResult(yhat=yhat, seconds=seconds)

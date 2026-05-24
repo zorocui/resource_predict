@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """
 模拟全量 / 增量数据源（resource_predict.providers.mock）。
@@ -221,7 +221,7 @@ def _mock_vm_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]
     return out
 
 
-def _mock_k8s_pod_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
+def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
     base_seed = 7000 + n
     idx = pd.date_range("2025-01-01", periods=n, freq=freq)
     idx_list = idx.tolist()
@@ -243,8 +243,9 @@ def _mock_k8s_pod_provider(resources: int, n: int, freq: str) -> List[Dict[str, 
     for i in range(resources):
         namespace = namespaces[i % len(namespaces)]
         owner_kind, owner_name = owners[i % len(owners)]
-        pod = f"{owner_name}-{1000 + i:04d}"
-        container = "app" if i % 4 else "sidecar"
+        workload_name = f"{owner_name}-{i % 3}"
+        pods = [f"{workload_name}-{1000 + i * 3 + j:04d}" for j in range(3)]
+        containers = ["app", "sidecar"] if i % 4 == 0 else ["app"]
         mode = ["scale_out", "scale_in", "hold", "scale_out", "hold"][i % 5]
         rng_cpu = np.random.default_rng(base_seed + i * 5 + 0)
         rng_mem = np.random.default_rng(base_seed + i * 5 + 1)
@@ -256,16 +257,19 @@ def _mock_k8s_pod_provider(resources: int, n: int, freq: str) -> List[Dict[str, 
         memory_limit = memory_limits[i % len(memory_limits)]
         out.append(
             {
-                "resource_id": f"k8s:{clusters[i % len(clusters)]}:{namespace}:{pod}:{container}",
-                "resource_type": "k8s_pod",
+                "resource_id": f"k8s:{clusters[i % len(clusters)]}:{namespace}:{owner_kind.lower()}:{workload_name}",
+                "resource_type": "k8s_workload",
                 "spec": {
                     "cluster": clusters[i % len(clusters)],
                     "namespace": namespace,
-                    "pod": pod,
-                    "container": container,
-                    "node": node_names[i % len(node_names)],
                     "owner_kind": owner_kind,
-                    "owner_name": owner_name,
+                    "owner_name": workload_name,
+                    "workload_kind": owner_kind,
+                    "workload_name": workload_name,
+                    "pods_observed": pods,
+                    "containers_observed": containers,
+                    "replicas_observed": len(pods),
+                    "node": node_names[i % len(node_names)],
                     "cpu_request_cores": cpu_request,
                     "cpu_limit_cores": cpu_limit,
                     "memory_request_gb": memory_request,
@@ -289,11 +293,11 @@ def _mock_k8s_pod_provider(resources: int, n: int, freq: str) -> List[Dict[str, 
 def mock_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
     if resources <= 1:
         return _mock_vm_provider(resources=resources, n=n, freq=freq)
-    pod_count = max(1, resources // 3)
-    vm_count = max(1, resources - pod_count)
+    workload_count = max(1, resources // 3)
+    vm_count = max(1, resources - workload_count)
     return [
         *_mock_vm_provider(resources=vm_count, n=n, freq=freq),
-        *_mock_k8s_pod_provider(resources=pod_count, n=n, freq=freq),
+        *_mock_k8s_workload_provider(resources=workload_count, n=n, freq=freq),
     ]
 
 
@@ -304,4 +308,3 @@ if __name__ == "__main__":
     print("first resource keys:", items[0].keys())
     print("first metric timestamps[0]:", items[0]["metrics"]["cpu"]["timestamps"][0])
     # print(items)
-

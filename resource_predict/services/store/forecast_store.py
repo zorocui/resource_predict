@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -6,6 +6,12 @@ from typing import Any, Dict, List, Optional
 
 from resource_predict.settings import AppConfig, GenerationConfig, settings
 from resource_predict.data.io import index_prepared_by_id, merge_charts_into_detail, read_raw_dataset
+from resource_predict.pipeline.constants import (
+    DETAILS_DIRNAME,
+    MANIFEST_FILENAME,
+    RAW_DATA_FILENAME,
+    SUMMARY_INDEX_FILENAME,
+)
 from resource_predict.services.store.resource_detail import apply_display_window
 
 
@@ -24,10 +30,10 @@ class ForecastStore:
         out_dir = Path(app_cfg.out_dir)
         self._generation_cfg = generation_cfg
         self._display_window_points = int(settings.update.display_window_points)
-        self._manifest_path = out_dir / app_cfg.manifest_filename
-        self._summary_path = out_dir / app_cfg.summary_index_filename
-        self._details_dir = out_dir / app_cfg.details_dirname
-        self._raw_path = out_dir / app_cfg.raw_data_filename
+        self._manifest_path = out_dir / MANIFEST_FILENAME
+        self._summary_path = out_dir / SUMMARY_INDEX_FILENAME
+        self._details_dir = out_dir / DETAILS_DIRNAME
+        self._raw_path = out_dir / RAW_DATA_FILENAME
         self._max_details_cache = max_details_cache
         self._summary_cache: Dict[str, Any] = {"mtime": 0.0, "data": None}
         self._details_cache: Dict[str, Dict[str, Any]] = {}
@@ -187,4 +193,3 @@ class ForecastStore:
             if isinstance(item, dict) and str(item.get("resource_id")) == resource_id:
                 return item
         return None
-

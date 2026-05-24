@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from typing import Dict, List
@@ -29,29 +29,163 @@ _METRIC_TO_DIM = {
 }
 
 
-def _metric_is_hot(stats: Dict[str, float]) -> bool:
-    """与 build_scaling_advice 中 out_reasons 同口径，判断该维度是否真正高负载。"""
+def _policy_tier_for_spec(spec: Dict[str, object]) -> str:
+    cfg = settings.decision
+    explicit = str((spec or {}).get("policy_tier") or "").lower().strip()
+    if explicit in {"conservative", "balanced", "aggressive"}:
+        return explicit
+    text = " ".join(
+        str((spec or {}).get(k) or "").lower()
+        for k in ("namespace", "cluster", "owner_name", "service", "app", "env")
+    )
+    if any(x and x in text for x in cfg.conservative_namespaces):
+        return "conservative"
+    if any(x and x in text for x in cfg.aggressive_namespaces):
+        return "aggressive"
+    default = str(cfg.default_policy_tier or "balanced").lower().strip()
+    return default if default in {"conservative", "balanced", "aggressive"} else "balanced"
+
+
+def _policy_thresholds(tier: str) -> Dict[str, float]:
+    cfg = settings.decision
+    out = float(cfg.scale_out_threshold)
+    in_avg = float(cfg.scale_in_threshold)
+    in_p95 = float(cfg.scale_in_p95_guard)
+    peak = float(cfg.peak_guard_threshold)
+    if tier == "conservative":
+        return {
+            "scale_out_threshold": max(0.01, out - 0.05),
+            "scale_in_threshold": max(0.01, in_avg - 0.05),
+            "scale_in_p95_guard": max(0.01, in_p95 - 0.05),
+            "peak_guard_threshold": max(0.01, peak - 0.05),
+        }
+    if tier == "aggressive":
+        return {
+            "scale_out_threshold": min(1.5, out + 0.05),
+            "scale_in_threshold": min(0.95, in_avg + 0.05),
+            "scale_in_p95_guard": min(0.95, in_p95 + 0.05),
+            "peak_guard_threshold": min(1.5, peak + 0.05),
+        }
+    return {
+        "scale_out_threshold": out,
+        "scale_in_threshold": in_avg,
+        "scale_in_p95_guard": in_p95,
+        "peak_guard_threshold": peak,
+    }
+
+
+def _metric_is_hot(stats: Dict[str, float], thresholds: Dict[str, float] | None = None) -> bool:
+    """判断该维度是否已经形成扩容信号。"""
     cfg = settings.decision
     p95 = float(stats.get("p95", 0.0))
     peak = float(stats.get("peak", 0.0))
     gap = float(stats.get("gap", 0.0))
     slope = float(stats.get("slope", 0.0))
     delta = float(stats.get("window_mean_delta", 0.0))
-    if p95 >= float(cfg.scale_out_threshold):
+    thresholds = thresholds or _policy_thresholds("balanced")
+    if p95 >= float(thresholds["scale_out_threshold"]):
         return True
-    if peak >= float(cfg.peak_guard_threshold) and gap >= float(cfg.peak_valley_gap_threshold):
+    if peak >= float(thresholds["peak_guard_threshold"]) and gap >= float(cfg.peak_valley_gap_threshold):
         return True
     if slope >= float(cfg.uptrend_slope_threshold) and delta >= float(cfg.window_mean_delta_threshold):
         return True
     return False
 
 
-def _metric_is_cold(stats: Dict[str, float]) -> bool:
-    """与 build_scaling_advice 中 in_reasons 同口径，判断该维度是否真正低负载。"""
+def _metric_is_cold(stats: Dict[str, float], thresholds: Dict[str, float] | None = None) -> bool:
+    """判断该维度是否已经形成缩容信号。"""
     cfg = settings.decision
     avg = float(stats.get("avg", 0.0))
     p95 = float(stats.get("p95", 0.0))
-    return avg < float(cfg.scale_in_threshold) and p95 < float(cfg.scale_in_p95_guard)
+    thresholds = thresholds or _policy_thresholds("balanced")
+    return avg < float(thresholds["scale_in_threshold"]) and p95 < float(thresholds["scale_in_p95_guard"])
+
+
+def _risk_profile(
+    action: str,
+    by_metric: Dict[str, Dict[str, float]],
+    metric_actions: Dict[str, str],
+    *,
+    tier: str,
+    thresholds: Dict[str, float],
+) -> Dict[str, object]:
+    cfg = settings.decision
+    saturation_scores: List[float] = []
+    idle_scores: List[float] = []
+    first_saturation_idx = None
+    high_duration = 0
+    for metric, st in by_metric.items():
+        p95 = float(st.get("p95", 0.0))
+        peak = float(st.get("peak", 0.0))
+        avg = float(st.get("avg", 0.0))
+        high_ratio = float(st.get("high_ratio", 0.0))
+        low_ratio = float(st.get("low_ratio", 0.0))
+        saturation_scores.append(
+            min(1.0, max(0.0, (max(p95, peak) - thresholds["scale_out_threshold"]) / 0.25))
+            * 0.65
+            + min(1.0, high_ratio) * 0.35
+        )
+        idle_scores.append(
+            min(1.0, max(0.0, (thresholds["scale_in_threshold"] - avg) / max(thresholds["scale_in_threshold"], 0.01)))
+            * 0.55
+            + min(1.0, low_ratio) * 0.45
+        )
+        if metric_actions.get(metric) == "scale_out":
+            high_duration = max(high_duration, int(st.get("high_streak", 0)))
+            if first_saturation_idx is None:
+                first_saturation_idx = 0
+    saturation_risk = round(100.0 * max(saturation_scores, default=0.0), 2)
+    idle_opportunity = round(100.0 * max(idle_scores, default=0.0), 2)
+    if action == "scale_out":
+        risk_score = saturation_risk
+    elif action == "scale_in":
+        risk_score = idle_opportunity
+    else:
+        risk_score = max(saturation_risk * 0.35, idle_opportunity * 0.2)
+    return {
+        "policy_tier": tier,
+        "risk_score": round(float(risk_score), 2),
+        "saturation_risk": saturation_risk,
+        "idle_opportunity": idle_opportunity,
+        "estimated_saturation_start_step": first_saturation_idx,
+        "high_load_duration_points": high_duration,
+        "thresholds": {
+            "scale_out": round(float(thresholds["scale_out_threshold"]), 4),
+            "scale_in_avg": round(float(thresholds["scale_in_threshold"]), 4),
+            "scale_in_p95": round(float(thresholds["scale_in_p95_guard"]), 4),
+            "peak_guard": round(float(thresholds["peak_guard_threshold"]), 4),
+        },
+        "cooldown_minutes": (
+            int(cfg.scale_out_cooldown_minutes)
+            if action == "scale_out"
+            else int(cfg.scale_in_cooldown_minutes)
+            if action == "scale_in"
+            else 0
+        ),
+    }
+
+
+def _action_gate(action: str, confidence_score: float, *, tier: str) -> Dict[str, object]:
+    cfg = settings.decision
+    if action == "scale_out":
+        required = int(cfg.scale_out_confirmations)
+    elif action == "scale_in":
+        required = int(cfg.scale_in_confirmations)
+    else:
+        required = 1
+    if tier == "conservative" and action == "scale_in":
+        required += 1
+    if tier == "aggressive" and action == "scale_in":
+        required = max(1, required - 1)
+    if tier == "conservative" and action == "scale_out":
+        required = max(1, required - 1)
+    ready = action == "hold" or (required <= 1 and confidence_score >= 72.0)
+    return {
+        "state": "ready" if ready else "observe",
+        "required_consistent_rounds": required,
+        "observed_consistent_rounds": 1 if action != "hold" else 0,
+        "reason": "needs repeated confirmation before execution" if not ready else "ready for execution review",
+    }
 
 
 def _finalize_target_spec_even(action: str, target: Dict[str, int], disk_min_gb: int = 50) -> Dict[str, int]:
@@ -390,9 +524,9 @@ def build_scaling_advice(
     - stats: 每个指标的统计与趋势特征（avg/p95/peak/gap/slope/...）
     """
     cfg = settings.decision
+    policy_tier = _policy_tier_for_spec(current_spec or {})
+    policy_thresholds = _policy_thresholds(policy_tier)
     by_metric: Dict[str, Dict[str, float]] = {}
-    out_reasons: List[str] = []
-    in_reasons: List[str] = []
     metric_actions: Dict[str, str] = {}
     metric_reasons: Dict[str, str] = {}
     metric_label = {"cpu": "CPU", "memory": "内存", "disk": "硬盘"}
@@ -414,32 +548,10 @@ def build_scaling_advice(
         st["low_streak"] = float(low_streak)
         by_metric[metric] = st
 
-        if st["p95"] >= cfg.scale_out_threshold:
-            out_reasons.append(f"{metric}:P95={st['p95'] * 100:.1f}%")
-        if high_streak >= cfg.consecutive_points:
-            out_reasons.append(f"{metric}:连续高负载{high_streak}点")
-        if st["peak"] >= cfg.peak_guard_threshold and st["gap"] >= cfg.peak_valley_gap_threshold:
-            out_reasons.append(
-                f"{metric}:峰值{st['peak'] * 100:.1f}%且峰谷差{st['gap'] * 100:.1f}%"
-            )
-        if st["slope"] >= cfg.uptrend_slope_threshold and st["window_mean_delta"] >= cfg.window_mean_delta_threshold:
-            out_reasons.append(
-                f"{metric}:上升趋势明显(slope={st['slope']:.4f},Δmean={st['window_mean_delta'] * 100:.1f})"
-            )
-
-        if st["avg"] < cfg.scale_in_threshold and st["p95"] < cfg.scale_in_p95_guard:
-            in_reasons.append(f"{metric}:均值{st['avg'] * 100:.1f}%且P95={st['p95'] * 100:.1f}%")
-        if low_streak >= cfg.consecutive_points:
-            in_reasons.append(f"{metric}:连续低负载{low_streak}点")
-        if st["slope"] <= cfg.downtrend_slope_threshold and st["window_mean_delta"] <= -cfg.window_mean_delta_threshold:
-            in_reasons.append(
-                f"{metric}:下降趋势明显(slope={st['slope']:.4f},Δmean={st['window_mean_delta'] * 100:.1f})"
-            )
-
     for metric in ("cpu", "memory", "disk"):
         st = by_metric[metric]
-        is_hot = _metric_is_hot(st)
-        is_cold = _metric_is_cold(st)
+        is_hot = _metric_is_hot(st, policy_thresholds)
+        is_cold = _metric_is_cold(st, policy_thresholds)
         has_strong_uptrend = st["slope"] >= cfg.uptrend_slope_threshold and st["window_mean_delta"] >= cfg.window_mean_delta_threshold
         label = metric_label[metric]
 
@@ -468,12 +580,6 @@ def build_scaling_advice(
         metric_reasons=metric_reasons,
     )
     target_spec = _pick_target_spec_by_metric(current_spec or {}, by_metric, metric_actions)
-    _reconcile_noop_metric_actions(
-        current_spec=current_spec or {},
-        target_spec=target_spec,
-        metric_actions=metric_actions,
-        metric_reasons=metric_reasons,
-    )
     action_info = _summarize_metric_actions(metric_actions)
     action = str(action_info["action"])
     has_mixed = bool(action_info["has_mixed"])
@@ -490,13 +596,25 @@ def build_scaling_advice(
         has_mixed_signals=has_mixed,
     )
     confidence = str(confidence_info["label"])
+    confidence_score = float(confidence_info["score"])
+    risk_profile = _risk_profile(
+        action,
+        by_metric,
+        metric_actions,
+        tier=policy_tier,
+        thresholds=policy_thresholds,
+    )
+    action_gate = _action_gate(action, confidence_score, tier=policy_tier)
 
     return {
         "action": action,
         "reason": reason,
         "confidence": confidence,
-        "confidence_score": confidence_info["score"],
+        "confidence_score": confidence_score,
         "confidence_metric_scores": confidence_info["metric_scores"],
+        "policy_tier": policy_tier,
+        "risk_profile": risk_profile,
+        "action_gate": action_gate,
         "suggested_delta": suggested_delta,
         "metric_actions": metric_actions,
         "metric_reasons": metric_reasons,
@@ -504,4 +622,3 @@ def build_scaling_advice(
         "stats": by_metric,
         "has_mixed_signals": has_mixed,
     }
-

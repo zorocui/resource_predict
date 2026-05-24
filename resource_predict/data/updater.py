@@ -1,4 +1,4 @@
-﻿"""
+"""
 定时/手动数据更新与 raw 文件合并。
 
 功能：
@@ -28,6 +28,7 @@ import numpy as np
 
 from resource_predict.settings import settings
 from resource_predict.data.io import coerce_metric_series, read_raw_dataset, write_raw_dataset
+from resource_predict.pipeline.constants import RAW_DATA_FILENAME
 from resource_predict.providers.mock import mock_incremental_provider
 from resource_predict.resource_types import metric_names_for_resource
 
@@ -413,7 +414,7 @@ def run_update(
 
     provider = incremental_provider or _resolve_provider()
     out_dir = Path(settings.app.out_dir)
-    raw_path = out_dir / settings.app.raw_data_filename
+    raw_path = out_dir / RAW_DATA_FILENAME
 
     logger.info("[updater] 开始读取 raw_data.json …")
     prepared, meta = read_raw_dataset(raw_path)
@@ -450,7 +451,7 @@ def _do_update(
         为 True 且无法立即取得排他锁时抛出 UpdateBusyError（由 API 映射为 409）。
     """
     out_dir = Path(settings.app.out_dir)
-    raw_path = out_dir / settings.app.raw_data_filename
+    raw_path = out_dir / RAW_DATA_FILENAME
 
     result: Dict[str, Any] = {
         "success": False,
@@ -780,4 +781,3 @@ def stop_background_updater(timeout: float = 10.0) -> None:
         else:
             logger.info("[updater] 后台调度线程已退出")
     _scheduler_thread = None
-

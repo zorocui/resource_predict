@@ -17,6 +17,7 @@ venv/
 ENV/
 
 # Local scratch / generated checks
+.superpowers/
 .tmp_*/
 .tmp_upsert_check/
 .playwright-cli/

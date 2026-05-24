@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
@@ -37,6 +37,8 @@ def matches_query(item: Dict[str, Any], q: str) -> bool:
         cluster = str(spec.get("cluster", ""))
         candidates_extra = [
             str(spec.get("namespace", "")),
+            str(spec.get("workload_kind", "")),
+            str(spec.get("workload_name", "")),
             str(spec.get("pod", "")),
             str(spec.get("container", "")),
             str(spec.get("node", "")),
@@ -68,4 +70,3 @@ def prediction_pending_for(resource_id: str) -> Optional[Dict[str, Any]]:
     if str(resource_id) not in ids:
         return None
     return status
-

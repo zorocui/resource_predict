@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -14,6 +14,12 @@ from resource_predict.resource_types import metric_names_for_resource
 logger = logging.getLogger(__name__)
 
 ExternalProvider = Callable[..., List[Dict[str, Any]]]
+MOCK_CPU_SCALE = 3.0
+MOCK_CPU_OFFSET = 20.0
+MOCK_MEMORY_SCALE = 2.4
+MOCK_MEMORY_OFFSET = 15.0
+MOCK_DISK_SCALE = 2.2
+MOCK_DISK_OFFSET = 10.0
 
 
 def format_spec_for_log(spec: Any) -> str:
@@ -122,9 +128,9 @@ def build_prepared_data(
         y_cpu = simulate_curve(n=n, seed=base_seed + i * 3 + 0, freq=freq)
         y_mem = simulate_curve(n=n, seed=base_seed + i * 3 + 1, freq=freq)
         y_disk = simulate_curve(n=n, seed=base_seed + i * 3 + 2, freq=freq)
-        y_cpu = np.clip((y_cpu * cfg.cpu_scale + cfg.cpu_offset) / 100.0, 0.0, 1.0)
-        y_mem = np.clip((y_mem * cfg.memory_scale + cfg.memory_offset) / 100.0, 0.0, 1.0)
-        y_disk = np.clip((y_disk * cfg.disk_scale + cfg.disk_offset) / 100.0, 0.0, 1.0)
+        y_cpu = np.clip((y_cpu * MOCK_CPU_SCALE + MOCK_CPU_OFFSET) / 100.0, 0.0, 1.0)
+        y_mem = np.clip((y_mem * MOCK_MEMORY_SCALE + MOCK_MEMORY_OFFSET) / 100.0, 0.0, 1.0)
+        y_disk = np.clip((y_disk * MOCK_DISK_SCALE + MOCK_DISK_OFFSET) / 100.0, 0.0, 1.0)
         out.append(
             {
                 "resource_id": f"resource_{i+1:02d}",
@@ -135,4 +141,3 @@ def build_prepared_data(
             }
         )
     return out
-

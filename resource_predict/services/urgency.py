@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from typing import Any, Dict, List
@@ -22,6 +22,9 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     metric_actions = advice.get("metric_actions", {})
     if not isinstance(metric_actions, dict):
         metric_actions = {}
+    risk_profile = advice.get("risk_profile", {})
+    if not isinstance(risk_profile, dict):
+        risk_profile = {}
 
     def _num(v: Any, default: float = 0.0) -> float:
         try:
@@ -112,6 +115,7 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     return round(
         (35.0 if action in {"scale_out", "scale_out_candidate"} else 18.0)
         + confidence_bonus
+        + min(20.0, 0.2 * _num(risk_profile.get("risk_score")))
         + max(metric_scores)
         + 0.25 * sum(sorted(metric_scores, reverse=True)[1:])
         + 4.0 * max(0, len(metric_scores) - 1)
@@ -119,4 +123,3 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         + _target_change_score(),
         3,
     )
-

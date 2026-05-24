@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import concurrent.futures
 import logging
@@ -12,9 +12,16 @@ import pandas as pd
 from resource_predict.settings import settings
 from resource_predict.data.io import read_raw_dataset, write_raw_dataset
 from resource_predict.core.decision import build_scaling_advice
-from resource_predict.core.forecasting import forecast_arima, forecast_prophet, forecast_sarima
+from resource_predict.core.forecasting import (
+    forecast_arima,
+    forecast_prophet,
+    forecast_rolling_mean,
+    forecast_sarima,
+    forecast_seasonal_naive,
+)
 from resource_predict.core.k8s_pod_decision import build_k8s_pod_advice
 from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resource, resource_type_of
+from resource_predict.pipeline.constants import MANIFEST_FILENAME, RAW_DATA_FILENAME
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
 from resource_predict.pipeline.prepare import ExternalProvider, build_prepared_data
@@ -46,12 +53,10 @@ def generate_all_images(
     predict_only=True 时从 raw_data.json 读取，不覆盖原始数据。
     """
     cfg = settings.generation
-    out_dir = out_dir or cfg.out_dir
+    out_dir = out_dir or settings.app.out_dir
     test_size = test_size if test_size is not None else cfg.test_size
     future_steps = future_steps if future_steps is not None else cfg.future_steps
-    timing_mode = (model_timing_mode or cfg.timing_stats_mode).lower().strip()
-    if timing_mode not in {"on", "off", "auto"}:
-        raise ValueError("model_timing_mode 仅支持: on / off / auto")
+    timing_enabled = bool(model_timing_mode and model_timing_mode.lower().strip() == "on")
     if future_steps <= 0:
         raise ValueError("future_steps 必须为正整数")
     if cfg.detail_chunk_size <= 0:
@@ -74,7 +79,7 @@ def generate_all_images(
     if predict_only:
         if data_provider is not None:
             raise ValueError("predict_only=True 时不应再传入 data_provider")
-        raw_path = out_base / settings.app.raw_data_filename
+        raw_path = out_base / RAW_DATA_FILENAME
         prepared_data, raw_meta = read_raw_dataset(raw_path)
         raw_prepared_data = prepared_data
         if partial_resource_ids:
@@ -110,7 +115,7 @@ def generate_all_images(
         n = n if n is not None else cfg.n
         base_seed = base_seed if base_seed is not None else cfg.base_seed
         freq = freq or cfg.freq
-        raw_path = out_base / settings.app.raw_data_filename
+        raw_path = out_base / RAW_DATA_FILENAME
         prepared_data = build_prepared_data(
             resources=resources,
             n=n,
@@ -139,18 +144,18 @@ def generate_all_images(
         metric_partial_enabled,
     )
 
-    if timing_mode == "auto":
-        timing_enabled = resources_ct <= cfg.timing_stats_auto_resources_threshold
-    else:
-        timing_enabled = timing_mode == "on"
-
     active_methods: List[str] = []
-    if settings.forecast.enable_arima:
+    enabled_methods = set(settings.forecast.enabled_methods)
+    if "arima" in enabled_methods:
         active_methods.append("arima")
-    if settings.forecast.enable_sarima:
+    if "sarima" in enabled_methods:
         active_methods.append("sarima")
-    if settings.forecast.enable_prophet:
+    if "prophet" in enabled_methods:
         active_methods.append("prophet")
+    if "seasonal_naive" in enabled_methods:
+        active_methods.append("seasonal_naive")
+    if "rolling_mean" in enabled_methods:
+        active_methods.append("rolling_mean")
     if not active_methods:
         raise ValueError("至少需要启用一个预测模型（ARIMA/SARIMA/Prophet）")
 
@@ -170,6 +175,169 @@ def generate_all_images(
     def _series_to_lists(s: pd.Series) -> List[float]:
         return s.to_numpy(dtype=float).tolist()
 
+    def _forecast_by_method(method_name: str, y_train: pd.Series, steps: int):
+        if method_name == "arima":
+            return forecast_arima(y_train, steps)
+        if method_name == "sarima":
+            return forecast_sarima(y_train, steps)
+        if method_name == "prophet":
+            return forecast_prophet(y_train, steps)
+        if method_name == "seasonal_naive":
+            return forecast_seasonal_naive(y_train, steps)
+        if method_name == "rolling_mean":
+            return forecast_rolling_mean(y_train, steps)
+        raise ValueError(f"Unsupported forecast method: {method_name}")
+
+    def _rolling_backtest_metrics(y_full: pd.Series, method_name: str) -> Dict[str, float]:
+        folds = max(1, int(getattr(settings.forecast, "rolling_backtest_folds", 1)))
+        fold_size = int(test_size)
+        min_train = max(fold_size, 24)
+        if folds <= 1 or len(y_full) < min_train + fold_size * 2:
+            return {}
+        scores: List[Dict[str, float]] = []
+        max_folds = min(folds, max(1, (len(y_full) - min_train) // fold_size))
+        for fold in range(max_folds):
+            test_end = len(y_full) - fold * fold_size
+            test_start = test_end - fold_size
+            if test_start < min_train:
+                break
+            train = y_full.iloc[:test_start]
+            test = y_full.iloc[test_start:test_end]
+            if len(train) <= 1 or len(test) != fold_size:
+                continue
+            try:
+                res = _forecast_by_method(method_name, train, fold_size)
+                pred = res.yhat.copy()
+                pred.index = test.index
+                scores.append(_metrics(test, pred))
+            except Exception:
+                continue
+        if not scores:
+            return {}
+        return {
+            "rolling_mae": float(np.mean([s["mae"] for s in scores])),
+            "rolling_rmse": float(np.mean([s["rmse"] for s in scores])),
+            "rolling_folds": float(len(scores)),
+        }
+
+    def _anomaly_profile(y_full: pd.Series) -> Dict[str, Any]:
+        values = y_full.to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size < 8:
+            return {
+                "is_anomalous": False,
+                "robust_zscore": 0.0,
+                "recent_value": float(values[-1]) if values.size else 0.0,
+                "route": "normal",
+            }
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        scale = max(1.4826 * mad, 1e-6)
+        recent_window = values[-min(3, values.size):]
+        recent_value = float(np.max(recent_window))
+        robust_z = float(abs(recent_value - median) / scale)
+        threshold = float(settings.forecast.anomaly_route_zscore_threshold)
+        return {
+            "is_anomalous": bool(robust_z >= threshold),
+            "robust_zscore": round(robust_z, 3),
+            "recent_value": recent_value,
+            "median": median,
+            "mad": mad,
+            "route": "robust" if robust_z >= threshold else "normal",
+        }
+
+    def _ensemble_series(
+        preds_by_method: Dict[str, pd.Series],
+        metrics_by_method: Dict[str, Dict[str, float]],
+    ) -> Optional[pd.Series]:
+        if not preds_by_method or not bool(settings.forecast.enable_ensemble):
+            return None
+        weighted_values = None
+        total_weight = 0.0
+        index = next(iter(preds_by_method.values())).index
+        for method_name, series in preds_by_method.items():
+            score = float(metrics_by_method.get(method_name, {}).get("selection_rmse", np.nan))
+            if not np.isfinite(score):
+                score = float(metrics_by_method.get(method_name, {}).get("rmse", np.nan))
+            if not np.isfinite(score):
+                continue
+            weight = 1.0 / max(score, 1e-6)
+            arr = series.to_numpy(dtype=float)
+            weighted_values = arr * weight if weighted_values is None else weighted_values + arr * weight
+            total_weight += weight
+        if weighted_values is None or total_weight <= 0:
+            return None
+        return pd.Series(weighted_values / total_weight, index=index, name="yhat")
+
+    def _mean_metric(metrics_by_method: Dict[str, Dict[str, float]], name: str) -> Optional[float]:
+        values = [
+            float(v[name])
+            for k, v in metrics_by_method.items()
+            if k != "ensemble" and v.get(name) is not None
+        ]
+        return float(np.mean(values)) if values else None
+
+    def _choose_best_method(
+        *,
+        metrics_by_method: Dict[str, Dict[str, float]],
+        anomaly: Dict[str, Any],
+    ) -> str:
+        candidates = list(metrics_by_method.keys())
+        if not candidates:
+            raise ValueError("no forecast candidates")
+        best = min(
+            candidates,
+            key=lambda k: metrics_by_method[k].get("selection_rmse", metrics_by_method[k].get("rmse", float("inf"))),
+        )
+        if not anomaly.get("is_anomalous"):
+            return best
+        robust_candidates = [m for m in ("ensemble", "seasonal_naive", "rolling_mean") if m in metrics_by_method]
+        if not robust_candidates:
+            return best
+        return min(
+            robust_candidates,
+            key=lambda k: metrics_by_method[k].get("selection_rmse", metrics_by_method[k].get("rmse", float("inf"))),
+        )
+
+    def _build_resource_profile(
+        *,
+        resource_type: str,
+        futures_by_metric: Dict[str, np.ndarray],
+        advice: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        metric_scores: Dict[str, float] = {}
+        for metric, values in futures_by_metric.items():
+            arr = np.asarray(values, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            metric_scores[metric] = float(np.percentile(arr, 95)) if arr.size else 0.0
+        hot = [m for m, v in metric_scores.items() if v >= 0.8]
+        cold = [m for m, v in metric_scores.items() if v <= 0.2]
+        dominant = max(metric_scores, key=metric_scores.get) if metric_scores else ""
+        if len(hot) >= 2:
+            shape = "balanced_pressure"
+        elif dominant == "cpu" and hot:
+            shape = "compute_bound"
+        elif dominant == "memory" and hot:
+            shape = "memory_bound"
+        elif dominant == "disk" and hot:
+            shape = "storage_bound"
+        elif len(cold) == len(metric_scores) and metric_scores:
+            shape = "idle_candidate"
+        else:
+            shape = "steady"
+        metric_actions = {}
+        if isinstance(advice, dict) and isinstance(advice.get("metric_actions"), dict):
+            metric_actions = advice["metric_actions"]
+        return {
+            "resource_type": resource_type,
+            "shape": shape,
+            "dominant_metric": dominant,
+            "hot_metrics": hot,
+            "cold_metrics": cold,
+            "metric_p95": {k: round(v, 4) for k, v in metric_scores.items()},
+            "metric_actions": metric_actions,
+        }
+
     def _worker(i: int) -> Dict[str, Any]:
         worker_started = time.perf_counter()
         source = prepared_data[i]
@@ -184,32 +352,67 @@ def generate_all_images(
             timing_local = {m: 0.0 for m in active_methods}
             preds: Dict[str, pd.Series] = {}
             metrics: Dict[str, Dict[str, float]] = {}
+            anomaly = _anomaly_profile(y_full)
             for m in active_methods:
-                if m == "arima":
-                    res = forecast_arima(y_train, test_size)
-                elif m == "sarima":
-                    res = forecast_sarima(y_train, test_size)
-                else:
-                    res = forecast_prophet(y_train, test_size)
+                res = _forecast_by_method(m, y_train, test_size)
                 pred = res.yhat.copy()
                 pred.index = y_test.index
                 preds[m] = pred
                 metrics[m] = _metrics(y_test, pred)
+                rolling = _rolling_backtest_metrics(y_full, m)
+                metrics[m].update(rolling)
+                if rolling.get("rolling_rmse") is not None:
+                    metrics[m]["selection_rmse"] = (
+                        0.65 * float(metrics[m]["rmse"])
+                        + 0.35 * float(rolling["rolling_rmse"])
+                    )
+                else:
+                    metrics[m]["selection_rmse"] = float(metrics[m]["rmse"])
                 timing_local[m] += float(res.seconds)
 
-            best = min(metrics.keys(), key=lambda k: metrics[k]["rmse"])
+            ensemble_pred = _ensemble_series(preds, metrics)
+            if ensemble_pred is not None:
+                preds["ensemble"] = ensemble_pred
+                metrics["ensemble"] = _metrics(y_test, ensemble_pred)
+                rolling_rmse = _mean_metric(metrics, "rolling_rmse")
+                if rolling_rmse is not None:
+                    metrics["ensemble"]["rolling_rmse"] = rolling_rmse
+                    rolling_mae = _mean_metric(metrics, "rolling_mae")
+                    if rolling_mae is not None:
+                        metrics["ensemble"]["rolling_mae"] = rolling_mae
+                    metrics["ensemble"]["rolling_folds"] = max(
+                        float(v.get("rolling_folds", 0.0))
+                        for k, v in metrics.items()
+                        if k != "ensemble"
+                    )
+                    metrics["ensemble"]["selection_rmse"] = (
+                        0.65 * float(metrics["ensemble"]["rmse"])
+                        + 0.35 * rolling_rmse
+                    )
+                else:
+                    metrics["ensemble"]["selection_rmse"] = float(metrics["ensemble"]["rmse"])
+
+            best = _choose_best_method(metrics_by_method=metrics, anomaly=anomaly)
 
             preds_future: Dict[str, pd.Series] = {}
             for m in active_methods:
-                if m == "arima":
-                    res = forecast_arima(y_full, future_steps)
-                elif m == "sarima":
-                    res = forecast_sarima(y_full, future_steps)
-                else:
-                    res = forecast_prophet(y_full, future_steps)
+                res = _forecast_by_method(m, y_full, future_steps)
                 preds_future[m] = res.yhat.copy()
                 timing_local[m] += float(res.seconds)
-            return preds, metrics, best, preds_future, timing_local
+            ensemble_future = _ensemble_series(preds_future, metrics)
+            if ensemble_future is not None:
+                preds_future["ensemble"] = ensemble_future
+            diagnostics = {
+                "anomaly_profile": anomaly,
+                "routing": {
+                    "selected_method": best,
+                    "route": anomaly.get("route", "normal"),
+                    "reason": "recent anomaly routed to robust candidate"
+                    if anomaly.get("is_anomalous")
+                    else "normal model selection",
+                },
+            }
+            return preds, metrics, best, preds_future, timing_local, diagnostics
 
         metric_sources = {
             name: (source[name].iloc[:-test_size], source[name].iloc[-test_size:], source[name])
@@ -251,27 +454,34 @@ def generate_all_images(
         metrics_out: Dict[str, Dict[str, Dict[str, float]]] = {}
         charts_forecast: Dict[str, Dict[str, Any]] = {}
         futures_for_advice: Dict[str, np.ndarray] = {}
+        forecast_diagnostics: Dict[str, Any] = {}
         for metric_name in metrics_to_fit:
-            pred, metric_scores, best, future_pred, _timing = computed[metric_name]
+            pred, metric_scores, best, future_pred, _timing, diagnostics = computed[metric_name]
             best_methods[metric_name] = best
             metrics_out[metric_name] = metric_scores
+            forecast_diagnostics[metric_name] = diagnostics
             charts_forecast[metric_name] = {
-                "preds": {m: _series_to_lists(pred[m]) for m in active_methods},
+                "preds": {m: _series_to_lists(pred[m]) for m in pred.keys()},
                 "x_pred_ms": _to_ms(next(iter(future_pred.values())).index),
-                "preds_future": {m: _series_to_lists(future_pred[m]) for m in active_methods},
+                "preds_future": {m: _series_to_lists(future_pred[m]) for m in future_pred.keys()},
                 "metrics": metric_scores,
                 "best_method": best,
             }
             futures_for_advice[metric_name] = future_pred[best].to_numpy(dtype=float)
 
         advice = None
-        if resource_type == "k8s_pod" and len(futures_for_advice) == len(metric_names):
+        if resource_type in {"k8s_pod", "k8s_workload"} and len(futures_for_advice) == len(metric_names):
             advice = build_k8s_pod_advice(futures_for_advice, resource=source)
         elif len(futures_for_advice) == len(METRIC_NAMES):
             advice = build_scaling_advice(
                 futures_for_advice,
                 current_spec=spec,
             )
+        resource_profile = _build_resource_profile(
+            resource_type=resource_type,
+            futures_by_metric=futures_for_advice,
+            advice=advice,
+        )
 
         wall_seconds = time.perf_counter() - worker_started
         item = {
@@ -281,6 +491,8 @@ def generate_all_images(
             "best_methods": best_methods,
             "metrics": metrics_out,
             "charts_forecast": charts_forecast,
+            "forecast_diagnostics": forecast_diagnostics,
+            "resource_profile": resource_profile,
             "_timings": {"by_model": timing_by_model, "total": timing_total, "wall": wall_seconds},
             "_slot": i,
         }
@@ -359,7 +571,7 @@ def generate_all_images(
         len(resources_items),
         resources_ct,
         total_elapsed,
-        out_base / "manifest.json",
+        out_base / MANIFEST_FILENAME,
     )
     if timing_enabled and resources_ct > 0:
         total_parts = ", ".join(f"{m}={total_timing_by_model[m]:.2f}s" for m in active_methods)
@@ -422,4 +634,3 @@ def _log_input_stats(
             future_steps,
             freq_display,
         )
-

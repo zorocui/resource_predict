@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 import threading
@@ -10,7 +10,13 @@ import numpy as np
 
 from resource_predict.core.decision import build_scaling_advice
 from resource_predict.data.io import atomic_write_json
-from resource_predict.pipeline.constants import METRIC_NAMES
+from resource_predict.pipeline.constants import (
+    DETAILS_DIRNAME,
+    MANIFEST_FILENAME,
+    METRIC_NAMES,
+    RAW_DATA_FILENAME,
+    SUMMARY_INDEX_FILENAME,
+)
 from resource_predict.settings import settings
 
 
@@ -26,10 +32,10 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
     effective_spec = _effective_spec(plan)
     _validate_effective_spec(plan, effective_spec)
     out_dir = Path(settings.app.out_dir)
-    summary_path = out_dir / settings.app.summary_index_filename
-    details_dir = out_dir / settings.app.details_dirname
-    raw_path = out_dir / settings.app.raw_data_filename
-    manifest_path = out_dir / settings.app.manifest_filename
+    summary_path = out_dir / SUMMARY_INDEX_FILENAME
+    details_dir = out_dir / DETAILS_DIRNAME
+    raw_path = out_dir / RAW_DATA_FILENAME
+    manifest_path = out_dir / MANIFEST_FILENAME
 
     updated: Dict[str, Any] = {
         "resource_id": resource_id,
@@ -245,4 +251,3 @@ def _update_manifest(
         break
     if updated["manifest_updated"]:
         atomic_write_json(manifest_path, manifest, ensure_ascii=False, indent=2)
-
