@@ -9,7 +9,7 @@ import numpy as np
 
 from resource_predict.pipeline.constants import DETAILS_DIRNAME, SUMMARY_INDEX_FILENAME
 from resource_predict.core.decision import build_scaling_advice
-from resource_predict.core.k8s_pod_decision import build_k8s_pod_advice
+from resource_predict.core.k8s_workload_decision import build_k8s_workload_advice
 from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resource, resource_type_of
 
 logger = logging.getLogger(__name__)
@@ -90,7 +90,7 @@ def merge_partial_forecast_items(
                 return
             future_by_metric[metric] = np.asarray(futures.get(best) or [], dtype=float)
         if resource_type_of(item) in {"k8s_pod", "k8s_workload"} and len(future_by_metric) == len(metric_names):
-            item["scaling_advice"] = build_k8s_pod_advice(
+            item["scaling_advice"] = build_k8s_workload_advice(
                 future_by_metric,
                 resource=item,
             )

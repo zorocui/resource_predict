@@ -151,7 +151,7 @@ def _risk_profile(
     }
 
 
-def build_k8s_pod_advice(
+def build_k8s_workload_advice(
     metric_future_values: Dict[str, np.ndarray],
     *,
     resource: Dict[str, Any],
@@ -165,6 +165,7 @@ def build_k8s_pod_advice(
     metric_actions: Dict[str, str] = {}
     metric_reasons: Dict[str, str] = {}
     blockers: list[str] = []
+    baseline_missing: list[str] = []
 
     for metric in ("cpu", "memory"):
         st = by_metric[metric]
@@ -177,10 +178,7 @@ def build_k8s_pod_advice(
             blockers.append(metric)
             continue
         if not has_base:
-            metric_actions[metric] = "insufficient_data"
-            metric_reasons[metric] = f"{label} lacks request/limit baseline; trend only"
-            blockers.append(metric)
-            continue
+            baseline_missing.append(metric)
         if st["p95"] >= 0.8 or st["peak"] >= 0.9:
             metric_actions[metric] = "scale_out_candidate"
             metric_reasons[metric] = (
@@ -194,6 +192,8 @@ def build_k8s_pod_advice(
         else:
             metric_actions[metric] = "hold"
             metric_reasons[metric] = f"{label} load is within the target range"
+        if not has_base:
+            metric_reasons[metric] += "; lacks request/limit baseline, trend only"
 
     actions = set(metric_actions.values())
     if "scale_out_candidate" in actions:
@@ -224,6 +224,8 @@ def build_k8s_pod_advice(
     )
     if target_policy.get("ready_for_execution"):
         confidence_score += 4.0
+    if baseline_missing and not target_policy.get("ready_for_execution"):
+        confidence_score -= 6.0
     confidence_score = max(0.0, min(100.0, confidence_score))
     confidence = "high" if confidence_score >= 72 else "medium" if confidence_score >= 45 else "low"
 
@@ -236,6 +238,11 @@ def build_k8s_pod_advice(
     else:
         required = 1
 
+    if baseline_missing:
+        missing_names = ", ".join("CPU" if m == "cpu" else "memory" for m in baseline_missing)
+        target_policy.setdefault("notes", []).append(
+            f"{missing_names} lacks request/limit baseline; recommendation is trend-only"
+        )
     reason = "; ".join(metric_reasons[m] for m in ("cpu", "memory") if m in metric_reasons)
     return {
         "resource_type": resource_type_of(resource),

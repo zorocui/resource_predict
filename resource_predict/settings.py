@@ -44,7 +44,7 @@ class GenerationConfig:
     max_workers: Optional[int] = None
     # details/ 详情分片大小；资源很多时避免单个详情 JSON 过大。
     detail_chunk_size: int = 200
-    # 是否保存 outputs/raw_data.json；增量更新和详情合并依赖该文件。
+    # 是否保存 scoped raw_data.json；增量更新和详情合并依赖该文件。
     save_raw_dataset: bool = True
     # 列表接口未显式指定 top_n 时的默认返回 TopN 数量。
     top_n_default: int = 20

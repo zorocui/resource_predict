@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import numpy as np
 
@@ -17,6 +17,7 @@ from resource_predict.pipeline.constants import (
     RAW_DATA_FILENAME,
     SUMMARY_INDEX_FILENAME,
 )
+from resource_predict.pipeline.output_paths import scoped_out_dir
 from resource_predict.settings import settings
 
 
@@ -31,7 +32,8 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
 
     effective_spec = _effective_spec(plan)
     _validate_effective_spec(plan, effective_spec)
-    out_dir = Path(settings.app.out_dir)
+    resource_type = str(getattr(plan, "resource_type", "") or "").lower()
+    out_dir = scoped_out_dir("k8s" if resource_type.startswith("k8s") else "vm", settings.app.out_dir)
     summary_path = out_dir / SUMMARY_INDEX_FILENAME
     details_dir = out_dir / DETAILS_DIRNAME
     raw_path = out_dir / RAW_DATA_FILENAME

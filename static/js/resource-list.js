@@ -17,6 +17,18 @@
     low: "Low",
   };
 
+  const URGENCY_HELP = [
+    "紧急度用于风险队列排序，分数越高越优先处理。",
+    "计算口径：基础动作分 + 置信度加成 + 风险分贡献 + 指标压力/空闲信号 + 多指标加成 + 混合信号加成 + 目标规格变化分。",
+    "风险分最多贡献 20 分；混合信号会额外加 4 分；目标规格变化越大，排序越靠前。",
+  ].join("\n");
+
+  const CONFIDENCE_HELP = [
+    "置信度表示当前扩缩容信号的可靠程度。",
+    "VM：综合 P95、峰值、平均值、持续高/低负载比例、趋势和尖峰惩罚；多指标一致会加分，混合信号会扣 8 分。",
+    "K8S：还会考虑数据质量、是否缺少 request/limit 基线，以及是否能生成目标策略。",
+  ].join("\n");
+
   function escapeHtml(value) {
     return String(value ?? "")
       .replaceAll("&", "&amp;")
@@ -24,6 +36,10 @@
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
+  }
+
+  function infoTooltip(text, label = "说明") {
+    return `<span class="info-tooltip" role="img" aria-label="${escapeHtml(label)}">i<span class="tooltip-bubble" aria-hidden="true">${escapeHtml(text)}</span></span>`;
   }
 
   function resourceTypeOf(item) {
@@ -120,6 +136,14 @@
     ].filter((x) => x && !String(x).startsWith("-")).join(" / ") || "-";
   }
 
+  function titleFor(item) {
+    const spec = item?.spec || {};
+    if (isK8s(item)) {
+      return spec.workload_name || spec.owner_name || spec.pod || item.resource_id || "-";
+    }
+    return item.resource_id || "-";
+  }
+
   function applyClientFilters(items, options = {}) {
     const confidence = app.state.confidenceFilter;
     const actionFilter = options.ignoreAction ? "" : app.state.actionFilter;
@@ -210,7 +234,7 @@
         <span class="row-accent"></span>
         <span class="row-main">
           <span class="row-title">
-            <strong title="${escapeHtml(item.resource_id)}">${escapeHtml(item.resource_id)}</strong>
+            <strong title="${escapeHtml(item.resource_id)}">${escapeHtml(titleFor(item))}</strong>
             <span class="resource-type-badge">${typeLabel(item)}</span>
             <span class="action-chip is-${escapeHtml(action)}">${escapeHtml(actionLabel(action))}</span>
           </span>
@@ -218,8 +242,8 @@
           <span class="row-metrics">${metricSummary(item)}</span>
         </span>
         <span class="row-side">
-          <span class="score-block" title="紧急度分数：根据建议动作、置信度、预测压力和目标规格变化计算，用于队列排序">
-            <span class="score-label">紧急度</span>
+          <span class="score-block">
+            <span class="score-label">紧急度 ${infoTooltip(URGENCY_HELP, "紧急度计算说明")}</span>
             <span class="score">${formatNumber(item.urgency_score || 0, 1)}</span>
           </span>
           <span class="confidence-chip is-${escapeHtml(confidence)}">${escapeHtml(CONFIDENCE_LABELS[confidence] || confidence)}</span>
@@ -290,6 +314,8 @@
   window.ResourceList = {
     ACTION_LABELS,
     CONFIDENCE_LABELS,
+    CONFIDENCE_HELP,
+    URGENCY_HELP,
     actionLabel,
     actionOf,
     applyClientFilters,
@@ -297,6 +323,7 @@
     escapeHtml,
     formatNumber,
     formatPct,
+    infoTooltip,
     isPod: (item) => resourceTypeOf(item) === "k8s_pod",
     isK8s,
     metricKeysFor,
@@ -307,6 +334,7 @@
     subtitleFor,
     syncFilterButtons,
     targetSpecText,
+    titleFor,
     triggerMetric,
     typeLabel,
   };

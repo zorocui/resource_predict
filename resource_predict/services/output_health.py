@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 from resource_predict.pipeline.constants import DETAILS_DIRNAME, RAW_DATA_FILENAME, SUMMARY_INDEX_FILENAME
+from resource_predict.pipeline.output_paths import all_scoped_out_dirs
 
 
 VM_METRICS = ("cpu", "memory", "disk")
@@ -13,6 +14,52 @@ K8S_WORKLOAD_METRICS = ("cpu", "memory")
 
 
 def check_outputs(out_dir: Path | str, *, require_both_types: bool = True) -> Dict[str, Any]:
+    base = Path(out_dir)
+    scoped_dirs = [
+        (scope, path)
+        for scope, path in all_scoped_out_dirs(base)
+        if (path / SUMMARY_INDEX_FILENAME).exists() or (path / RAW_DATA_FILENAME).exists()
+    ]
+    if not scoped_dirs:
+        return _report(
+            False,
+            [f"缺少 scoped 输出目录: {base / 'vm'} 和 {base / 'k8s'}"],
+            [],
+            {},
+            {},
+            [],
+        )
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    summary_counts: Counter[str] = Counter()
+    raw_counts: Counter[str] = Counter()
+    samples: List[Dict[str, Any]] = []
+    for scope, path in scoped_dirs:
+        report = _check_single_output(path, require_both_types=False)
+        errors.extend(f"{scope}: {error}" for error in report.get("errors", []))
+        warnings.extend(f"{scope}: {warning}" for warning in report.get("warnings", []))
+        summary_counts.update(report.get("summary_counts", {}))
+        raw_counts.update(report.get("raw_counts", {}))
+        samples.extend(report.get("sample_workloads", []))
+
+    if require_both_types:
+        _require_type(summary_counts, "openstack_vm", "summary_index", errors)
+        _require_type(summary_counts, "k8s_workload", "summary_index", errors)
+        _require_type(raw_counts, "openstack_vm", "raw_data", errors)
+        _require_type(raw_counts, "k8s_workload", "raw_data", errors)
+
+    return _report(
+        not errors,
+        errors,
+        warnings,
+        dict(sorted(summary_counts.items())),
+        dict(sorted(raw_counts.items())),
+        samples[:5],
+    )
+
+
+def _check_single_output(out_dir: Path | str, *, require_both_types: bool = True) -> Dict[str, Any]:
     """Validate generated prediction artifacts against the VM + K8S Workload contract."""
     base = Path(out_dir)
     errors: List[str] = []

@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 模拟全量 / 增量数据源（resource_predict.providers.mock）。
 
-给 pipeline / generate_images 的 data_provider 接口用的示例：
+给 pipeline / generate_forecasts 的 data_provider 接口用的示例：
 - 返回值格式与 pipeline.prepare 中 data_provider 约定一致
 - cpu/memory/disk 的 values 为使用率小数，范围 [0, 1]
 - 默认模拟 5 个 resources

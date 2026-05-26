@@ -12,10 +12,11 @@ from resource_predict.pipeline.constants import (
     RAW_DATA_FILENAME,
     SUMMARY_INDEX_FILENAME,
 )
+from resource_predict.pipeline.output_paths import all_scoped_out_dirs
 from resource_predict.services.store.resource_detail import apply_display_window
 
 
-class ForecastStore:
+class _SingleForecastStore:
     """读取 outputs/ 下 summary、details、manifest 与 raw，带 mtime 缓存。"""
 
     def __init__(
@@ -192,4 +193,82 @@ class ForecastStore:
         for item in self.load_manifest():
             if isinstance(item, dict) and str(item.get("resource_id")) == resource_id:
                 return item
+        return None
+
+
+class ForecastStore:
+    """Read isolated VM/K8S output stores and expose one merged API view."""
+
+    def __init__(
+        self,
+        app_cfg: Optional[AppConfig] = None,
+        generation_cfg: Optional[GenerationConfig] = None,
+        *,
+        max_details_cache: int = 500,
+    ) -> None:
+        app_cfg = app_cfg or settings.app
+        generation_cfg = generation_cfg or settings.generation
+        root = Path(app_cfg.out_dir)
+        scoped = [path for _scope, path in all_scoped_out_dirs(root)]
+        bases = scoped
+        per_reader_cache = max(1, max_details_cache // max(1, len(bases)))
+        self._readers = [
+            _SingleForecastStore(
+                AppConfig(
+                    static_folder=app_cfg.static_folder,
+                    template_folder=app_cfg.template_folder,
+                    out_dir=str(base),
+                    log_file=app_cfg.log_file,
+                    log_level=app_cfg.log_level,
+                    log_console=app_cfg.log_console,
+                    host=app_cfg.host,
+                    port=app_cfg.port,
+                    debug=app_cfg.debug,
+                ),
+                generation_cfg,
+                max_details_cache=per_reader_cache,
+            )
+            for base in bases
+        ]
+
+    def load_manifest(self) -> List[dict]:
+        items: List[dict] = []
+        seen: set[str] = set()
+        for reader in self._readers:
+            for item in reader.load_manifest():
+                rid = str(item.get("resource_id")) if isinstance(item, dict) else ""
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    items.append(item)
+        return items
+
+    def get_summary(self) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {
+            "meta": {
+                "resources": 0,
+                "output_mode": "scoped",
+            },
+            "resources": [],
+        }
+        resources: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for reader in self._readers:
+            summary = reader.get_summary()
+            part = summary.get("resources", []) if isinstance(summary, dict) else []
+            for item in part:
+                if not isinstance(item, dict):
+                    continue
+                rid = str(item.get("resource_id") or "")
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    resources.append(item)
+        merged["resources"] = resources
+        merged["meta"]["resources"] = len(resources)
+        return merged
+
+    def get_resource_detail(self, resource_id: str) -> Optional[Dict[str, Any]]:
+        for reader in self._readers:
+            detail = reader.get_resource_detail(resource_id)
+            if detail is not None:
+                return detail
         return None

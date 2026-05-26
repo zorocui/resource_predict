@@ -4,6 +4,7 @@ import os
 
 from flask import Flask
 
+from resource_predict.api.cluster_configs import register_cluster_config_routes
 from resource_predict.api.pages import register_page_routes
 from resource_predict.api.resources import register_resource_routes
 from resource_predict.api.scaling import register_scaling_routes
@@ -42,6 +43,7 @@ def create_app() -> Flask:
     register_resource_routes(app, route_helpers)
     register_scaling_routes(app, route_helpers)
     register_update_routes(app)
+    register_cluster_config_routes(app)
     start_background_updater()
 
     return app

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any
 
 from flask import Flask, jsonify, request
 
 from resource_predict.data.updater import (
     UpdateBusyError,
     get_update_status,
-    run_upsert_with_data,
+    run_scoped_update_with_data,
+    run_scoped_upsert_with_data,
     run_update,
-    run_update_with_data,
 )
 from resource_predict.services.update_tasks import run_update_task_sync, start_update_task_async
 
@@ -80,7 +80,7 @@ def register_update_routes(app: Flask) -> None:
             submitted_resource_ids[:20],
         )
         start_update_task_async(
-            run_update_with_data,
+            run_scoped_update_with_data,
             body,
             fail_if_busy=True,
             busy_error_cls=UpdateBusyError,
@@ -121,7 +121,7 @@ def register_update_routes(app: Flask) -> None:
             submitted_resource_ids[:20],
         )
         start_update_task_async(
-            run_upsert_with_data,
+            run_scoped_upsert_with_data,
             body,
             fail_if_busy=True,
             busy_error_cls=UpdateBusyError,

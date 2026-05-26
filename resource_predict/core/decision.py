@@ -94,7 +94,6 @@ def _metric_is_hot(stats: Dict[str, float], thresholds: Dict[str, float] | None 
 
 def _metric_is_cold(stats: Dict[str, float], thresholds: Dict[str, float] | None = None) -> bool:
     """判断该维度是否已经形成缩容信号。"""
-    cfg = settings.decision
     avg = float(stats.get("avg", 0.0))
     p95 = float(stats.get("p95", 0.0))
     thresholds = thresholds or _policy_thresholds("balanced")

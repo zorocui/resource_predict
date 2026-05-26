@@ -1,1158 +1,359 @@
-# 云资源使用预测与扩缩容建议
+# 云资源使用预测与调配建议
 
-本项目用于云资源使用率分析、时间序列预测和扩缩容建议生成。当前支持两类主视图：
+本项目用于云资源历史使用率分析、时间序列预测、扩缩容建议生成和调配预检。当前支持两类资源：
 
-- **VM 资源**：以虚拟机为对象，预测 CPU、内存、硬盘，并给出目标规格建议。
-- **K8S Workload 负载**：以容器控制器为对象，接入多个集群 kube-prometheus 的 CPU、内存监控数据，聚合 Deployment/StatefulSet/DaemonSet 等控制器下的 Pod 与容器序列，给出分析建议，不自动执行 K8S 调配。
+- **VM 资源**：预测 `cpu / memory / disk`，生成 OpenStack 规格调整建议。
+- **K8S Workload**：从 Prometheus 聚合 Pod/Container 指标到 Deployment/StatefulSet/DaemonSet 等控制器粒度，预测 `cpu / memory`，生成 requests/limits 调整建议。当前以分析建议为主。
 
-系统采用“原始监控数据”和“预测产物”分层设计：`raw_data.json` 保存观测序列，`summary_index.json` 与 `details/` 保存预测结果，前端通过 API 合并展示。
+预测产物按资源族隔离：
 
----
+- VM: `outputs/vm/`
+- K8S: `outputs/k8s/`
+
+Web/API 会自动合并两个目录展示，K8S 数据接入不会覆盖 VM 产物。
 
 ## 目录
 
-| 章节 | 说明 |
-| --- | --- |
-| [1. 功能概览](#1-功能概览) | VM、K8S Workload、预测、前端、调配能力 |
-| [2. 快速开始](#2-快速开始) | 本地运行、预测生成、Web 启动 |
-| [3. 项目结构](#3-项目结构) | 目录说明与主要模块 |
-| [4. 数据流与产物](#4-数据流与产物) | 数据流图、产物职责、全量/增量流程 |
-| [5. 资源类型与数据模型](#5-资源类型与数据模型) | VM 与 K8S Workload 的输入格式和建议结构 |
-| [6. K8S Workload 真实环境接入](#6-k8s-workload-真实环境接入) | kube-prometheus 接入步骤 |
-| [7. API 参考](#7-api-参考) | 列表、详情、更新、调配 API |
-| [8. 资源调配](#8-资源调配) | OpenStack/K8S 调配预检与执行 |
-| [9. 配置与运维](#9-配置与运维) | 配置项、日志、运行建议 |
-| [10. 常见问题](#10-常见问题) | 排错与维护建议 |
+- [快速开始](#快速开始)
+- [项目结构](#项目结构)
+- [架构与数据流](#架构与数据流)
+- [CLI 命令](#cli-命令)
+- [K8S Prometheus 接入](#k8s-prometheus-接入)
+- [API 摘要](#api-摘要)
+- [配置](#配置)
+- [验证与维护](#验证与维护)
 
----
+## 快速开始
 
-## 1. 功能概览
+以下命令面向 CentOS/Linux shell。
 
-- **双主视图**：前端提供“VM资源”和“K8S Workload负载”两个主视图。
-- **多指标预测**：VM 支持 `cpu / memory / disk`；K8S Workload 支持 `cpu / memory`。
-- **自动选模**：支持 ARIMA、SARIMA、Prophet、Seasonal naive、Rolling mean 与 Ensemble；默认启用 `seasonal_naive / rolling_mean / prophet`，并综合尾部测试集 RMSE 与滚动回测 RMSE 选择最佳模型。
-- **异常感知分流**：当最近点出现 robust z-score 异常时，预测会优先路由到 `ensemble / seasonal_naive / rolling_mean` 等稳健候选，降低异常尖峰对策略的误导。
-- **策略档位与风险评分**：扩缩容建议会输出 `policy_tier / risk_profile / action_gate`，用于区分保守、平衡、激进策略，并给出饱和风险、空闲机会和动作确认要求。
-- **资源画像**：输出 `resource_profile`，识别计算型、内存型、存储型、整体压力型、空闲候选等负载形态。
-- **数据分层**：`raw_data.json` 存观测数据，`details/` 存预测曲线。
-- **增量更新**：`POST /api/update-data` 或 `POST /api/upsert-data` 接收监控增量，后台合并并重预测。
-- **指标级重预测**：仅更新某个指标时，可保留其他指标旧预测并重建建议。
-- **VM 扩缩容建议**：输出 `action / confidence / reason / target_spec / stats / risk_profile / action_gate`。
-- **K8S Workload 分析建议**：输出 `scale_out_candidate / scale_in_candidate / hold / insufficient_data`，并生成 `target_k8s_policy` 的 requests/limits 推荐；仍仅分析，不自动执行调配。
-- **调配执行**：已有 OpenStack VM resize 和 K8S workload requests/limits 调配入口；Workload 视图当前只展示推荐，不接入执行。
-- **稳定写入**：关键 JSON 使用临时文件 + 原子替换，降低写坏风险。
-
----
-
-## 2. 快速开始
-
-建议使用项目虚拟环境：
-
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+export PYTHONUTF8=1
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 ```
 
-`PYTHONUTF8=1` 建议保留。Windows 中文路径下，Prophet/CmdStanPy 可能因默认 GBK 解码报错。
+生成演示预测产物：
 
-### 2.1 生成 VM 演示数据
-
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_images.py
+```bash
+python generate_forecasts.py
 ```
 
-仅基于已有 `outputs/raw_data.json` 重算预测：
+只基于已有 `raw_data.json` 重算预测：
 
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_images.py predict
+```bash
+python generate_forecasts.py predict
 ```
 
-### 2.2 生成 K8S Workload 数据
+检查产物健康状态：
 
-生成或重算后，建议立刻做一次产物健康检查，确认 `summary_index.json`、`raw_data.json` 与 `details/` 引用一致，并且 K8S 资源已经按 `k8s_workload` 控制器粒度输出：
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe check_outputs.py
+```bash
+python check_outputs.py
 ```
 
-如需给自动化流程消费完整结果：
-```powershell
-.\.venv\Scripts\python.exe check_outputs.py --json
+启动 Web：
+
+```bash
+python app.py
 ```
 
-需要先配置 Prometheus 地址，详见 [6. K8S Workload 真实环境接入](#6-k8s-workload-真实环境接入)。该命令默认使用 upsert 模式，会把 Pod/Container 监控按控制器聚合成 `k8s_workload`，再合并到现有 `raw_data.json`，不会覆盖已有 VM。
-
-```powershell
-$env:K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://你的-prometheus:9090"}'
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_k8s_pods.py
-```
-
-### 2.3 启动 Web
-
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe app.py
-```
-
-访问：
+默认访问：
 
 ```text
 http://127.0.0.1:5000
 ```
 
-顶部可切换：
-
-- `VM资源`
-- `K8S Workload负载`
-
----
-
-## 3. 项目结构
+## 项目结构
 
 ```text
-resource_predict/
+.
 ├── app.py                         # Flask Web 入口
-├── generate_images.py             # VM/通用预测 CLI
-├── generate_k8s_pods.py           # K8S Workload Prometheus 接入 CLI
+├── generate_forecasts.py          # 演示数据生成/预测重算 CLI
+├── ingest_k8s_workloads.py        # K8S Workload Prometheus 接入 CLI
+├── check_outputs.py               # 预测产物健康检查 CLI
+├── requirements.txt               # 运行依赖
+├── requirements-dev.txt           # 测试和静态检查工具
 ├── deploy/
-│   └── clusters.example.json      # 调配控制节点配置示例
+│   └── clusters.example.json      # VM 调配配置示例
 ├── resource_predict/
-│   ├── settings.py                # 全局配置
-│   ├── resource_types.py          # resource_type 与指标集合
-│   ├── core/
-│   │   ├── forecasting.py         # ARIMA/SARIMA/Prophet + baseline 预测
-│   │   ├── decision.py            # VM 扩缩容建议、策略档位、风险评分
-│   │   └── k8s_pod_decision.py    # K8S Workload 分析建议与 requests/limits 推荐
-│   ├── data/
-│   │   ├── io.py                  # raw_data 读写与图表合并
-│   │   └── updater.py             # 增量合并与后台重预测
-│   ├── providers/
-│   │   ├── mock.py                # 演示数据
-│   │   └── k8s_prometheus.py      # kube-prometheus provider
-│   ├── pipeline/
-│   │   ├── run.py                 # 全量/仅预测主流程
-│   │   ├── prepare.py             # provider 数据标准化
-│   │   ├── partial.py             # 指标级增量合并
-│   │   └── write_outputs.py       # summary/details/manifest 写出
 │   ├── api/                       # Flask API 路由
-│   └── services/
-│       ├── store/                 # 读取 summary/details/raw
-│       ├── scaling/               # 调配任务
-│       └── urgency.py             # 列表紧迫度排序
-├── templates/
-├── static/
-└── outputs/                       # 运行时产物，已被 .gitignore 忽略
+│   ├── core/                      # 预测、VM 决策、K8S Workload 决策
+│   ├── data/                      # raw_data 读写与增量合并
+│   ├── pipeline/                  # 预测管线和产物写入
+│   ├── providers/                 # mock / Prometheus 数据源
+│   ├── services/                  # 应用服务、调配、配置、store
+│   ├── resource_types.py          # 资源类型和指标集
+│   └── settings.py                # 默认配置
+├── static/                        # 前端静态资源
+├── templates/                     # Flask 模板
+├── tests/                         # 自动化测试
+└── outputs/                       # 运行产物，已被 .gitignore 忽略
 ```
 
-业务代码统一使用 `resource_predict.*` 导入。
+## 架构与数据流
 
----
-
-## 4. 数据流与产物
-
-### 4.1 总体架构
+### 总体架构
 
 ```mermaid
 flowchart TB
-    subgraph ingest [数据接入]
-        DP["data_provider / mock 全量"]
-        K8S["k8s_prometheus provider"]
-        Push["POST /api/update-data 或 POST /api/upsert-data"]
-        Pull["POST /api/update-trigger"]
+    subgraph Input["数据输入"]
+        Mock["mock provider"]
+        Prom["K8S Prometheus"]
+        Push["/api/update-data 或 /api/upsert-data"]
     end
 
-    subgraph store_raw [原始数据层]
-        Raw["outputs/raw_data.json"]
+    subgraph Pipeline["预测管线"]
+        Prep["prepare / normalize"]
+        Raw["raw_data.json"]
+        Forecast["generate_forecasts"]
+        Decision["VM / K8S decision"]
+        Outputs["summary_index + details + manifest"]
     end
 
-    subgraph pipeline [resource_predict.pipeline]
-        Prep["prepare / read_raw_dataset"]
-        Pred["按资源和指标并行预测"]
-        DecVM["VM decision"]
-        DecPod["K8S Workload decision"]
-        WOut["write_outputs"]
+    subgraph App["应用层"]
+        Store["ForecastStore"]
+        API["Flask API"]
+        UI["Web UI"]
     end
 
-    subgraph store_out [预测产物层]
-        Sum["summary_index.json"]
-        Det["details/part-*.json"]
-        Man["manifest.json"]
-        Stats["generation_stats.json"]
-    end
-
-    subgraph web [Web]
-        API["resource_predict.api"]
-        FS["ForecastStore"]
-        UI["VM资源 / K8S Workload负载"]
-    end
-
-    DP --> Prep
-    K8S --> Prep
-    Push --> Raw
-    Pull --> Raw
+    Mock --> Prep
+    Prom --> Prep
+    Push --> Prep
     Prep --> Raw
-    Raw --> Pred
-    Pred --> DecVM
-    Pred --> DecPod
-    DecVM --> WOut
-    DecPod --> WOut
-    WOut --> Sum
-    WOut --> Det
-    WOut --> Man
-    WOut --> Stats
-    Sum --> FS
-    Det --> FS
-    Raw --> FS
-    FS --> API
+    Raw --> Forecast
+    Forecast --> Decision
+    Decision --> Outputs
+    Outputs --> Store
+    Store --> API
     API --> UI
 ```
 
-### 4.2 产物职责
-
-| 文件 | 写入方 | 读取方 | 内容 |
-| --- | --- | --- | --- |
-| `outputs/raw_data.json` | 全量生成 / updater / K8S provider | pipeline、ForecastStore | 原始观测序列、资源元数据、数据质量 |
-| `outputs/summary_index.json` | pipeline | 列表 API | 资源摘要、建议、紧迫度排序依据、详情引用 |
-| `outputs/details/part-*.json` | pipeline | 详情 API | 预测曲线、RMSE、best_method |
-| `outputs/manifest.json` | pipeline | 兼容回退 | 合并后的旧结构 |
-| `outputs/generation_stats.json` | pipeline | 运维 | 最近一次生成统计 |
-| `outputs/scaling_tasks.json` | 调配任务 | 调配 API | 预检/执行任务记录 |
-| `outputs/resource_predict.log` | 运行时 | 运维 | 预测、更新、调配日志 |
-
-`details` 只保存预测曲线；完整图表数据由 `ForecastStore` 读取 `raw_data.json` 后与预测结果合并。
-
-### 4.3 全量生成
+### 产物隔离
 
 ```mermaid
 flowchart LR
-    A["data_provider"] --> B["prepare"]
-    B --> C["raw_data.json"]
-    C --> D["按资源并行预测"]
-    D --> E["holdout + rolling RMSE 选模"]
-    E --> F{"resource_type"}
-    F -->|openstack_vm / vm| G["build_scaling_advice"]
-    F -->|k8s_workload| H["build_k8s_pod_advice"]
-    G --> I["summary + details + manifest"]
-    H --> I
+    VM["VM resources"] --> VMO["outputs/vm"]
+    K8S["K8S Workloads"] --> K8SO["outputs/k8s"]
+    VMO --> Store["ForecastStore 合并读取"]
+    K8SO --> Store
+    Store --> API["/api/resources 和详情 API"]
 ```
 
-### 4.3.1 预测模型与策略增强
+每个 scope 内包含：
 
-预测阶段对每个资源、每个指标独立建模。当前默认启用：
+```text
+raw_data.json
+summary_index.json
+manifest.json
+details/*.json
+```
 
-| 方法 | 说明 | 适用场景 |
-| --- | --- | --- |
-| `seasonal_naive` | 复用最近一个日周期的形状 | 日周期明显、历史较短、需要快速兜底 |
-| `rolling_mean` | 使用最近窗口均值作为低波动基线 | 平稳负载、避免过拟合 |
-| `ensemble` | 按 `selection_rmse` 的倒数加权融合已启用模型 | 多模型表现接近、需要更稳健的折中曲线 |
-| `prophet` | 趋势 + 日/周季节性模型 | 趋势变化、周期性较复杂 |
-
-代码仍支持 `arima` 与 `sarima`，可在 `ForecastConfig.enabled_methods` 中启用。模型选择会先在尾部 `test_size` 窗口计算 `mae/rmse`，再按 `rolling_backtest_folds` 做滚动回测；若滚动回测可用，则用 `selection_rmse = 0.65 * rmse + 0.35 * rolling_rmse` 选择 `best_method`。`enable_ensemble=True` 时，系统会把已启用模型按误差倒数加权生成 `ensemble`，并把它作为候选曲线参与选择。
-
-每个指标还会输出 `forecast_diagnostics`：
-
-| 字段 | 说明 |
-| --- | --- |
-| `anomaly_profile` | 最近窗口的 robust z-score、异常状态和路由类型。 |
-| `routing` | 实际选择的模型、是否因异常切到稳健候选，以及路由原因。 |
-
-扩缩容策略在原有阈值规则上增加三层信息：
-
-| 字段 | 说明 |
-| --- | --- |
-| `policy_tier` | 策略档位：`conservative / balanced / aggressive`。可通过 `spec.policy_tier` 显式指定，也可按 namespace、cluster、owner 等元数据推断。 |
-| `risk_profile` | 风险画像：包含饱和风险、空闲机会、策略阈值、冷却建议等。 |
-| `action_gate` | 动作去抖：给出建议动作需要连续确认的轮数，避免一次预测波动直接触发执行。 |
-| `resource_profile` | 资源画像：基于未来 P95 和建议动作识别 `compute_bound / memory_bound / storage_bound / balanced_pressure / idle_candidate / steady`。 |
-
-### 4.4 增量更新
+### 增量更新
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as 调用方
-    participant API as api/updates
-    participant U as data/updater
-    participant R as raw_data.json
-    participant P as pipeline
-    participant O as outputs/
+    participant Client as Client / Prometheus Ingest
+    participant API as Flask API
+    participant Updater as data.updater
+    participant Pipeline as forecast pipeline
+    participant Outputs as outputs/vm 或 outputs/k8s
 
-    C->>API: POST update-data / upsert-data
-    API-->>C: 202 Accepted
-    API->>U: 后台线程
-    U->>R: 合并增量（原子写盘）
-    U->>P: generate_predictions_only
-    P->>O: 更新 summary / details
-    C->>API: GET update-status
-    API-->>C: merging / predicting / idle
+    Client->>API: POST /api/update-data 或 /api/upsert-data
+    API->>Updater: start update task
+    Updater->>Outputs: read raw_data.json
+    Updater->>Updater: merge or upsert metrics
+    Updater->>Pipeline: recompute forecasts
+    Pipeline->>Outputs: write summary/details/manifest
+    API-->>Client: status via /api/update-status
 ```
 
-规则：
-
-- `update-data` 只更新已有资源。
-- `upsert-data` 可插入新资源。
-- 更新时记录本次变化的 `resource_id` 和指标名。
-- 若有旧预测产物，会尽量只重算变化指标，再重建建议。
-- `display_window_points` 只影响前端展示，不裁剪训练数据。
-
-### 4.5 前端读取详情
+### 调配流程
 
 ```mermaid
-flowchart TD
-    A["GET /api/resources"] --> B["summary_index"]
-    C["GET /api/resources/<id>"] --> D["details 分片"]
-    D --> E["raw_data 合并 y_train/y_test"]
-    E --> F["apply_display_window"]
-    F --> G["返回 ECharts JSON"]
+flowchart TB
+    Advice["scaling_advice"] --> Gate{"action 可执行?"}
+    Gate -->|hold / insufficient_data| Stop["仅展示原因"]
+    Gate -->|scale_out / scale_in| Task["创建调配任务"]
+    Task --> Plan["生成命令和预检信息"]
+    Plan --> Confirm{"是否需要确认?"}
+    Confirm -->|dry_run| Done["只返回计划"]
+    Confirm -->|execute| Run["SSH 到控制节点执行"]
+    Run --> Snapshot["更新本地产物快照"]
 ```
 
-更新进行中若资源处于 `writing_raw` / `predicting`，详情接口返回 `202 + prediction_pending`。
+## CLI 命令
 
----
+### 预测生成
 
-## 5. 资源类型与数据模型
-
-### 5.1 支持的资源类型
-
-| resource_type | 主视图 | 指标 | 建议类型 | 是否执行调配 |
-| --- | --- | --- | --- | --- |
-| `openstack_vm` / 默认 VM | VM资源 | `cpu / memory / disk` | `scale_out / scale_in / hold` | 支持 OpenStack resize |
-| `k8s_container` | VM资源兼容调配入口 | `cpu / memory / disk` 兼容结构 | `scale_out / scale_in / hold` | 支持 workload requests/limits |
-| `k8s_workload` | K8S Workload负载 | `cpu / memory` | `scale_out_candidate / scale_in_candidate / hold / insufficient_data`，附带 `target_k8s_policy` | 仅分析，不自动执行 |
-| `k8s_pod` | 旧产物兼容 | `cpu / memory` | 同 K8S Workload | 仅分析，不自动执行 |
-
-### 5.2 VM 数据格式
-
-`data_provider` 返回 list，每项格式：
-
-```python
-{
-    "resource_id": "vm-001",
-    "resource_type": "openstack_vm",
-    "spec": {
-        "cluster": "cluster-openstack-a",
-        "ip": "10.0.10.11",
-        "instance_id": "server-uuid",
-        "cpu_cores": 4,
-        "memory_gb": 16,
-        "disk_gb": 100
-    },
-    "metrics": {
-        "cpu": {"timestamps": [1730000000000], "values": [0.42]},
-        "memory": {"timestamps": [1730000000000], "values": [0.58]},
-        "disk": {"timestamps": [1730000000000], "values": [0.32]}
-    }
-}
+```bash
+export PYTHONUTF8=1
+python generate_forecasts.py
 ```
 
-字段规则：
+只重算预测，不覆盖 raw：
 
-| 字段 | 必填 | 说明 |
-| --- | --- | --- |
-| `resource_id` | 是 | 资源唯一 ID |
-| `resource_type` | 建议 | 默认按 VM 处理 |
-| `metrics.cpu/memory/disk` | 是 | VM 三个指标都需要完整序列 |
-| `timestamps` | 是 | 秒/毫秒 Unix 时间戳、ISO 字符串或 pandas 可解析值 |
-| `values` | 是 | 使用率小数，通常为 `[0, 1]`，部分真实口径可超过 1 |
-| `spec.cluster` | 调配必填 | 对应 `deploy/clusters.json` 的集群 key |
-| `spec.instance_id/server_id` | OpenStack 调配必填 | OpenStack server ID |
-| `spec.cpu_cores/memory_gb/disk_gb` | 调配建议必填 | 当前规格 |
-
-### 5.3 K8S Workload 数据格式
-
-K8S Prometheus provider 会把 Pod/Container 监控聚合到控制器粒度，并生成：
-
-```python
-{
-    "resource_id": "k8s:cluster-k8s-a:default:deployment:api-server",
-    "resource_type": "k8s_workload",
-    "spec": {
-        "cluster": "cluster-k8s-a",
-        "namespace": "default",
-        "workload_kind": "Deployment",
-        "workload_name": "api-server",
-        "pods_observed": ["api-server-7d9c4f9b8c-x1"],
-        "containers_observed": ["app", "sidecar"],
-        "replicas_observed": 3,
-        "cpu_request_cores": 3.0,
-        "cpu_limit_cores": 6.0,
-        "memory_request_gb": 6.0,
-        "memory_limit_gb": 12.0,
-        "cpu_metric_mode": "cpu_usage/cpu_request",
-        "memory_metric_mode": "memory_working_set/memory_limit"
-    },
-    "metrics": {
-        "cpu": {"timestamps": [1730000000000], "values": [0.64]},
-        "memory": {"timestamps": [1730000000000], "values": [0.52]}
-    },
-    "data_quality": {
-        "cpu": {"level": "good", "points": 2016, "missing_ratio": 0.01},
-        "memory": {"level": "good", "points": 2016, "missing_ratio": 0.01}
-    }
-}
+```bash
+export PYTHONUTF8=1
+python generate_forecasts.py predict
 ```
 
-口径：
+### K8S Workload 接入
 
-| 指标 | 优先口径 | 兜底 |
-| --- | --- | --- |
-| CPU | `cpu_usage_cores / cpu_request_cores` | 无 request 时用 limit；都没有则展示原始 cores |
-| 内存 | `working_set_gb / memory_limit_gb` | 无 limit 时用 request；都没有则展示原始 GB |
+```bash
+export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://prometheus.example:9090"}'
+export PYTHONUTF8=1
+python ingest_k8s_workloads.py
+```
 
-Workload 数据质量会影响建议置信度。缺点严重或缺少 request/limit 时，系统会偏向 `insufficient_data` 或 `hold`。
+只诊断，不写产物：
 
-### 5.4 建议输出结构
+```bash
+python ingest_k8s_workloads.py --diagnose
+python ingest_k8s_workloads.py --diagnose --json
+```
 
-VM 与 K8S Workload 都会在 `scaling_advice` 中输出可解释的建议。常见字段：
+只拉取指定集群：
 
-| 字段 | VM | K8S Workload | 说明 |
-| --- | --- | --- | --- |
-| `action` | 是 | 是 | VM 为 `scale_out / scale_in / hold`；K8S 为候选建议或数据不足。 |
-| `confidence` / `confidence_score` | 是 | 是 | 置信度标签和 0-100 分值。 |
-| `metric_actions` / `metric_reasons` | 是 | 是 | 每个指标的动作和解释。 |
-| `stats` | 是 | 是 | 未来窗口统计，如 avg、P95、peak；VM 还包含趋势和连续高低负载。 |
-| `policy_tier` | 是 | 是 | 当前策略档位。 |
-| `risk_profile` | 是 | 是 | 风险画像，用于排序和运维判断。 |
-| `action_gate` | 是 | 是 | 动作去抖信息，包含所需连续确认轮数。 |
-| `resource_profile` | 是 | 是 | 资源负载画像，摘要中也会保留，便于列表和后续策略使用。 |
-| `forecast_diagnostics` | 是 | 是 | 每个指标的异常检测与模型路由诊断，详情接口返回。 |
-| `target_spec` | 是 | 否 | VM 推荐目标规格。 |
-| `target_k8s_policy` | 否 | 是 | Workload requests/limits 推荐，不会自动执行。 |
+```bash
+python ingest_k8s_workloads.py --cluster cluster-k8s-a
+```
 
-VM 示例片段：
+### 产物检查
+
+```bash
+python check_outputs.py
+python check_outputs.py --json
+python check_outputs.py --allow-missing-type
+```
+
+## K8S Prometheus 接入
+
+### 需要的 Prometheus 指标
+
+| 指标 | 用途 |
+| --- | --- |
+| `container_cpu_usage_seconds_total` | CPU 使用量 |
+| `container_memory_working_set_bytes` | 内存使用量 |
+| `kube_pod_owner` | Pod 到 ReplicaSet/控制器的 owner 关系 |
+| `kube_replicaset_owner` | ReplicaSet 到 Deployment 的 owner 关系 |
+| `kube_pod_container_resource_requests*` | CPU/Memory request |
+| `kube_pod_container_resource_limits*` | CPU/Memory limit |
+
+provider 会把 Pod/Container 序列聚合为 `k8s_workload`，生成形如：
+
+```text
+k8s:<cluster>:<namespace>:<workload-kind>:<workload-name>
+```
+
+### 配置方式
+
+临时验证推荐环境变量：
+
+```bash
+export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
+python ingest_k8s_workloads.py --diagnose
+```
+
+长期运行推荐写入：
+
+```text
+deploy/k8s_prometheus_clusters.json
+```
+
+示例：
 
 ```json
-{
-  "action": "scale_out",
-  "confidence": "high",
-  "policy_tier": "balanced",
-  "target_spec": { "cpu_cores": 8, "memory_gb": 32, "disk_gb": 200 },
-  "risk_profile": {
-    "risk_score": 94.8,
-    "saturation_risk": 94.8,
-    "idle_opportunity": 0.0,
-    "cooldown_minutes": 60
-  },
-  "action_gate": {
-    "state": "observe",
-    "required_consistent_rounds": 2,
-    "observed_consistent_rounds": 1
+[
+  {
+    "cluster": "cluster-k8s-a",
+    "prometheus_url": "http://prometheus.example:9090",
+    "namespace_regex": "default|prod"
   }
-}
+]
 ```
 
-K8S Workload 示例片段：
+该文件可能包含内网地址或凭据，默认不提交。
 
-```json
-{
-  "action": "scale_out_candidate",
-  "confidence": "high",
-  "policy_tier": "balanced",
-  "target_k8s_policy": {
-    "recommendations": {
-      "cpu": { "request_cores": 1.144, "limit_cores": 1.43 },
-      "memory": { "request_gb": 2.083, "limit_gb": 2.5 }
-    },
-    "ready_for_execution": true
-  },
-  "analysis_only": true
-}
-```
+## API 摘要
 
----
-
-## 6. K8S Workload 真实环境接入
-
-你的内网环境是 **K8S 1.14 + kube-prometheus**。推荐通过 Prometheus HTTP API 拉取数据。
-
-### 6.1 接入数据流
-
-```mermaid
-flowchart LR
-    K8S["K8S 1.14 集群"] --> KP["kube-prometheus"]
-    KP --> P["Prometheus HTTP API"]
-    P --> Provider["k8s_workload_prometheus_provider"]
-    Provider --> Raw["outputs/raw_data.json"]
-    Raw --> Pipeline["预测与 Workload 分析建议"]
-    Pipeline --> UI["K8S Workload负载页"]
-```
-
-### 6.2 确认 Prometheus 地址
-
-在 K8S 控制节点或能访问集群内网的机器上执行：
-
-```bash
-kubectl -n monitoring get svc
-kubectl -n monitoring get pod
-```
-
-常见 Prometheus Service：
-
-| 名称 | 说明 |
+| API | 说明 |
 | --- | --- |
-| `prometheus-k8s` | kube-prometheus 常见名称 |
-| `prometheus-operated` | Prometheus Operator 创建的 headless Service |
-| `kube-prometheus-stack-prometheus` | Helm chart 常见名称 |
-
-如果 Service 是 `prometheus-k8s`，端口是 `9090`，集群内地址通常为：
-
-```text
-http://prometheus-k8s.monitoring.svc:9090
-```
-
-如果本项目运行在集群外，可先用端口转发验证：
-
-```bash
-kubectl -n monitoring port-forward svc/prometheus-k8s 9090:9090
-```
-
-此时本项目机器访问：
-
-```text
-http://127.0.0.1:9090
-```
-
-生产环境可改为内网 LB、NodePort、Nginx 反代或堡垒机代理。要求只有一个：本项目机器能访问 `http://地址:端口/api/v1/query`。
-
-### 6.3 验证 Prometheus 指标
-
-先在 Prometheus UI 中执行以下查询，确认有数据。
-
-CPU 使用量：
-
-```text
-rate(container_cpu_usage_seconds_total{container!="",pod!=""}[5m])
-```
-
-内存使用量：
-
-```text
-container_memory_working_set_bytes{container!="",pod!="",container!=""}
-```
-
-K8S 1.14 常见 request/limit 指标：
-
-```text
-kube_pod_container_resource_requests_cpu_cores
-kube_pod_container_resource_limits_cpu_cores
-kube_pod_container_resource_requests_memory_bytes
-kube_pod_container_resource_limits_memory_bytes
-```
-
-控制器归属指标：
-
-```text
-kube_pod_owner{owner_is_controller="true"}
-```
-
-部分 kube-state-metrics 版本使用新格式，本项目也兼容：
-
-```text
-kube_pod_container_resource_requests{resource="cpu"}
-kube_pod_container_resource_limits{resource="cpu"}
-kube_pod_container_resource_requests{resource="memory"}
-kube_pod_container_resource_limits{resource="memory"}
-```
-
-确认返回标签至少包含：
-
-| 标签 | 用途 |
-| --- | --- |
-| `namespace` | 命名空间 |
-| `pod` | Pod 名称 |
-| `container` | 容器名称 |
-| `node` | 可选，前端展示所在节点 |
-| `owner_kind / owner_name` | 来自 `kube_pod_owner`，用于聚合到 Deployment/StatefulSet/DaemonSet 等控制器 |
-
-### 6.4 配置 Prometheus 访问
-
-项目只保留多集群配置入口：`settings.k8s_prometheus.clusters` 或 `K8S_PROMETHEUS_CLUSTERS`。即使只接入一个集群，也按一个元素的多集群配置写，避免单集群 URL 与多集群列表并存。
-
-方式 A：环境变量，适合首次验证。`K8S_PROMETHEUS_CLUSTERS` 支持 JSON 对象：
-
-```powershell
-$env:K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_k8s_pods.py
-```
-
-内网地址示例：
-
-```powershell
-$env:K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://prometheus-k8s.monitoring.svc:9090"}'
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_k8s_pods.py
-```
-
-也支持 JSON 数组，适合每个集群设置不同 namespace 或鉴权：
-
-```powershell
-$env:K8S_PROMETHEUS_CLUSTERS='[
-  {"cluster":"cluster-k8s-a","prometheus_url":"http://prom-a:9090","namespace_regex":"prod|default"},
-  {"cluster":"cluster-k8s-b","prometheus_url":"http://prom-b:9090","bearer_token":"xxxxx"},
-  {"cluster":"cluster-k8s-c","prometheus_url":"http://prom-c:9090","basic_auth":"dXNlcjpwYXNz"}
-]'
-.\.venv\Scripts\python.exe generate_k8s_pods.py
-```
-
-方式 B：固定写入 `resource_predict/settings.py`。
-
-```python
-@dataclass(frozen=True)
-class K8SPrometheusTarget:
-    prometheus_url: str = ""
-    cluster: str = ""
-    namespace_regex: str = ""
-    bearer_token: str = ""
-    basic_auth: str = ""
-
-
-@dataclass(frozen=True)
-class K8SPrometheusConfig:
-    history_days: int = 7
-    step_seconds: int = 300
-    namespace_regex: str = ""
-    request_timeout_seconds: int = 30
-    clusters: tuple[K8SPrometheusTarget, ...] = ()
-```
-
-| 配置 | 说明 |
-| --- | --- |
-| `clusters[].prometheus_url` | Prometheus HTTP API 地址 |
-| `clusters[].cluster` | 集群标识，写入 `resource_id` |
-| `clusters[].namespace_regex` | 可选，只接入部分命名空间；为空时继承全局默认 |
-| `clusters[].bearer_token` | 可选，Bearer Token 鉴权 |
-| `clusters[].basic_auth` | 可选，Basic Auth，值为 base64 后的 `user:password` |
-| `history_days` | 默认拉取最近 7 天 |
-| `step_seconds` | 默认 300 秒，即 5 分钟 |
-| `namespace_regex` | 全局 namespace 默认值，如 `default|prod` |
-| `request_timeout_seconds` | HTTP 查询超时 |
-| `clusters` | K8S Prometheus 目标列表；为空时必须提供 `K8S_PROMETHEUS_CLUSTERS` |
-
-固定写入示例：
-
-```python
-k8s_prometheus = K8SPrometheusConfig(
-    clusters=(
-        K8SPrometheusTarget(
-            cluster="cluster-k8s-a",
-            prometheus_url="http://prom-a:9090",
-            namespace_regex="prod|default",
-        ),
-        K8SPrometheusTarget(
-            cluster="cluster-k8s-b",
-            prometheus_url="http://prom-b:9090",
-        ),
-    )
-)
-```
-
-按集群单独更新：
-
-```powershell
-.\.venv\Scripts\python.exe generate_k8s_pods.py --cluster cluster-k8s-a
-```
-
-多集群拉取时，`resource_id` 会带上集群名和控制器标识，例如 `k8s:cluster-k8s-b:default:deployment:api-server`，所以不同集群里同名 namespace/workload 不会互相覆盖。
-
-### 6.5 首次生成与查看
-
-首次写入 raw 前，建议先做只读诊断。诊断不会写 `raw_data.json`，也不会触发预测：
-
-```powershell
-$env:K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://你的-prometheus:9090"}'
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_k8s_pods.py --diagnose
-```
-
-诊断会检查 CPU/内存使用率、`kube_pod_owner`、`kube_replicaset_owner`、request/limit 指标，并给出可解析的 Workload 数量。若需要机器可读输出：
-
-```powershell
-.\.venv\Scripts\python.exe generate_k8s_pods.py --diagnose --json
-```
-
-诊断通过后，推荐用默认 upsert 模式接入。它会先拉取 Prometheus Pod/Container 数据并聚合为 Workload，再合并到现有 `outputs/raw_data.json`：
-
-- 已有 VM 资源会保留。
-- 已有 Workload 会按 `resource_id` 更新 `spec/data_quality`，并合并 `cpu/memory` 时间序列。
-- 不存在的 Workload 会新增。
-- 写入前会自动备份当前 raw 到 `outputs/backups/`。
-- 如果 `raw_data.json` 不存在，则会初始化一个仅包含 K8S Workload 的 raw。
-
-执行：
-
-```powershell
-$env:K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://你的-prometheus:9090"}'
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_k8s_pods.py
-```
-
-可选模式：
-
-```powershell
-# 默认：合并 Workload，不覆盖 VM
-.\.venv\Scripts\python.exe generate_k8s_pods.py --mode upsert
-
-# 仅替换已有 K8S 集合，VM 保留
-.\.venv\Scripts\python.exe generate_k8s_pods.py --mode replace-k8s
-
-# 初始化 raw；raw 已存在时会先备份
-.\.venv\Scripts\python.exe generate_k8s_pods.py --mode init
-```
-
-不要用 `generate_all_images(data_provider=k8s_workload_prometheus_provider)` 直接接入生产 K8S，因为它属于全量生成，会重写 raw。真实环境推荐使用 `generate_k8s_pods.py` 默认 upsert，或使用 `/api/upsert-data`。
-
-启动 Web：
-
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe app.py
-```
-
-打开：
-
-```text
-http://127.0.0.1:5000
-```
-
-切到 **K8S Workload负载**。如果列表为空，先看 [10. 常见问题](#10-常见问题)。
-
-### 6.6 小范围验证建议
-
-首次接入不要直接拉全量集群，建议先限制命名空间：
-
-```python
-namespace_regex: str = "default"
-```
-
-验证顺序：
-
-1. Prometheus UI 中确认 CPU、内存、request、limit 查询均有数据。
-2. 运行 `generate_k8s_pods.py`。
-3. 打开 `outputs/raw_data.json`，确认存在 `resource_type: "k8s_workload"`。
-4. 启动 Web，切到“K8S Workload负载”。
-5. 任选一个 Workload，与 Prometheus UI 中按同一 owner 聚合后的曲线对比量级。
-
-### 6.7 无法直连 Prometheus 时
-
-如果本项目机器不能访问 Prometheus，可以由内网定时任务查询 Prometheus，再按 `k8s_workload` 数据结构推送：
-
-```text
-POST /api/upsert-data
-```
-
-这种方式适合网络隔离严格、只能单向推送数据的环境。
-
----
-
-## 7. API 参考
-
-### 7.1 资源与详情
-
-| 路径 | 说明 |
-| --- | --- |
-| `GET /` | 首页 |
+| `GET /` | Web 首页 |
 | `GET /api/resources` | 资源列表 |
+| `GET /api/resources/<id>` | 资源详情 |
 | `GET /api/resources/details?ids=a,b` | 批量详情 |
-| `GET /api/resources/<id>` | 单资源详情 |
 | `GET /api/resources/advice-summary` | 建议统计 |
+| `GET /api/update-status` | 更新任务状态 |
+| `POST /api/update-trigger` | 触发 pull 型增量更新 |
+| `POST /api/update-data` | 只更新已有资源 |
+| `POST /api/upsert-data` | 更新或新增资源 |
+| `GET /api/cluster-configs` | 读取集群配置 |
+| `PUT /api/cluster-configs` | 保存集群配置 |
+| `POST /api/cluster-configs/k8s-diagnose` | 诊断 K8S Prometheus |
+| `POST /api/cluster-configs/k8s-fetch` | 拉取 K8S Prometheus 数据 |
+| `POST /api/resources/<id>/scale` | 创建调配任务 |
+| `GET /api/scaling-tasks/<id>` | 查询调配任务 |
+| `POST /api/scaling-tasks/<id>/confirm` | 确认 OpenStack resize |
 
-常用参数：
+常用列表参数：
 
 | 参数 | 说明 |
 | --- | --- |
 | `resource_type=openstack_vm` | 只看 VM |
 | `resource_type=k8s_workload` | 只看 K8S Workload |
-| `q=xxx` | 搜索资源 ID、IP、集群、namespace、workload、pod、container、node |
+| `q=keyword` | 搜索资源 ID、IP、namespace、workload、node 等 |
 | `action=scale_out` | 筛选 VM 扩容 |
 | `action=scale_out_candidate` | 筛选 K8S 扩容候选 |
 | `page/page_size` | 分页 |
-| `top_n` | TopN |
-| `sort_by=urgency_score` | 按紧迫度排序 |
+| `sort_by=urgency_score` | 按紧急度排序 |
 
-示例：
+## 配置
+
+主要默认配置在：
 
 ```text
-GET /api/resources?resource_type=k8s_workload&page=1&page_size=20
-GET /api/resources?resource_type=openstack_vm&action=scale_out
+resource_predict/settings.py
 ```
 
-列表项会附带 `urgency_score`。该分数综合建议动作、置信度、预测压力、风险画像和目标规格变化，用于把更需要处理的资源排在前面。
+本地敏感配置：
 
-### 7.2 数据更新
-
-| 路径 | 说明 |
-| --- | --- |
-| `GET /api/update-status` | 后台更新状态 |
-| `POST /api/update-trigger` | Pull 增量更新 |
-| `POST /api/update-data` | Push 增量，仅更新已有资源 |
-| `POST /api/upsert-data` | Push upsert，可插入新资源 |
-
-VM 增量示例：
-
-```json
-[
-  {
-    "resource_id": "vm-001",
-    "metrics": {
-      "cpu": { "timestamps": [1730000000000], "values": [0.45] },
-      "memory": { "timestamps": [], "values": [] },
-      "disk": { "timestamps": [], "values": [] }
-    }
-  }
-]
+```text
+deploy/clusters.json
+deploy/k8s_prometheus_clusters.json
+.env
 ```
 
-K8S Workload upsert 示例：
+这些文件已在 `.gitignore` 中忽略。
 
-```json
-[
-  {
-    "resource_id": "k8s:cluster-k8s-a:default:deployment:api-server",
-    "resource_type": "k8s_workload",
-    "spec": {
-      "cluster": "cluster-k8s-a",
-      "namespace": "default",
-      "workload_kind": "Deployment",
-      "workload_name": "api-server",
-      "replicas_observed": 3,
-      "cpu_request_cores": 1,
-      "memory_limit_gb": 2
-    },
-    "metrics": {
-      "cpu": { "timestamps": [1730000000000], "values": [0.55] },
-      "memory": { "timestamps": [1730000000000], "values": [0.48] }
-    }
-  }
-]
-```
+## 验证与维护
 
-规则：
-
-- 时间戳支持秒、毫秒或可解析字符串。
-- `values` 使用小数，不是百分号。
-- VM 新资源需要 `cpu/memory/disk`。
-- K8S Workload 新资源只需要 `cpu/memory`。
-- K8S Workload 必须带顶层 `resource_type: "k8s_workload"`，否则会按 VM 默认规则校验。
-- Upsert 会合并到现有 `raw_data.json`，不会整体覆盖；写入前会自动备份。
-- 合法请求立即返回 `202`，后台重预测；轮询 `/api/update-status`。
-
-### 7.3 调配 API
-
-| 路径 | 说明 |
-| --- | --- |
-| `POST /api/resources/<id>/scale` | 调配预检/执行 |
-| `GET /api/scaling-tasks/<task_id>` | 调配任务状态 |
-| `GET /api/resources/<id>/scaling-history` | 调配历史 |
-
-Workload 视图当前不展示调配按钮，不会调用调配 API。K8S 的 `target_k8s_policy` 只作为 requests/limits 推荐和后续自动化接入依据。
-
----
-
-## 8. 资源调配
-
-调配根据 `scaling_advice` 在集群控制节点生成白名单命令，支持预检 `dry_run` 和执行 `execute`。实现位于 `resource_predict/services/scaling/`。
-
-### 8.1 调配数据流
-
-```mermaid
-flowchart LR
-    Pipeline["pipeline"] --> Advice["scaling_advice"]
-    Advice --> Frontend["前端预检或调配"]
-    Frontend --> Api["POST /api/resources/<id>/scale"]
-    Api --> Task["后台任务"]
-    Task --> Control["SSH 控制节点"]
-    Control --> Command["openstack resize 或 kubectl"]
-```
-
-### 8.2 调配流程
-
-```mermaid
-flowchart TB
-    Start["预检或调配"] --> Hold{"action == hold"}
-    Hold -->|是| Deny["拒绝"]
-    Hold -->|否| Dup{"存在并发任务"}
-    Dup -->|是| Conflict["返回 409"]
-    Dup -->|否| Queued["queued, 返回 202 和 task_id"]
-    Queued --> BG["后台任务 _run_task"]
-    BG --> Plan["build_scaling_plan"]
-    Plan --> Mode{"mode"}
-    Mode -->|dry_run| DryRunOk["success, 仅生成计划"]
-    Mode -->|execute| SSH["SSH 逐条执行"]
-    SSH --> Done["success 或 failed"]
-```
-
-请求：
-
-```json
-{ "mode": "dry_run" }
-```
-
-```json
-{
-  "mode": "execute",
-  "confirm": true,
-  "confirm_create_flavor": false
-}
-```
-
-任务状态：
-
-| status | 含义 |
-| --- | --- |
-| `queued` | 已入队 |
-| `running` | 计划中或 SSH 执行中 |
-| `waiting_confirm` | OpenStack resize 后等待确认 |
-| `confirming` | 正在确认 OpenStack resize |
-| `success` | 成功 |
-| `failed` | 失败 |
-
-### 8.3 OpenStack VM
-
-`resource_type=openstack_vm` 时，后台读取 OpenStack flavor 并选择合适规格：
-
-- 扩容：选择 CPU、内存、磁盘都不低于目标规格的最小 flavor。
-- 缩容：选择 CPU、内存不高于目标规格，且磁盘不低于当前磁盘的最大 flavor。
-- 无合适 flavor 时，可在用户确认后自动创建 flavor。
-- 磁盘缩容不自动执行。
-- 磁盘扩容只 resize flavor，不自动处理文件系统扩容。
-
-OpenStack 必填：
-
-```json
-{
-  "resource_type": "openstack_vm",
-  "cluster": "cluster-openstack-a",
-  "instance_id": "server-uuid",
-  "cpu_cores": 4,
-  "memory_gb": 16,
-  "disk_gb": 100
-}
-```
-
-### 8.4 K8S Workload
-
-`resource_type=k8s_container` 时，后台生成：
+### 回归检查
 
 ```bash
-kubectl -n <namespace> set resources deployment/<name> -c <container> \
-  --requests=cpu=<cpu>,memory=<memory> \
-  --limits=cpu=<cpu>,memory=<memory>
+export PYTHONUTF8=1
+python -m compileall -q app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict tests
+python -m pyflakes app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict tests
+vulture app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict tests --min-confidence 80
+python -m pytest -q
 ```
 
-K8S workload 必填：
+### 维护约定
 
-```json
-{
-  "resource_type": "k8s_container",
-  "cluster": "cluster-k8s-a",
-  "namespace": "default",
-  "deployment": "app-name",
-  "container": "main",
-  "cpu_cores": 1,
-  "memory_gb": 2,
-  "disk_gb": 20
-}
-```
+- 根目录只放直接运行的 CLI 或项目级配置。
+- 业务逻辑放入 `resource_predict/` 包内，CLI 只做参数解析和输出。
+- 新增 K8S 逻辑优先使用 `workload` 命名；`pod` 只作为 Prometheus 标签或历史产物兼容词出现。
+- 预测产物统一称为 `outputs` 或 `forecast artifacts`，不要再使用 `images` 命名。
+- 不提交 `outputs/`、日志、缓存、`__pycache__`、本地凭据。
 
-说明：
+### 常见问题
 
-- `deployment` 或 `statefulset` 二选一。
-- `container` 可选；不填则 `kubectl set resources` 不指定容器。
-- K8S 存储不自动调整。
-- `k8s_workload` 当前只是分析对象，不进入调配执行；但会在 `target_k8s_policy` 中给出建议的 CPU/memory request/limit。
-
-### 8.5 集群配置
-
-复制配置：
-
-```bash
-cp deploy/clusters.example.json deploy/clusters.json
-```
-
-OpenStack 示例：
-
-```json
-{
-  "cluster-openstack-a": {
-    "cloud_type": "openstack",
-    "control_host": "192.168.1.10",
-    "ssh_user": "root",
-    "ssh_port": 22,
-    "ssh_key": "C:/path/to/id_rsa",
-    "openstack_rc": "/root/admin-openrc",
-    "auto_confirm_resize": false
-  }
-}
-```
-
-K8S 示例：
-
-```json
-{
-  "cluster-k8s-a": {
-    "cloud_type": "k8s",
-    "control_host": "192.168.1.20",
-    "ssh_user": "root",
-    "ssh_port": 22,
-    "ssh_key": "C:/path/to/id_rsa",
-    "kubeconfig": "/root/.kube/config",
-    "command_timeout_seconds": 300
-  }
-}
-```
-
----
-
-## 9. 配置与运维
-
-### 9.1 主要配置
-
-| 配置类 | 文件 | 说明 |
-| --- | --- | --- |
-| `AppConfig` | `resource_predict/settings.py` | Web、输出目录、日志 |
-| `GenerationConfig` | `resource_predict/settings.py` | 资源数量、测试窗口、分页 |
-| `ForecastConfig` | `resource_predict/settings.py` | 启用模型、Prophet 主参数、baseline 模型、滚动回测和预测裁剪 |
-| `DecisionConfig` | `resource_predict/settings.py` | VM/Pod 策略档位、扩缩容业务阈值、动作去抖和冷却建议 |
-| `UpdateConfig` | `resource_predict/settings.py` | 增量更新、定时更新 |
-| `K8SPrometheusConfig` | `resource_predict/settings.py` | K8S Workload Prometheus 接入 |
-| `clusters.json` | `deploy/clusters.json` | 调配控制节点和 kubeconfig/openrc |
-
-默认预测配置：
-
-```python
-enabled_methods = ("seasonal_naive", "rolling_mean", "prophet")
-rolling_backtest_folds = 3
-enable_ensemble = True
-anomaly_route_zscore_threshold = 3.5
-```
-
-默认策略配置：
-
-```python
-default_policy_tier = "balanced"
-scale_out_confirmations = 2
-scale_in_confirmations = 3
-scale_out_cooldown_minutes = 60
-scale_in_cooldown_minutes = 360
-```
-
-策略档位说明：
-
-| 档位 | 行为 |
+| 问题 | 处理 |
 | --- | --- |
-| `conservative` | 更早扩容、更谨慎缩容，适合核心业务或生产 namespace。 |
-| `balanced` | 默认策略，兼顾风险和成本。 |
-| `aggressive` | 更积极缩容，适合测试、批处理或低优先级负载。 |
-
-### 9.2 日志
-
-默认日志：
-
-```text
-outputs/resource_predict.log
-```
-
-Windows 下如果日志文件删不掉，先停止 Flask/Python 进程。
-
-### 9.3 后台更新
-
-`UpdateConfig.enabled=False` 时，不自动定时更新，只支持手动触发：
-
-```text
-POST /api/update-trigger
-POST /api/update-data
-POST /api/upsert-data
-```
-
-要开启自动 Pull 更新，需要配置：
-
-```python
-enabled = True
-interval_minutes = 60
-incremental_provider_path = "your_module:provider"
-```
-
-provider 签名：
-
-```python
-def provider(prepared_resources, points_to_add):
-    return incremental_items
-```
-
-### 9.4 验证命令
-
-Python 编译检查：
-
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe -m compileall resource_predict app.py generate_images.py generate_k8s_pods.py
-```
-
-前端 JS 语法检查：
-
-```powershell
-node --check static\js\app-state.js
-node --check static\js\resource-list.js
-node --check static\js\charts.js
-node --check static\js\index.js
-```
-
-VM 回归预测：
-
-```powershell
-$env:PYTHONUTF8="1"
-.\.venv\Scripts\python.exe generate_images.py predict
-```
-
-最近一次验证输出示例：
-
-```json
-{
-  "active_methods": ["prophet", "seasonal_naive", "rolling_mean"],
-  "test_size": 72,
-  "future_steps": 24,
-  "predicted_resources": 15
-}
-```
-
-接口烟测：
-
-```powershell
-@'
-from app import create_app
-app = create_app()
-with app.test_client() as c:
-    print(c.get("/api/resources?page_size=3").status_code)
-    print(c.get("/api/resources?resource_type=k8s_workload&page_size=1").get_json()["items"][0]["scaling_advice"]["target_k8s_policy"]["ready_for_execution"])
-'@ | .\.venv\Scripts\python.exe -
-```
-
----
-
-## 10. 常见问题
-
-| 现象 | 处理 |
-| --- | --- |
-| 页面无数据 | 先生成预测产物，确认 `outputs/summary_index.json` 存在 |
-| VM 页有数据，Workload 页为空 | 尚未运行 `generate_k8s_pods.py`，或 Prometheus 查询无结果 |
-| `请配置 settings.k8s_prometheus.clusters，或环境变量 K8S_PROMETHEUS_CLUSTERS` | 设置多集群 JSON 环境变量，或写入 `settings.k8s_prometheus.clusters` |
-| Prometheus 连接超时 | 本项目机器不能访问 Prometheus；先用浏览器/curl/Invoke-WebRequest 验证 URL |
-| CPU/内存有曲线但建议“数据不足” | 缺少 request/limit 指标，检查 kube-state-metrics |
-| 指标有数据但没有 Workload | 缺少 `kube_pod_owner` 或 Prometheus 标签不符合 provider 当前查询逻辑，需要按实际标签调整 |
-| `predict` 失败：缺少 raw | 先全量生成或使用 upsert/provider 创建 `raw_data.json` |
-| CmdStanPy 在中文路径下报解码错误 | 运行前设置 `$env:PYTHONUTF8="1"` |
-| 更新接口返回 409 | 已有更新任务，查看 `GET /api/update-status` |
-| 详情返回 `prediction_pending` | 后台正在预测，完成后刷新 |
-| 调配返回 409 | 同一资源已有进行中的调配任务 |
-| 日志删不掉 | 停止 Flask/Python 后再删 |
-
-维护建议：
-
-- 不要提交 `outputs/`、日志、缓存、`__pycache__`。
-- 修改预测或决策逻辑后，运行 `generate_images.py predict` 回归。
-- 修改 K8S provider 后，先用单 namespace 小范围验证。
-- 修改前端后，检查 VM 与 K8S Workload 两个主视图。
+| 页面无数据 | 先运行 `python generate_forecasts.py`，再运行 `python check_outputs.py` |
+| VM 有数据，K8S 为空 | 检查 Prometheus 配置，运行 `python ingest_k8s_workloads.py --diagnose` |
+| 提示缺少 K8S Prometheus 配置 | 设置 `K8S_PROMETHEUS_CLUSTERS` 或写入 `deploy/k8s_prometheus_clusters.json` |
+| 产物结构不一致 | 运行 `python check_outputs.py --json` 查看具体错误 |
+| 测试工具缺失 | 运行 `python -m pip install -r requirements-dev.txt` |

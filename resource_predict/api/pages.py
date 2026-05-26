@@ -4,7 +4,6 @@ from typing import Any, Callable, Dict, List
 
 from flask import Flask, render_template
 
-from resource_predict.pipeline.constants import SUMMARY_INDEX_FILENAME
 from resource_predict.settings import settings
 
 
@@ -21,7 +20,7 @@ def register_page_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) -> 
         except Exception as e:
             error = str(e)
         if not resources and not error:
-            error = f"尚未检测到预测结果，请先生成 {settings.app.out_dir}/{SUMMARY_INDEX_FILENAME}。"
+            error = f"尚未检测到预测结果，请先生成 {settings.app.out_dir}/vm 或 {settings.app.out_dir}/k8s 下的预测产物。"
         return render_template(
             "index.html",
             resources=[],

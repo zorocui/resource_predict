@@ -12,6 +12,11 @@ import numpy as np
 import pandas as pd
 
 from resource_predict.settings import settings
+from resource_predict.services.cluster_configs import (
+    K8S_PROMETHEUS_CONFIG_PATH,
+    ClusterConfigValidationError,
+    read_k8s_prometheus_clusters,
+)
 
 
 @dataclass(frozen=True)
@@ -67,7 +72,7 @@ ContainerKey = Tuple[str, str, str]
 WorkloadKey = Tuple[str, str, str]
 
 
-def k8s_pod_prometheus_provider(
+def k8s_workload_prometheus_provider(
     *,
     resources: int,
     n: int,
@@ -114,9 +119,6 @@ def k8s_pod_prometheus_provider(
     return out
 
 
-k8s_workload_prometheus_provider = k8s_pod_prometheus_provider
-
-
 def diagnose_k8s_prometheus(
     *,
     clusters: Optional[Iterable[str]] = None,
@@ -152,15 +154,17 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
     if target.namespace_regex:
         selector += f',namespace=~"{target.namespace_regex}"'
     owner_selector = 'pod!=""'
+    replicaset_owner_selector = ""
     if target.namespace_regex:
         owner_selector += f',namespace=~"{target.namespace_regex}"'
+        replicaset_owner_selector = f'namespace=~"{target.namespace_regex}"'
 
     warnings: List[str] = []
     errors: List[str] = []
     query_counts: Dict[str, int] = {}
     try:
         cpu_usage_rows = client.query_range(
-            f"rate(container_cpu_usage_seconds_total{{{selector}}}[5m])",
+            f"rate(container_cpu_usage_seconds_total{{{selector}}}[10m])",
             start=start,
             end=end,
             step=step,
@@ -177,7 +181,7 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
         query_counts["memory_usage_series"] = len(mem_usage)
 
         pod_owners_raw = _pod_owner_values(client, owner_selector)
-        replicaset_owners = _replicaset_owner_values(client, owner_selector)
+        replicaset_owners = _replicaset_owner_values(client, replicaset_owner_selector)
         pod_owners = _resolve_controller_owners(pod_owners_raw, replicaset_owners)
         query_counts["pod_owner_rows"] = len(pod_owners_raw)
         query_counts["replicaset_owner_rows"] = len(replicaset_owners)
@@ -276,12 +280,14 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
     if target.namespace_regex:
         selector += f',namespace=~"{target.namespace_regex}"'
     owner_selector = 'pod!=""'
+    replicaset_owner_selector = ""
     if target.namespace_regex:
         owner_selector += f',namespace=~"{target.namespace_regex}"'
+        replicaset_owner_selector = f'namespace=~"{target.namespace_regex}"'
 
     cpu_usage = _range_by_key(
         client.query_range(
-            f"rate(container_cpu_usage_seconds_total{{{selector}}}[5m])",
+            f"rate(container_cpu_usage_seconds_total{{{selector}}}[10m])",
             start=start,
             end=end,
             step=step,
@@ -312,7 +318,7 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
         f'kube_pod_container_resource_limits{{{selector},resource="memory"}}',
     ])
     pod_owners = _pod_owner_values(client, owner_selector)
-    replicaset_owners = _replicaset_owner_values(client, owner_selector)
+    replicaset_owners = _replicaset_owner_values(client, replicaset_owner_selector)
     if replicaset_owners:
         pod_owners = _resolve_controller_owners(pod_owners, replicaset_owners)
 
@@ -407,7 +413,8 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
 def _resolve_targets() -> List[PrometheusTarget]:
     cfg = settings.k8s_prometheus
     env_targets = _targets_from_env()
-    configured = env_targets or list(cfg.clusters)
+    file_targets = _targets_from_file()
+    configured = file_targets or env_targets or list(cfg.clusters)
 
     targets: List[PrometheusTarget] = []
     invalid: List[str] = []
@@ -456,6 +463,15 @@ def _targets_from_env() -> List[Dict[str, Any]]:
                 out.append({"cluster": cluster, **value})
         return out
     raise ValueError("K8S_PROMETHEUS_CLUSTERS 必须是 JSON 数组或对象")
+
+
+def _targets_from_file() -> List[Dict[str, Any]]:
+    if not K8S_PROMETHEUS_CONFIG_PATH.exists():
+        return []
+    try:
+        return read_k8s_prometheus_clusters(K8S_PROMETHEUS_CONFIG_PATH)
+    except ClusterConfigValidationError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _target_to_dict(item: Any) -> Dict[str, Any]:
@@ -547,8 +563,9 @@ def _pod_owner_values(client: PrometheusClient, selector: str) -> Dict[Tuple[str
 
 
 def _replicaset_owner_values(client: PrometheusClient, selector: str) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    prefix = f"{selector}," if selector else ""
     queries = [
-        f'kube_replicaset_owner{{{selector},owner_is_controller="true"}}',
+        f'kube_replicaset_owner{{{prefix}owner_is_controller="true"}}',
         f"kube_replicaset_owner{{{selector}}}",
     ]
     owners: Dict[Tuple[str, str], Tuple[str, str]] = {}
@@ -710,7 +727,7 @@ def _data_quality(s: pd.Series, step_seconds: int) -> Dict[str, Any]:
         span = max(0.0, (arr.index[-1] - arr.index[0]).total_seconds())
         expected = int(span // max(1, step_seconds)) + 1
     missing_ratio = 1.0 - (len(arr) / expected) if expected > 0 else 1.0
-    diffs = np.diff(arr.index.view("int64") // 1_000_000) if len(arr) >= 2 else np.array([])
+    diffs = np.diff(arr.index.view("int64") // 1_000_000_000) if len(arr) >= 2 else np.array([])
     max_gap = int(np.max(diffs)) if diffs.size else 0
     if len(arr) < 24 or missing_ratio > 0.35 or max_gap > step_seconds * 12:
         level = "poor"

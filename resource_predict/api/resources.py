@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List
 
 from flask import Flask, jsonify, request
 
+from resource_predict.resource_types import resource_type_of
 from resource_predict.settings import settings
 from resource_predict.services.urgency import compute_urgency_score
 
@@ -22,9 +23,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         resources = summary.get("resources", []) if isinstance(summary, dict) else []
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
-        resource_type_filter = (request.args.get("resource_type") or "").strip().lower().replace("-", "_")
-        if resource_type_filter in {"workload", "controller", "k8s_controller"}:
-            resource_type_filter = "k8s_workload"
+        resource_type_filter = _normalize_resource_type_filter(request.args.get("resource_type"))
         sort_by = (request.args.get("sort_by") or "urgency_score").strip().lower()
         top_n = safe_int(request.args.get("top_n"), 0)
         page = max(1, safe_int(request.args.get("page"), 1))
@@ -33,7 +32,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
 
         rows = [x for x in resources if isinstance(x, dict)]
         if resource_type_filter:
-            rows = [x for x in rows if _resource_type_of(x) == resource_type_filter]
+            rows = [x for x in rows if resource_type_of(x) == resource_type_filter]
         if q:
             rows = [x for x in rows if matches_query(x, q)]
         if action_filter in {"scale_out", "scale_in", "hold", "mixed", "scale_out_candidate", "scale_in_candidate", "insufficient_data"}:
@@ -83,12 +82,10 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         resources = summary.get("resources", []) if isinstance(summary, dict) else []
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
-        resource_type_filter = (request.args.get("resource_type") or "").strip().lower().replace("-", "_")
-        if resource_type_filter in {"workload", "controller", "k8s_controller"}:
-            resource_type_filter = "k8s_workload"
+        resource_type_filter = _normalize_resource_type_filter(request.args.get("resource_type"))
         rows = [x for x in resources if isinstance(x, dict)]
         if resource_type_filter:
-            rows = [x for x in rows if _resource_type_of(x) == resource_type_filter]
+            rows = [x for x in rows if resource_type_of(x) == resource_type_filter]
         if q:
             rows = [x for x in rows if matches_query(x, q)]
         if action_filter in {"scale_out", "scale_in", "hold", "scale_out_candidate", "scale_in_candidate", "insufficient_data"}:
@@ -171,12 +168,8 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         return jsonify({"resources": items})
 
 
-def _resource_type_of(item: Dict[str, Any]) -> str:
-    raw = str(item.get("resource_type") or "").strip().lower().replace("-", "_")
-    if raw in {"workload", "controller", "k8s_workload", "k8s_controller"}:
-        return "k8s_workload"
-    if raw in {"pod", "k8s_pod"}:
-        return "k8s_pod"
-    if raw in {"k8s", "kubernetes", "k8s_container", "container"}:
-        return "k8s_container"
-    return raw or "openstack_vm"
+def _normalize_resource_type_filter(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return resource_type_of({"resource_type": raw})

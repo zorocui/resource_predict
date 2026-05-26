@@ -20,6 +20,7 @@
           <button class="nav-tab" type="button" data-view="overview">概览</button>
           <button class="nav-tab" type="button" data-view="tasks">调配任务</button>
           <button class="nav-tab" type="button" data-view="updates">数据更新</button>
+          <button class="nav-tab" type="button" data-view="configs">集群配置</button>
         </nav>
       </header>
 
@@ -170,6 +171,46 @@
               <pre id="update-message" class="status-message"></pre>
             </section>
           </div>
+
+          <div id="configs-view" class="view-panel">
+            <section class="config-workspace">
+              <div class="config-head">
+                <div>
+                  <h2>集群配置</h2>
+                  <p>配置 VM 调配控制节点，以及 K8S 监控接入所需的 Prometheus 集群。</p>
+                </div>
+                <button id="cluster-config-save" class="primary-btn" type="button">保存配置</button>
+              </div>
+
+              <div class="config-section">
+                <div class="config-section-head">
+                  <div>
+                    <h3>VM 调配集群</h3>
+                    <p>保存到 deploy/clusters.json，调配预检和执行会按资源 spec.cluster 读取。</p>
+                  </div>
+                  <button id="vm-cluster-add" class="secondary-btn" type="button">新增集群</button>
+                </div>
+                <div id="vm-cluster-list" class="config-list"></div>
+              </div>
+
+              <div class="config-section">
+                <div class="config-section-head">
+                  <div>
+                    <h3>K8S 监控接入</h3>
+                    <p>保存到 deploy/k8s_prometheus_clusters.json，数据更新拉取 Workload 时优先读取。</p>
+                  </div>
+                  <div class="config-actions">
+                    <button id="k8s-cluster-add" class="secondary-btn" type="button">新增接入</button>
+                    <button id="k8s-diagnose" class="secondary-btn" type="button">诊断接入</button>
+                    <button id="k8s-fetch" class="primary-btn" type="button">拉取 K8S 数据</button>
+                  </div>
+                </div>
+                <div id="k8s-cluster-list" class="config-list"></div>
+              </div>
+
+              <pre id="cluster-config-message" class="status-message"></pre>
+            </section>
+          </div>
         </section>
 
         <aside id="detail-panel" class="detail-panel" data-resource-id="" aria-label="资源详情">
@@ -199,7 +240,10 @@
             <section class="detail-card">
               <div class="detail-card-head">
                 <h3>指标预测</h3>
-                <button id="chart-guide-btn" class="link-btn" type="button" aria-pressed="true">辅助线：开</button>
+                <div class="chart-card-actions">
+                  <button id="chart-zoom-btn" class="icon-only-btn" type="button" title="放大图表" aria-label="放大图表">⛶</button>
+                  <button id="chart-guide-btn" class="link-btn" type="button" aria-pressed="true">辅助线：开</button>
+                </div>
               </div>
               <div id="metric-tabs" class="metric-tabs"></div>
               <div id="detail-chart" class="detail-chart"></div>
@@ -237,6 +281,21 @@
           </div>
         </div>
       </div>
+
+      <div id="chart-modal" class="chart-modal" hidden>
+        <div class="chart-modal-backdrop" data-chart-modal-dismiss></div>
+        <div class="chart-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="chart-modal-title">
+          <div class="chart-modal-header">
+            <div>
+              <div id="chart-modal-title" class="chart-modal-title">指标预测</div>
+              <div id="chart-modal-subtitle" class="chart-modal-subtitle"></div>
+            </div>
+            <button type="button" class="icon-text-btn" data-chart-modal-dismiss>关闭</button>
+            </div>
+            <div id="chart-modal-metric-tabs" class="metric-tabs chart-modal-tabs"></div>
+            <div id="chart-modal-chart" class="chart-modal-chart"></div>
+          </div>
+        </div>
     </div>
 
     <script src="{{ url_for('static', filename='js/app-state.js') }}"></script>

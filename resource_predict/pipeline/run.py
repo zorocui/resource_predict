@@ -19,7 +19,7 @@ from resource_predict.core.forecasting import (
     forecast_sarima,
     forecast_seasonal_naive,
 )
-from resource_predict.core.k8s_pod_decision import build_k8s_pod_advice
+from resource_predict.core.k8s_workload_decision import build_k8s_workload_advice
 from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resource, resource_type_of
 from resource_predict.pipeline.constants import MANIFEST_FILENAME, RAW_DATA_FILENAME
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
@@ -30,7 +30,7 @@ from resource_predict.pipeline.write_outputs import write_prediction_outputs
 logger = logging.getLogger(__name__)
 
 
-def generate_all_images(
+def generate_forecasts(
     *,
     out_dir: Optional[str] = None,
     resources: Optional[int] = None,
@@ -471,7 +471,7 @@ def generate_all_images(
 
         advice = None
         if resource_type in {"k8s_pod", "k8s_workload"} and len(futures_for_advice) == len(metric_names):
-            advice = build_k8s_pod_advice(futures_for_advice, resource=source)
+            advice = build_k8s_workload_advice(futures_for_advice, resource=source)
         elif len(futures_for_advice) == len(METRIC_NAMES):
             advice = build_scaling_advice(
                 futures_for_advice,
@@ -589,7 +589,7 @@ def generate_all_images(
 def generate_predictions_only(**kwargs: Any) -> List[Dict[str, Any]]:
     kwargs = {**kwargs, "predict_only": True}
     kwargs.setdefault("save_raw", False)
-    return generate_all_images(**kwargs)
+    return generate_forecasts(**kwargs)
 
 
 def _log_input_stats(

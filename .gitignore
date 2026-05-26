@@ -30,6 +30,7 @@ outputs/*
 
 # Local cluster credentials (copy from deploy/clusters.example.json)
 deploy/clusters.json
+deploy/k8s_prometheus_clusters.json
 .env
 .env.*
 !.env.example

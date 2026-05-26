@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
+
+import pandas as pd
 
 from resource_predict.providers import k8s_prometheus as provider
 from resource_predict.providers.k8s_prometheus import PrometheusTarget
@@ -12,10 +17,13 @@ GIB = 1024 ** 3
 
 
 class FakePrometheusClient:
+    queries: list[str] = []
+
     def __init__(self, *args, **kwargs):
         pass
 
     def query_range(self, query: str, *, start: float, end: float, step: int):
+        self.queries.append(query)
         if "container_cpu_usage_seconds_total" in query:
             return [
                 self._range_row("ns", "api-rs-a", "app", "node-1", [0.2, 0.4]),
@@ -31,6 +39,7 @@ class FakePrometheusClient:
         return []
 
     def query(self, query: str, *, ts=None):
+        self.queries.append(query)
         if "kube_pod_owner" in query:
             return [
                 self._instant_row(
@@ -92,6 +101,24 @@ class FakePrometheusClient:
 
 
 class K8SWorkloadProviderTest(unittest.TestCase):
+    def setUp(self):
+        FakePrometheusClient.queries = []
+
+    def test_resolve_targets_prefers_file_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "k8s_prometheus_clusters.json"
+            path.write_text(
+                json.dumps([{"cluster": "file-cluster", "prometheus_url": "http://file-prometheus:9090"}]),
+                encoding="utf-8",
+            )
+            with patch.object(provider, "K8S_PROMETHEUS_CONFIG_PATH", path):
+                with patch.dict("os.environ", {"K8S_PROMETHEUS_CLUSTERS": '{"env-cluster":"http://env:9090"}'}):
+                    targets = provider._resolve_targets()
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].cluster, "file-cluster")
+        self.assertEqual(targets[0].prometheus_url, "http://file-prometheus:9090")
+
     def test_fetch_target_aggregates_pods_to_deployment_workload(self):
         target = PrometheusTarget(
             cluster="cluster-a",
@@ -151,6 +178,54 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         ])
         self.assertTrue(any("缺少 owner" in warning for warning in report["warnings"]))
         self.assertEqual(report["errors"], [])
+
+    def test_replicaset_owner_query_does_not_include_pod_selector(self):
+        target = PrometheusTarget(
+            cluster="cluster-a",
+            prometheus_url="http://prometheus.example",
+            namespace_regex="prod|default",
+            bearer_token="",
+            basic_auth="",
+            history_days=1,
+            step_seconds=300,
+            request_timeout_seconds=5,
+        )
+
+        with patch.object(provider, "PrometheusClient", FakePrometheusClient):
+            provider._diagnose_target(target)
+
+        queries = [q for q in FakePrometheusClient.queries if "kube_replicaset_owner" in q]
+        self.assertTrue(queries)
+        self.assertTrue(all('pod!=""' not in query for query in queries))
+        self.assertTrue(any('namespace=~"prod|default"' in query for query in queries))
+
+    def test_cpu_usage_query_uses_ten_minute_rate_window(self):
+        target = PrometheusTarget(
+            cluster="cluster-a",
+            prometheus_url="http://prometheus.example",
+            namespace_regex="",
+            bearer_token="",
+            basic_auth="",
+            history_days=1,
+            step_seconds=300,
+            request_timeout_seconds=5,
+        )
+
+        with patch.object(provider, "PrometheusClient", FakePrometheusClient):
+            provider._diagnose_target(target)
+
+        cpu_queries = [q for q in FakePrometheusClient.queries if "container_cpu_usage_seconds_total" in q]
+        self.assertTrue(cpu_queries)
+        self.assertTrue(all("[10m]" in query for query in cpu_queries))
+
+    def test_data_quality_uses_seconds_for_gap_threshold(self):
+        idx = pd.date_range("2026-01-01", periods=24, freq="300s")
+        series = pd.Series([1.0] * len(idx), index=idx)
+
+        quality = provider._data_quality(series, step_seconds=300)
+
+        self.assertEqual(quality["level"], "good")
+        self.assertEqual(quality["max_gap_seconds"], 300)
 
 
 if __name__ == "__main__":

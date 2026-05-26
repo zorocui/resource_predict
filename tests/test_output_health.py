@@ -69,14 +69,36 @@ def valid_artifacts() -> tuple[dict, dict, dict]:
     return summary, raw, details
 
 
+def write_scoped_artifacts(base: Path, summary: dict, raw: dict, details: dict) -> None:
+    for scope, resource_type in (("vm", "openstack_vm"), ("k8s", "k8s_workload")):
+        scoped_summary = {
+            "meta": {"details_files": ["part-00000.json"], "details_dir": "details"},
+            "resources": [],
+        }
+        scoped_raw = {"meta": raw.get("meta", {}), "resources": []}
+        scoped_details = {"resources": []}
+        for item in summary["resources"]:
+            if item.get("resource_type") == resource_type:
+                scoped = dict(item)
+                scoped["detail_ref"] = {"file": "part-00000.json", "offset": len(scoped_details["resources"])}
+                scoped_summary["resources"].append(scoped)
+        for item in raw["resources"]:
+            if item.get("resource_type") == resource_type:
+                scoped_raw["resources"].append(item)
+        for item in details["resources"]:
+            if item.get("resource_type") == resource_type:
+                scoped_details["resources"].append(item)
+        write_json(base / scope / "summary_index.json", scoped_summary)
+        write_json(base / scope / "raw_data.json", scoped_raw)
+        write_json(base / scope / "details" / "part-00000.json", scoped_details)
+
+
 class OutputHealthTest(unittest.TestCase):
     def test_check_outputs_accepts_vm_and_k8s_workload_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             summary, raw, details = valid_artifacts()
-            write_json(base / "summary_index.json", summary)
-            write_json(base / "raw_data.json", raw)
-            write_json(base / "details" / "part-00000.json", details)
+            write_scoped_artifacts(base, summary, raw, details)
 
             report = check_outputs(base)
 
@@ -102,9 +124,11 @@ class OutputHealthTest(unittest.TestCase):
             summary["resources"][1]["resource_type"] = "k8s_pod"
             raw["resources"][1]["resource_type"] = "k8s_pod"
             details["resources"][1]["resource_type"] = "k8s_pod"
-            write_json(base / "summary_index.json", summary)
-            write_json(base / "raw_data.json", raw)
-            write_json(base / "details" / "part-00000.json", details)
+            write_json(base / "vm" / "summary_index.json", {"meta": {"details_files": []}, "resources": [summary["resources"][0]]})
+            write_json(base / "vm" / "raw_data.json", {"meta": raw.get("meta", {}), "resources": [raw["resources"][0]]})
+            write_json(base / "k8s" / "summary_index.json", {"meta": {"details_files": ["part-00000.json"]}, "resources": [summary["resources"][1]]})
+            write_json(base / "k8s" / "raw_data.json", {"meta": raw.get("meta", {}), "resources": [raw["resources"][1]]})
+            write_json(base / "k8s" / "details" / "part-00000.json", {"resources": [details["resources"][1]]})
 
             report = check_outputs(base)
 
@@ -117,6 +141,17 @@ class OutputHealthTest(unittest.TestCase):
             base = Path(tmp)
             summary, raw, details = valid_artifacts()
             details["resources"][1]["scaling_advice"].pop("target_k8s_policy")
+            write_scoped_artifacts(base, summary, raw, details)
+
+            report = check_outputs(base)
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("details.target_k8s_policy 缺失" in err for err in report["errors"]))
+
+    def test_check_outputs_rejects_unscoped_legacy_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            summary, raw, details = valid_artifacts()
             write_json(base / "summary_index.json", summary)
             write_json(base / "raw_data.json", raw)
             write_json(base / "details" / "part-00000.json", details)
@@ -124,7 +159,7 @@ class OutputHealthTest(unittest.TestCase):
             report = check_outputs(base)
 
         self.assertFalse(report["ok"])
-        self.assertTrue(any("details.target_k8s_policy 缺失" in err for err in report["errors"]))
+        self.assertTrue(any("scoped 输出目录" in err for err in report["errors"]))
 
 
 if __name__ == "__main__":

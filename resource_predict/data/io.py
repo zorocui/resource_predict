@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 from resource_predict.resource_types import metric_names_for_resource, resource_type_of

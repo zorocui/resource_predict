@@ -21,7 +21,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import numpy as np
@@ -29,6 +29,7 @@ import numpy as np
 from resource_predict.settings import settings
 from resource_predict.data.io import coerce_metric_series, read_raw_dataset, write_raw_dataset
 from resource_predict.pipeline.constants import RAW_DATA_FILENAME
+from resource_predict.pipeline.output_paths import scoped_out_dir, split_items_by_scope
 from resource_predict.providers.mock import mock_incremental_provider
 from resource_predict.resource_types import metric_names_for_resource
 
@@ -153,6 +154,45 @@ def get_update_status() -> Dict[str, Any]:
     """返回当前更新状态（线程安全）。"""
     with _lock:
         return dict(_update_status)
+
+
+def mark_external_update_started(phase: str, message: str = "") -> None:
+    """Mark a non-standard update task, such as K8S Prometheus fetch, as running."""
+    now = time.time()
+    with _lock:
+        _update_status["running"] = True
+        _update_status["phase"] = phase
+        _update_status["last_started_at"] = now
+        _update_status["last_finished_at"] = None
+        _update_status["last_error"] = None
+        _update_status["last_result"] = None
+        if message:
+            _update_status["message"] = message
+
+
+def mark_external_update_failed(error: str, phase: str = "error") -> None:
+    with _lock:
+        _update_status["running"] = False
+        _update_status["phase"] = phase
+        _update_status["last_error"] = error
+        _update_status["last_finished_at"] = time.time()
+        _update_status["message"] = error
+
+
+def mark_external_update_finished(result: Dict[str, Any]) -> None:
+    with _lock:
+        _update_status["running"] = False
+        _update_status["phase"] = "idle"
+        _update_status["last_error"] = None
+        _update_status["last_finished_at"] = time.time()
+        _update_status["last_result"] = dict(result)
+        _update_status["resources_updated"] = int(result.get("resources_updated") or 0)
+        _update_status["resources_created"] = int(result.get("resources_created") or 0)
+        _update_status["predicted_resources"] = int(result.get("predicted_resources") or 0)
+        _update_status["created_resource_ids"] = list(result.get("created_resource_ids") or [])
+        _update_status["total_updates"] += 1
+        _update_status["total_new_points"] += int(result.get("total_new_points") or 0)
+        _update_status["message"] = "K8S Prometheus 数据拉取完成"
 
 
 def _normalize_one_timestamp_ms(t: Any) -> int:
@@ -351,6 +391,7 @@ def run_update_with_data(
     new_data_list: List[Dict[str, Any]],
     *,
     fail_if_busy: bool = False,
+    out_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """
     使用外部传入的增量数据进行更新 + 预测重算（push 模式）。
@@ -370,13 +411,14 @@ def run_update_with_data(
     Dict : {"success": bool, "resources_updated": int, "total_new_points": int, ...}
     """
     logger.info("[updater] 收到 push 更新数据：%d 个资源", len(new_data_list) if isinstance(new_data_list, list) else 0)
-    return _do_update(new_data_list=new_data_list, fail_if_busy=fail_if_busy)
+    return _do_update(new_data_list=new_data_list, fail_if_busy=fail_if_busy, out_dir=out_dir)
 
 
 def run_upsert_with_data(
     new_data_list: List[Dict[str, Any]],
     *,
     fail_if_busy: bool = False,
+    out_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """
     使用外部传入数据进行显式 upsert：已有资源更新，不存在的资源插入。
@@ -392,7 +434,24 @@ def run_upsert_with_data(
         new_data_list=new_data_list,
         fail_if_busy=fail_if_busy,
         allow_create=True,
+        out_dir=out_dir,
     )
+
+
+def run_scoped_update_with_data(
+    new_data_list: List[Dict[str, Any]],
+    *,
+    fail_if_busy: bool = False,
+) -> Dict[str, Any]:
+    return _run_scoped_data_update(new_data_list, allow_create=False, fail_if_busy=fail_if_busy)
+
+
+def run_scoped_upsert_with_data(
+    new_data_list: List[Dict[str, Any]],
+    *,
+    fail_if_busy: bool = False,
+) -> Dict[str, Any]:
+    return _run_scoped_data_update(new_data_list, allow_create=True, fail_if_busy=fail_if_busy)
 
 
 def run_update(
@@ -413,7 +472,7 @@ def run_update(
     points = points_per_update if points_per_update is not None else int(cfg.points_per_update)
 
     provider = incremental_provider or _resolve_provider()
-    out_dir = Path(settings.app.out_dir)
+    out_dir = scoped_out_dir("vm")
     raw_path = out_dir / RAW_DATA_FILENAME
 
     logger.info("[updater] 开始读取 raw_data.json …")
@@ -441,6 +500,7 @@ def _do_update(
     prepared_cache: Optional[Tuple[List[Dict[str, Any]], Dict[str, Any], str]] = None,
     fail_if_busy: bool = False,
     allow_create: bool = False,
+    out_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """
     更新流程核心：run_update / run_update_with_data 复用。
@@ -450,8 +510,8 @@ def _do_update(
     fail_if_busy
         为 True 且无法立即取得排他锁时抛出 UpdateBusyError（由 API 映射为 409）。
     """
-    out_dir = Path(settings.app.out_dir)
-    raw_path = out_dir / RAW_DATA_FILENAME
+    output_dir = Path(out_dir) if out_dir is not None else Path(settings.app.out_dir)
+    raw_path = output_dir / RAW_DATA_FILENAME
 
     result: Dict[str, Any] = {
         "success": False,
@@ -493,8 +553,13 @@ def _do_update(
             )
         else:
             logger.info("[updater] 开始读取 raw_data.json …")
-            prepared, meta = read_raw_dataset(raw_path)
-            freq = str(meta.get("freq", settings.generation.freq))
+            if allow_create and not raw_path.exists():
+                prepared = []
+                freq = settings.generation.freq
+                logger.info("[updater] 目标 raw_data.json 不存在，将通过 upsert 初始化: %s", raw_path)
+            else:
+                prepared, meta = read_raw_dataset(raw_path)
+                freq = str(meta.get("freq", settings.generation.freq))
             logger.info("[updater] 已读取 %d 个资源，freq=%s", len(prepared), freq)
 
         cfg_u = settings.update
@@ -693,6 +758,54 @@ def _do_update(
         _update_exclusive.release()
 
     return result
+
+
+def _run_scoped_data_update(
+    new_data_list: List[Dict[str, Any]],
+    *,
+    allow_create: bool,
+    fail_if_busy: bool,
+) -> Dict[str, Any]:
+    split = split_items_by_scope(new_data_list)
+    results: Dict[str, Any] = {
+        "success": True,
+        "scoped": True,
+        "resources_updated": 0,
+        "resources_created": 0,
+        "total_new_points": 0,
+        "predicted_resources": 0,
+        "updated_resource_ids": [],
+        "created_resource_ids": [],
+        "updated_metrics_by_resource": {},
+        "results_by_scope": {},
+        "warnings": [],
+        "error": None,
+    }
+    for scope, items in split.items():
+        if not items:
+            continue
+        result = _do_update(
+            new_data_list=items,
+            fail_if_busy=fail_if_busy,
+            allow_create=allow_create,
+            out_dir=scoped_out_dir(scope),
+        )
+        results["results_by_scope"][scope] = result
+        if not result.get("success"):
+            results["success"] = False
+            results["error"] = result.get("error")
+            break
+        results["resources_updated"] += int(result.get("resources_updated") or 0)
+        results["resources_created"] += int(result.get("resources_created") or 0)
+        results["total_new_points"] += int(result.get("total_new_points") or 0)
+        results["predicted_resources"] += int(result.get("predicted_resources") or 0)
+        results["updated_resource_ids"].extend(result.get("updated_resource_ids") or [])
+        results["created_resource_ids"].extend(result.get("created_resource_ids") or [])
+        results["warnings"].extend(result.get("warnings") or [])
+        metrics_by_resource = result.get("updated_metrics_by_resource") or {}
+        if isinstance(metrics_by_resource, dict):
+            results["updated_metrics_by_resource"].update(metrics_by_resource)
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -248,6 +248,20 @@
     app.detailChartInstance = null;
   }
 
+  function disposeModalChart() {
+    if (!app.modalChartInstance) return;
+    try { app.modalChartInstance.dispose(); } catch (_) {}
+    app.modalChartInstance = null;
+  }
+
+  function renderModalMetricTabs(resource, activeMetric) {
+    if (!app.els.chartModalMetricTabs) return;
+    const metricKeys = list.metricKeysFor(resource);
+    app.els.chartModalMetricTabs.innerHTML = metricKeys.map((key) => (
+      `<button type="button" class="${key === activeMetric ? "active" : ""}" data-modal-metric-key="${list.escapeHtml(key)}">${list.escapeHtml(app.metricTitleMap[key])}</button>`
+    )).join("");
+  }
+
   function renderSpec(resource) {
     const spec = resource?.spec || {};
     const entries = list.isK8s(resource)
@@ -282,7 +296,7 @@
     const resourceLabel = list.isK8s(resource) ? "K8S Workload" : "VM";
     const actionText = list.actionLabel(action);
     const decisionResource = `${resourceLabel} ${resource.resource_id || ""}`;
-    app.els.detailConfidence.textContent = `置信度 ${list.CONFIDENCE_LABELS[confidence] || confidence}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""}`;
+    app.els.detailConfidence.innerHTML = `置信度 ${list.escapeHtml(list.CONFIDENCE_LABELS[confidence] || confidence)}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""} ${list.infoTooltip(list.CONFIDENCE_HELP, "置信度计算说明")}`;
     app.els.detailConfidence.className = `confidence-chip is-${confidence}`;
     app.els.detailAdvice.innerHTML = `
       <div class="decision-summary is-${list.escapeHtml(action)}">
@@ -343,6 +357,35 @@
     requestAnimationFrame(() => app.detailChartInstance?.resize());
   }
 
+  async function openChartModal(metricKey) {
+    if (!app.state.selectedResourceId || !app.state.selectedMetricKey) return;
+    const resource = await ensureResource(app.state.selectedResourceId);
+    const metricKeys = list.metricKeysFor(resource);
+    let activeMetric = metricKey || app.state.selectedMetricKey || list.triggerMetric(resource);
+    if (!metricKeys.includes(activeMetric)) activeMetric = list.triggerMetric(resource);
+    app.state.selectedMetricKey = activeMetric;
+    const key = `${app.state.selectedResourceId}:${activeMetric}`;
+    const data = app.chartDataByKey.get(key);
+    if (!data || typeof echarts === "undefined" || !app.els.chartModal || !app.els.chartModalChart) return;
+    disposeModalChart();
+    app.els.chartModal.hidden = false;
+    const metricName = app.metricTitleMap[activeMetric] || activeMetric;
+    app.els.chartModalTitle.textContent = `${metricName} 指标预测`;
+    app.els.chartModalSubtitle.textContent = app.state.selectedResourceId;
+    renderMetricTabs(resource, activeMetric);
+    renderModalMetricTabs(resource, activeMetric);
+    app.els.chartModalChart.innerHTML = "";
+    app.modalChartInstance = echarts.init(app.els.chartModalChart, null, { renderer: app.ECHARTS_RENDERER });
+    app.modalChartInstance.setOption(buildChartOption(data, activeMetric), { notMerge: true, lazyUpdate: false });
+    renderChart(app.state.selectedResourceId, activeMetric);
+    requestAnimationFrame(() => app.modalChartInstance?.resize());
+  }
+
+  function closeChartModal() {
+    disposeModalChart();
+    if (app.els.chartModal) app.els.chartModal.hidden = true;
+  }
+
   async function renderDetail(resourceId, metricKey) {
     app.els.detailEmpty.hidden = true;
     app.els.detailContent.hidden = false;
@@ -380,16 +423,34 @@
     app.els.chartGuideBtn.setAttribute("aria-pressed", app.chartAuxiliaryVisible ? "true" : "false");
     if (app.state.selectedResourceId && app.state.selectedMetricKey) {
       renderChart(app.state.selectedResourceId, app.state.selectedMetricKey);
+      if (app.els.chartModal && !app.els.chartModal.hidden) openChartModal();
     }
   }
 
   window.addEventListener("resize", () => {
     app.detailChartInstance?.resize();
+    app.modalChartInstance?.resize();
+  });
+
+  app.els.chartModal?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-chart-modal-dismiss]")) closeChartModal();
+  });
+
+  app.els.chartModalMetricTabs?.addEventListener("click", (event) => {
+    const btn = event.target.closest("button[data-modal-metric-key]");
+    if (!btn) return;
+    openChartModal(btn.dataset.modalMetricKey || app.state.selectedMetricKey);
+  });
+
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && app.els.chartModal && !app.els.chartModal.hidden) closeChartModal();
   });
 
   window.ResourceCharts = {
     cacheResourceChartsFromPayload,
+    closeChartModal,
     disposeDetailChart,
+    openChartModal,
     renderDetail,
     toggleChartAuxiliary,
   };

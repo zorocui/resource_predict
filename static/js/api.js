@@ -30,9 +30,9 @@
     throw lastErr;
   }
 
-  async function postJson(url, body) {
+  async function postJson(url, body, method = "POST") {
     const r = await fetch(url, {
-      method: "POST",
+      method,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body || {}),
     });
