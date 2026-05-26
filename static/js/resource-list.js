@@ -4,8 +4,8 @@
   const ACTION_LABELS = {
     scale_out: "扩容",
     scale_in: "缩容",
-    scale_out_candidate: "扩容候选",
-    scale_in_candidate: "缩容候选",
+    scale_out_candidate: "扩容",
+    scale_in_candidate: "缩容",
     hold: "保持",
     insufficient_data: "数据不足",
     mixed: "混合信号",
@@ -116,8 +116,12 @@
       const memLimit = formatNumber(target.memory_limit_gb, 2);
       const replicas = formatNumber(target.replicas, 0);
       const parts = [];
-      if (cpuReq !== "-") parts.push(`CPU ${cpuReq}C${cpuLimit !== "-" ? `/${cpuLimit}C` : ""}`);
-      if (memReq !== "-") parts.push(`内存 ${memReq}GB${memLimit !== "-" ? `/${memLimit}GB` : ""}`);
+      if (cpuReq !== "-") {
+        parts.push(`CPU request ${cpuReq}C${cpuLimit !== "-" ? ` / limit ${cpuLimit}C` : ""}`);
+      }
+      if (memReq !== "-") {
+        parts.push(`内存 request ${memReq}GB${memLimit !== "-" ? ` / limit ${memLimit}GB` : ""}`);
+      }
       if (replicas !== "-") parts.push(`副本 ${replicas}`);
       if (parts.length) return `目标 ${parts.join(" · ")}`;
       return advice.analysis_only ? "仅分析，缺少可执行目标" : "K8S 目标待确认";

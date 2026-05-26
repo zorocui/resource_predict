@@ -211,7 +211,7 @@ flowchart TB
     Workload["聚合为 k8s_workload"]
     Raw["outputs/k8s/raw_data.json"]
     Forecast["预测 cpu / memory"]
-    Advice["requests / limits 调整候选"]
+    Advice["requests / limits 调配目标"]
 
     Config --> Prom
     Prom --> Metrics
@@ -582,7 +582,7 @@ deploy/k8s_prometheus_clusters.json
 | `resource_type=k8s_workload` | 只看 K8S Workload |
 | `q=keyword` | 搜索资源 ID、IP、namespace、workload、node 等 |
 | `action=scale_out` | 筛选 VM 扩容 |
-| `action=scale_out_candidate` | 筛选 K8S 扩容候选 |
+| `action=scale_out_candidate` | 筛选 K8S 扩容建议 |
 | `page/page_size` | 分页 |
 | `sort_by=urgency_score` | 按紧急度排序 |
 

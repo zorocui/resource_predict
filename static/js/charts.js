@@ -264,6 +264,11 @@
 
   function renderSpec(resource) {
     const spec = resource?.spec || {};
+    const formatMaybe = (value, unit, digits = 2) => {
+      if (value === undefined || value === null || value === "") return "-";
+      const text = list.formatNumber(value, digits);
+      return text === "-" ? "-" : `${text} ${unit}`;
+    };
     const entries = list.isK8s(resource)
       ? [
           ["集群", spec.cluster],
@@ -272,6 +277,10 @@
           ["副本数", spec.replicas_observed],
           ["容器", Array.isArray(spec.containers_observed) ? spec.containers_observed.join(", ") : spec.container],
           ["节点", Array.isArray(spec.nodes) ? spec.nodes.join(", ") : spec.node],
+          ["CPU Request", formatMaybe(spec.cpu_request_cores, "C")],
+          ["CPU Limit", formatMaybe(spec.cpu_limit_cores, "C")],
+          ["内存 Request", formatMaybe(spec.memory_request_gb, "GB")],
+          ["内存 Limit", formatMaybe(spec.memory_limit_gb, "GB")],
           ["CPU 基准", spec.cpu_metric_mode],
           ["内存基准", spec.memory_metric_mode],
         ]

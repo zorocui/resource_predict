@@ -426,8 +426,7 @@ h1 {
   white-space: nowrap;
 }
 
-.row-subtitle,
-.target-text {
+.row-subtitle {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
@@ -492,6 +491,17 @@ h1 {
   font-weight: 900;
   line-height: 1.35;
   white-space: nowrap;
+}
+
+.target-text {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 100%;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-align: right;
+  white-space: normal;
 }
 
 .info-tooltip {
@@ -1446,6 +1456,7 @@ h1 {
 
   .target-text {
     grid-column: 1 / -1;
+    text-align: left;
   }
 
   .reason-grid,

@@ -103,8 +103,16 @@ def _recommend_k8s_policy(
         else:
             target = max(float(base), target)
         if metric == "cpu":
-            request = round(max(0.05, target), 3)
-            limit = round(max(request * 1.25, _num(spec.get("cpu_limit_cores")) or request), 3)
+            request = _round_k8s_even_target(target, action=action, base=base)
+            if request is None:
+                continue
+            limit_base = _num(spec.get("cpu_limit_cores"))
+            limit = _round_k8s_even_target_limit(
+                request * 1.25,
+                action=action,
+                current_limit=limit_base,
+                request=request,
+            )
             policy["recommendations"]["cpu"] = {
                 "request_cores": request,
                 "limit_cores": limit,
@@ -113,8 +121,16 @@ def _recommend_k8s_policy(
                 "action": action,
             }
         else:
-            request = round(max(0.064, target), 3)
-            limit = round(max(request * 1.2, _num(spec.get("memory_limit_gb")) or request), 3)
+            request = _round_k8s_even_target(target, action=action, base=base)
+            if request is None:
+                continue
+            limit_base = _num(spec.get("memory_limit_gb"))
+            limit = _round_k8s_even_target_limit(
+                request * 1.2,
+                action=action,
+                current_limit=limit_base,
+                request=request,
+            )
             policy["recommendations"]["memory"] = {
                 "request_gb": request,
                 "limit_gb": limit,
@@ -131,6 +147,30 @@ def _recommend_k8s_policy(
         policy["notes"].append("apply gradually and observe one cooldown window")
     policy["ready_for_execution"] = bool(policy["recommendations"])
     return policy
+
+
+def _round_k8s_even_target(value: float, *, action: str, base: float) -> int | None:
+    if action == "scale_in_candidate":
+        rounded = int(np.floor(float(value) / 2.0) * 2)
+        rounded = max(2, rounded)
+        if rounded >= float(base):
+            return None
+        return rounded
+    rounded = int(np.ceil(float(value) / 2.0) * 2)
+    return max(2, rounded)
+
+
+def _round_k8s_even_target_limit(
+    value: float,
+    *,
+    action: str,
+    current_limit: float | None,
+    request: int,
+) -> int:
+    rounded = max(request, int(np.ceil(float(value) / 2.0) * 2), 2)
+    if action == "scale_out_candidate" and current_limit is not None:
+        rounded = max(rounded, int(np.ceil(float(current_limit) / 2.0) * 2))
+    return rounded
 
 
 def _recommend_replicas(

@@ -92,11 +92,53 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         self.assertFalse(advice["analysis_only"])
         self.assertGreater(advice["target_spec"]["cpu_request_cores"], 0.5)
         self.assertGreater(advice["target_spec"]["memory_request_gb"], 1.0)
+        for key in (
+            "cpu_request_cores",
+            "cpu_limit_cores",
+            "memory_request_gb",
+            "memory_limit_gb",
+        ):
+            self.assertIsInstance(advice["target_spec"][key], int)
+            self.assertEqual(advice["target_spec"][key] % 2, 0)
         self.assertGreater(advice["target_spec"]["replicas"], 2)
         self.assertEqual(
             advice["target_k8s_policy"]["recommendations"]["replicas"]["target_replicas"],
             advice["target_spec"]["replicas"],
         )
+
+    def test_scale_in_does_not_round_small_specs_up_into_resource_expansion(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 3,
+                "cpu_request_cores": 1.0,
+                "cpu_limit_cores": 2.0,
+                "memory_request_gb": 1.0,
+                "memory_limit_gb": 2.0,
+            },
+            "data_quality": {
+                "cpu": {"level": "good"},
+                "memory": {"level": "good"},
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu": np.array([0.05, 0.08, 0.1]),
+                "memory": np.array([0.05, 0.08, 0.1]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_in_candidate")
+        self.assertNotIn("cpu_request_cores", advice["target_spec"])
+        self.assertNotIn("memory_request_gb", advice["target_spec"])
+        self.assertLess(advice["target_spec"]["replicas"], 3)
 
 
 if __name__ == "__main__":
