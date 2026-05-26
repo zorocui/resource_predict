@@ -148,6 +148,50 @@ class OutputHealthTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertTrue(any("details.target_k8s_policy 缺失" in err for err in report["errors"]))
 
+    def test_check_outputs_accepts_executable_k8s_target_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            summary, raw, details = valid_artifacts()
+            advice = {
+                "resource_type": "k8s_workload",
+                "action": "scale_out_candidate",
+                "target_k8s_policy": {"recommendations": {"replicas": {"target_replicas": 3}}},
+                "target_spec": {
+                    "cpu_request_cores": 0.75,
+                    "cpu_limit_cores": 1.0,
+                    "memory_request_gb": 1.5,
+                    "memory_limit_gb": 2.0,
+                    "replicas": 3,
+                },
+                "analysis_only": False,
+            }
+            summary["resources"][1]["scaling_advice"] = advice
+            details["resources"][1]["scaling_advice"] = dict(advice)
+            write_scoped_artifacts(base, summary, raw, details)
+
+            report = check_outputs(base)
+
+        self.assertTrue(report["ok"], report)
+
+    def test_check_outputs_rejects_executable_k8s_without_target_spec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            summary, raw, details = valid_artifacts()
+            advice = {
+                "resource_type": "k8s_workload",
+                "action": "scale_out_candidate",
+                "target_k8s_policy": {"recommendations": {"replicas": {"target_replicas": 3}}},
+                "analysis_only": False,
+            }
+            summary["resources"][1]["scaling_advice"] = advice
+            details["resources"][1]["scaling_advice"] = dict(advice)
+            write_scoped_artifacts(base, summary, raw, details)
+
+            report = check_outputs(base)
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("K8S executable advice must include target_spec" in err for err in report["errors"]))
+
     def test_check_outputs_rejects_unscoped_legacy_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

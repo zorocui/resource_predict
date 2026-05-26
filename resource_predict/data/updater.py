@@ -703,6 +703,7 @@ def _do_update(
         from resource_predict.pipeline import generate_predictions_only
 
         manifest = generate_predictions_only(
+            out_dir=str(output_dir),
             resource_ids=updated_resource_ids,
             metric_names_by_resource=updated_metrics_by_resource,
         )

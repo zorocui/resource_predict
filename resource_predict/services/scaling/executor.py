@@ -71,7 +71,7 @@ def build_scaling_plan(
             cluster_config,
             allow_create_flavor=allow_create_flavor,
         )
-    elif resource_type == "k8s_container":
+    elif resource_type in {"k8s_container", "k8s_workload"}:
         commands, warnings, details = _build_k8s_commands(resource_id, spec, target, cluster_config)
     else:
         raise ScalingPlanError(f"unsupported resource type: {resource_type}")
@@ -101,11 +101,18 @@ def _detect_resource_type(
         "kubernetes": "k8s_container",
         "container": "k8s_container",
         "k8s_container": "k8s_container",
+        "k8s_workload": "k8s_workload",
+        "workload": "k8s_workload",
     }
     if value in aliases:
         return aliases[value]
-    if spec.get("namespace") and (spec.get("deployment") or spec.get("statefulset")):
-        return "k8s_container"
+    if spec.get("namespace") and (
+        spec.get("deployment")
+        or spec.get("statefulset")
+        or spec.get("workload_name")
+        or spec.get("owner_name")
+    ):
+        return "k8s_workload"
     if spec.get("instance_id") or spec.get("server_id"):
         return "openstack_vm"
     return value
@@ -269,45 +276,93 @@ def _build_k8s_commands(
     cluster_config: Dict[str, Any],
 ) -> tuple[List[str], List[str], Dict[str, Any]]:
     namespace = str(spec.get("namespace") or "default").strip()
-    workload_kind = "deployment"
-    workload_name = str(spec.get("deployment") or "").strip()
+    workload_kind = str(spec.get("workload_kind") or spec.get("owner_kind") or "").strip().lower()
+    workload_name = str(spec.get("workload_name") or spec.get("owner_name") or "").strip()
+    if not workload_name and spec.get("deployment"):
+        workload_kind = "deployment"
+        workload_name = str(spec.get("deployment")).strip()
     if not workload_name and spec.get("statefulset"):
         workload_kind = "statefulset"
         workload_name = str(spec.get("statefulset")).strip()
+    if workload_kind in {"deploy", "deployment"}:
+        workload_kind = "deployment"
+    elif workload_kind in {"sts", "statefulset"}:
+        workload_kind = "statefulset"
+    elif workload_kind in {"ds", "daemonset"}:
+        workload_kind = "daemonset"
     if not workload_name:
-        raise ScalingPlanError(f"K8S resource {resource_id} is missing deployment/statefulset")
+        raise ScalingPlanError(f"K8S resource {resource_id} is missing workload_name/deployment/statefulset")
+    if workload_kind not in {"deployment", "statefulset", "daemonset"}:
+        raise ScalingPlanError(f"K8S workload kind {workload_kind or '-'} is not supported")
     container = str(spec.get("container") or "").strip()
+    observed_containers = spec.get("containers_observed")
+    if not container and isinstance(observed_containers, list) and len(observed_containers) == 1:
+        container = str(observed_containers[0] or "").strip()
 
-    cpu = _num(target.get("cpu_cores"))
-    memory = _num(target.get("memory_gb"))
-    if cpu is None or memory is None:
-        raise ScalingPlanError("K8S scaling needs target_spec.cpu_cores and memory_gb")
+    cpu_request = _num(target.get("cpu_request_cores") or target.get("cpu_cores"))
+    cpu_limit = _num(target.get("cpu_limit_cores") or target.get("cpu_cores"))
+    memory_request = _num(target.get("memory_request_gb") or target.get("memory_gb"))
+    memory_limit = _num(target.get("memory_limit_gb") or target.get("memory_gb"))
+    replicas = _positive_int(target.get("replicas"), 0)
 
     kubeconfig = str(cluster_config.get("kubeconfig", "")).strip()
     kube = "kubectl"
     if kubeconfig:
         kube += f" --kubeconfig {shlex.quote(kubeconfig)}"
     target_ref = f"{workload_kind}/{workload_name}"
-    container_arg = f" -c {shlex.quote(container)}" if container else ""
-    cpu_value = _format_k8s_cpu(cpu)
-    mem_value = f"{int(memory)}Gi" if float(memory).is_integer() else f"{memory}Gi"
-    cmd = (
-        f"{kube} -n {shlex.quote(namespace)} set resources {shlex.quote(target_ref)}"
-        f"{container_arg} --requests=cpu={cpu_value},memory={mem_value}"
-        f" --limits=cpu={cpu_value},memory={mem_value}"
-    )
     warnings: List[str] = []
+    commands: List[str] = []
+    if cpu_request is not None or memory_request is not None or cpu_limit is not None or memory_limit is not None:
+        request_parts = []
+        limit_parts = []
+        if cpu_request is not None:
+            request_parts.append(f"cpu={_format_k8s_cpu(cpu_request)}")
+        if memory_request is not None:
+            request_parts.append(f"memory={_format_k8s_memory(memory_request)}")
+        if cpu_limit is not None:
+            limit_parts.append(f"cpu={_format_k8s_cpu(cpu_limit)}")
+        if memory_limit is not None:
+            limit_parts.append(f"memory={_format_k8s_memory(memory_limit)}")
+        container_arg = f" --containers={shlex.quote(container)}" if container else ""
+        if not container:
+            warnings.append("no single container was identified; kubectl will apply resources to all containers")
+        cmd = f"{kube} -n {shlex.quote(namespace)} set resources {shlex.quote(target_ref)}{container_arg}"
+        if request_parts:
+            cmd += f" --requests={','.join(request_parts)}"
+        if limit_parts:
+            cmd += f" --limits={','.join(limit_parts)}"
+        commands.append(cmd)
+    if replicas > 0 and workload_kind != "daemonset":
+        current_replicas = _positive_int(spec.get("replicas_observed") or spec.get("replicas"), 0)
+        if current_replicas != replicas:
+            commands.append(f"{kube} -n {shlex.quote(namespace)} scale {shlex.quote(target_ref)} --replicas={replicas}")
+    elif replicas > 0 and workload_kind == "daemonset":
+        warnings.append("DaemonSet replicas are controlled by node scheduling; replica scaling command was skipped")
     current_disk = _num(spec.get("disk_gb"))
     target_disk = _num(target.get("disk_gb"))
     if current_disk is not None and target_disk is not None and target_disk != current_disk:
         warnings.append("K8S phase 1 only adjusts CPU/memory requests/limits; storage capacity is not changed")
-    return [cmd], warnings, {"workload": {"kind": workload_kind, "name": workload_name, "namespace": namespace, "container": container}}
+    return commands, warnings, {
+        "workload": {
+            "kind": workload_kind,
+            "name": workload_name,
+            "namespace": namespace,
+            "container": container,
+            "replicas": replicas if replicas > 0 else None,
+        }
+    }
 
 
 def _format_k8s_cpu(cpu: float) -> str:
     if float(cpu).is_integer():
         return str(int(cpu))
     return f"{int(round(cpu * 1000))}m"
+
+
+def _format_k8s_memory(memory_gb: float) -> str:
+    if float(memory_gb).is_integer():
+        return f"{int(memory_gb)}Gi"
+    return f"{int(round(memory_gb * 1024))}Mi"
 
 
 def _num(value: Any) -> float | None:

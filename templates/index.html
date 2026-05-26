@@ -131,7 +131,7 @@
           <div id="tasks-view" class="view-panel">
             <section class="empty-state">
               <h2>调配任务</h2>
-              <p>围绕当前选中资源展示最近调配记录。VM 可在右侧详情里发起预检或调配，K8S Workload 仅分析不执行。</p>
+              <p>围绕当前选中资源展示最近调配记录。VM 与 K8S Workload 可在右侧详情里发起预检或调配。</p>
               <div class="status-board" id="task-status-board">
                 <div class="status-card">
                   <span>当前资源</span>
@@ -185,10 +185,13 @@
               <div class="config-section">
                 <div class="config-section-head">
                   <div>
-                    <h3>VM 调配集群</h3>
-                    <p>保存到 deploy/clusters.json，调配预检和执行会按资源 spec.cluster 读取。</p>
+                  <h3>调配集群</h3>
+                    <p>保存到 deploy/clusters.json，VM 与 K8S 调配预检和执行会按资源 spec.cluster 读取。</p>
                   </div>
-                  <button id="vm-cluster-add" class="secondary-btn" type="button">新增集群</button>
+                  <div class="config-actions">
+                    <button id="vm-cluster-add" class="secondary-btn" type="button">新增 VM 集群</button>
+                    <button id="k8s-scaling-cluster-add" class="secondary-btn" type="button">新增 K8S 集群</button>
+                  </div>
                 </div>
                 <div id="vm-cluster-list" class="config-list"></div>
               </div>
@@ -206,6 +209,16 @@
                   </div>
                 </div>
                 <div id="k8s-cluster-list" class="config-list"></div>
+              </div>
+
+              <div class="config-section">
+                <div class="config-section-head">
+                  <div>
+                    <h3>预测模型</h3>
+                    <p>保存到 deploy/forecast_config.json，后续重新预测时按这里启用的模型参与选择。</p>
+                  </div>
+                </div>
+                <div id="forecast-model-list" class="config-list"></div>
               </div>
 
               <pre id="cluster-config-message" class="status-message"></pre>

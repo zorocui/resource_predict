@@ -24,13 +24,14 @@ ENV/
 *.tmp
 *.temp
 
-# Runtime outputs (regenerate via generate_images.py)
+# Runtime outputs (regenerate via generate_forecasts.py)
 outputs/*
 !outputs/.gitkeep
 
 # Local cluster credentials (copy from deploy/clusters.example.json)
 deploy/clusters.json
 deploy/k8s_prometheus_clusters.json
+deploy/forecast_config.json
 .env
 .env.*
 !.env.example

@@ -318,10 +318,9 @@ def _check_k8s_workload_summary(
         return
     if _resource_type(advice) != "k8s_workload":
         errors.append(f"{rid}: scaling_advice.resource_type 必须是 k8s_workload")
-    if advice.get("analysis_only") is not True:
-        errors.append(f"{rid}: K8S 建议必须 analysis_only=true")
     if not isinstance(advice.get("target_k8s_policy"), dict):
         errors.append(f"{rid}: target_k8s_policy 缺失")
+    _check_k8s_target_contract(rid, advice, errors)
     if str(advice.get("action") or "") not in {
         "scale_out_candidate",
         "scale_in_candidate",
@@ -351,10 +350,41 @@ def _validate_detail_contracts(detail_items: List[Dict[str, Any]], errors: List[
         if not isinstance(advice, dict):
             errors.append(f"{rid}: details.scaling_advice 必须是 object")
             continue
-        if advice.get("analysis_only") is not True:
-            errors.append(f"{rid}: details K8S 建议必须 analysis_only=true")
         if not isinstance(advice.get("target_k8s_policy"), dict):
             errors.append(f"{rid}: details.target_k8s_policy 缺失")
+        _check_k8s_target_contract(rid, advice, errors, prefix="details.")
+
+
+def _check_k8s_target_contract(
+    rid: str,
+    advice: Dict[str, Any],
+    errors: List[str],
+    *,
+    prefix: str = "",
+) -> None:
+    if advice.get("analysis_only") is True:
+        return
+    action = str(advice.get("action") or "")
+    if action not in {"scale_out_candidate", "scale_in_candidate"}:
+        return
+    target = advice.get("target_spec")
+    if not isinstance(target, dict) or not target:
+        errors.append(f"{rid}: {prefix}K8S executable advice must include target_spec")
+        return
+    has_resource_target = any(
+        key in target
+        for key in (
+            "cpu_request_cores",
+            "cpu_limit_cores",
+            "memory_request_gb",
+            "memory_limit_gb",
+            "cpu_cores",
+            "memory_gb",
+        )
+    )
+    has_replica_target = target.get("replicas") is not None
+    if not has_resource_target and not has_replica_target:
+        errors.append(f"{rid}: {prefix}K8S target_spec must include resources or replicas")
 
 
 def _check_metrics(

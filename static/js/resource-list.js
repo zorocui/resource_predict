@@ -108,7 +108,20 @@
 
   function targetSpecText(item) {
     const advice = item?.scaling_advice || {};
-    if (isK8s(item)) return advice.analysis_only ? "仅分析，不执行 K8S 调配" : "K8S 建议";
+    if (isK8s(item)) {
+      const target = advice.target_spec || {};
+      const cpuReq = formatNumber(target.cpu_request_cores ?? target.cpu_cores, 2);
+      const cpuLimit = formatNumber(target.cpu_limit_cores, 2);
+      const memReq = formatNumber(target.memory_request_gb ?? target.memory_gb, 2);
+      const memLimit = formatNumber(target.memory_limit_gb, 2);
+      const replicas = formatNumber(target.replicas, 0);
+      const parts = [];
+      if (cpuReq !== "-") parts.push(`CPU ${cpuReq}C${cpuLimit !== "-" ? `/${cpuLimit}C` : ""}`);
+      if (memReq !== "-") parts.push(`内存 ${memReq}GB${memLimit !== "-" ? `/${memLimit}GB` : ""}`);
+      if (replicas !== "-") parts.push(`副本 ${replicas}`);
+      if (parts.length) return `目标 ${parts.join(" · ")}`;
+      return advice.analysis_only ? "仅分析，缺少可执行目标" : "K8S 目标待确认";
+    }
     const target = advice.target_spec || {};
     const cpu = formatNumber(target.cpu_cores, 0);
     const memory = formatNumber(target.memory_gb, 0);
@@ -195,13 +208,41 @@
     renderOverview(counts, summaryItems);
   }
 
+  function activeForecastMethods() {
+    const forecastConfig = app.state.forecastConfigPayload || {};
+    const methods = Array.isArray(forecastConfig.enabled_methods)
+      ? forecastConfig.enabled_methods.filter((method) => typeof method === "string" && method)
+      : [];
+    if (forecastConfig.enable_ensemble && !methods.includes("ensemble")) {
+      methods.push("ensemble");
+    }
+    return methods;
+  }
+
+  function bestMethodCounts(summaryItems) {
+    const methods = activeForecastMethods();
+    const enabled = new Set(methods);
+    const counts = Object.fromEntries(methods.map((method) => [method, 0]));
+    for (const item of summaryItems) {
+      const bestMethods = item?.best_methods || {};
+      if (!bestMethods || typeof bestMethods !== "object") continue;
+      Object.values(bestMethods).forEach((method) => {
+        if (enabled.has(method)) counts[method] += 1;
+      });
+    }
+    return methods.map((method) => [
+      `${app.labelMap[method] || method} 最优`,
+      counts[method] || 0,
+    ]);
+  }
+
   function renderOverview(counts, summaryItems) {
     if (!app.els.overviewGrid) return;
     const byType = summaryItems.reduce((acc, item) => {
       acc[typeLabel(item)] = (acc[typeLabel(item)] || 0) + 1;
       return acc;
     }, {});
-    app.els.overviewGrid.innerHTML = [
+    const overviewCards = [
       ["当前范围", summaryItems.length],
       ["VM", byType.VM || 0],
       ["Workload", byType.Workload || 0],
@@ -209,7 +250,11 @@
       ["需扩容", counts.scale_out],
       ["需缩容", counts.scale_in],
       ["混合信号", counts.mixed],
-    ].map(([k, v]) => `<div class="overview-card"><span>${escapeHtml(k)}</span><strong>${escapeHtml(v)}</strong></div>`).join("");
+      ...bestMethodCounts(summaryItems),
+    ];
+    app.els.overviewGrid.innerHTML = overviewCards
+      .map(([k, v]) => `<div class="overview-card"><span>${escapeHtml(k)}</span><strong>${escapeHtml(v)}</strong></div>`)
+      .join("");
   }
 
   function renderRows() {

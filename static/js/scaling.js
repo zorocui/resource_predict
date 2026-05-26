@@ -18,15 +18,17 @@
       .replaceAll("'", "&#39;");
   }
 
-  function buildControls(resourceId, action, confidence, hasMixed) {
-    const disabled = action === "hold" || action === "insufficient_data" || action === "mixed";
+  function buildControls(resourceId, action, confidence, hasMixed, options = {}) {
+    const analysisOnly = Boolean(options.analysisOnly);
+    const disabled = analysisOnly || action === "hold" || action === "insufficient_data" || action === "mixed";
     const risky = confidence === "low" || hasMixed;
     const disabledAttr = disabled ? " disabled" : "";
+    const disabledText = analysisOnly ? "当前建议缺少可执行目标，暂不能调配" : "当前建议无需执行调配";
     return `
-      <div class="scaling-controls" data-scaling-resource="${escapeHtml(resourceId)}">
+      <div class="scaling-controls" data-scaling-resource="${escapeHtml(resourceId)}" data-scaling-resource-type="${escapeHtml(options.resourceType || "")}">
         <button type="button" class="scale-btn" data-scaling-mode="dry_run"${disabledAttr}>预检</button>
         <button type="button" class="scale-btn scale-execute${risky ? " is-risky" : ""}" data-scaling-mode="execute"${disabledAttr}>调配</button>
-        <span class="scaling-status" data-role="scaling-status">${disabled ? "当前建议无需执行调配" : ""}</span>
+        <span class="scaling-status" data-role="scaling-status">${disabled ? disabledText : ""}</span>
       </div>`;
   }
 
@@ -182,13 +184,16 @@
     activeRequestJson = deps.requestJson;
     activePostJson = deps.postJson;
     const resourceId = container?.dataset.scalingResource || "";
+    const resourceType = container?.dataset.scalingResourceType || "";
     const mode = btn.dataset.scalingMode || "dry_run";
     if (!container || !resourceId) return;
     let confirmCreateFlavor = mode === "dry_run";
     if (mode === "execute") {
-      const ok = window.confirm("确认执行调配命令？后端会登录资源所在集群的控制节点并修改云资源规格。");
+      const ok = window.confirm("确认执行调配命令？后端会登录资源所在集群的控制节点并修改资源规格。");
       if (!ok) return;
-      confirmCreateFlavor = window.confirm("如果 OpenStack 中没有匹配目标规格的 flavor，是否允许后端创建新 flavor 后再调配？");
+      confirmCreateFlavor = resourceType === "k8s_workload"
+        ? false
+        : window.confirm("如果 OpenStack 中没有匹配目标规格的 flavor，是否允许后端创建新 flavor 后再调配？");
     }
     const statusEl = container.querySelector('[data-role="scaling-status"]');
     container.querySelectorAll("[data-scaling-mode]").forEach((x) => { x.disabled = true; });

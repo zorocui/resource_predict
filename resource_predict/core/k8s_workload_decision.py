@@ -122,12 +122,100 @@ def _recommend_k8s_policy(
                 "base_gb": base,
                 "action": action,
             }
+    replica_target = _recommend_replicas(spec=spec, by_metric=by_metric, metric_actions=metric_actions, tier=tier)
+    if replica_target:
+        policy["recommendations"]["replicas"] = replica_target
     if any(v == "scale_out_candidate" for v in metric_actions.values()):
         policy["notes"].append("consider HPA when CPU drives the recommendation")
     if any(v == "scale_in_candidate" for v in metric_actions.values()):
         policy["notes"].append("apply gradually and observe one cooldown window")
     policy["ready_for_execution"] = bool(policy["recommendations"])
     return policy
+
+
+def _recommend_replicas(
+    *,
+    spec: Dict[str, Any],
+    by_metric: Dict[str, Dict[str, float]],
+    metric_actions: Dict[str, str],
+    tier: str,
+) -> Dict[str, Any] | None:
+    current = _positive_int(spec.get("replicas_observed") or spec.get("replicas") or spec.get("current_replicas"))
+    if current is None:
+        return None
+    actions = set(metric_actions.values())
+    if "scale_out_candidate" in actions:
+        target_util = _target_utilization(tier, "scale_out_candidate")
+        pressure = max(
+            (
+                max(float(st.get("p95", 0.0)), float(st.get("peak", 0.0)))
+                for metric, st in by_metric.items()
+                if metric_actions.get(metric) == "scale_out_candidate"
+            ),
+            default=0.0,
+        )
+        target = int(np.ceil(current * max(pressure, target_util) / target_util))
+        target = max(current + 1, target)
+        return {
+            "current_replicas": current,
+            "target_replicas": target,
+            "target_utilization": target_util,
+            "action": "scale_out_candidate",
+        }
+    if "scale_in_candidate" not in actions:
+        return None
+    target_util = _target_utilization(tier, "scale_in_candidate")
+    pressure = max(
+        (
+            max(float(st.get("p95", 0.0)), float(st.get("avg", 0.0)))
+            for metric, st in by_metric.items()
+            if metric_actions.get(metric) == "scale_in_candidate"
+        ),
+        default=0.0,
+    )
+    target = int(np.floor(current * max(pressure, 0.05) / target_util))
+    target = max(1, min(current - 1, target)) if current > 1 else 1
+    if target >= current:
+        return None
+    return {
+        "current_replicas": current,
+        "target_replicas": target,
+        "target_utilization": target_util,
+        "action": "scale_in_candidate",
+    }
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(float(value))
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _target_spec_from_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+    recs = policy.get("recommendations", {})
+    if not isinstance(recs, dict):
+        return {}
+    target: Dict[str, Any] = {}
+    cpu = recs.get("cpu")
+    if isinstance(cpu, dict):
+        if cpu.get("request_cores") is not None:
+            target["cpu_request_cores"] = cpu["request_cores"]
+            target["cpu_cores"] = cpu["request_cores"]
+        if cpu.get("limit_cores") is not None:
+            target["cpu_limit_cores"] = cpu["limit_cores"]
+    memory = recs.get("memory")
+    if isinstance(memory, dict):
+        if memory.get("request_gb") is not None:
+            target["memory_request_gb"] = memory["request_gb"]
+            target["memory_gb"] = memory["request_gb"]
+        if memory.get("limit_gb") is not None:
+            target["memory_limit_gb"] = memory["limit_gb"]
+    replicas = recs.get("replicas")
+    if isinstance(replicas, dict) and replicas.get("target_replicas") is not None:
+        target["replicas"] = replicas["target_replicas"]
+    return target
 
 
 def _risk_profile(
@@ -222,6 +310,7 @@ def build_k8s_workload_advice(
         metric_actions=metric_actions,
         tier=tier,
     )
+    target_spec = _target_spec_from_policy(target_policy)
     if target_policy.get("ready_for_execution"):
         confidence_score += 4.0
     if baseline_missing and not target_policy.get("ready_for_execution"):
@@ -264,6 +353,7 @@ def build_k8s_workload_advice(
         "metric_reasons": metric_reasons,
         "stats": by_metric,
         "data_quality": resource.get("data_quality", {}),
+        "target_spec": target_spec,
         "target_k8s_policy": target_policy,
-        "analysis_only": True,
+        "analysis_only": not bool(target_spec),
     }

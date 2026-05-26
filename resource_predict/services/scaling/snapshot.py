@@ -9,15 +9,16 @@ from typing import Any, Dict
 import numpy as np
 
 from resource_predict.core.decision import build_scaling_advice
+from resource_predict.core.k8s_workload_decision import build_k8s_workload_advice
 from resource_predict.data.io import atomic_write_json
 from resource_predict.pipeline.constants import (
     DETAILS_DIRNAME,
     MANIFEST_FILENAME,
-    METRIC_NAMES,
     RAW_DATA_FILENAME,
     SUMMARY_INDEX_FILENAME,
 )
 from resource_predict.pipeline.output_paths import scoped_out_dir
+from resource_predict.resource_types import metric_names_for_resource, resource_type_of
 from resource_predict.settings import settings
 
 
@@ -114,7 +115,8 @@ def _recompute_advice(item: Dict[str, Any]) -> bool:
     if not isinstance(charts, dict):
         return False
     future_by_metric: Dict[str, np.ndarray] = {}
-    for metric in METRIC_NAMES:
+    metric_names = metric_names_for_resource(item)
+    for metric in metric_names:
         block = charts.get(metric, {})
         if not isinstance(block, dict):
             return False
@@ -123,7 +125,10 @@ def _recompute_advice(item: Dict[str, Any]) -> bool:
         if not best or not isinstance(futures, dict) or best not in futures:
             return False
         future_by_metric[metric] = np.asarray(futures.get(best) or [], dtype=float)
-    item["scaling_advice"] = build_scaling_advice(future_by_metric, current_spec=item.get("spec", {}))
+    if resource_type_of(item) == "k8s_workload":
+        item["scaling_advice"] = build_k8s_workload_advice(future_by_metric, resource=item)
+    else:
+        item["scaling_advice"] = build_scaling_advice(future_by_metric, current_spec=item.get("spec", {}))
     return True
 
 

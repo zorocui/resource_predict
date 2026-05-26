@@ -3,6 +3,8 @@
   const api = window.ResourceApi;
   const charts = window.ResourceCharts;
   const list = window.ResourceList;
+  let updatePollTimer = null;
+  let updatePollWasRunning = false;
 
   function setView(view) {
     app.state.activeView = view || "risk";
@@ -25,14 +27,18 @@
 
   async function loadQueue({ keepSelection = false } = {}) {
     app.els.summaryText.textContent = "正在加载资源...";
-    const payload = await api.requestJson(api.buildQuery("/api/resources", {
-      page: 1,
-      page_size: app.API_PAGE_SIZE,
-      sort_by: "urgency_score",
-      resource_type: app.state.resourceTypeFilter,
-      action: buildActionForApi(),
-      q: app.state.query,
-    }));
+    const [payload, forecastPayload] = await Promise.all([
+      api.requestJson(api.buildQuery("/api/resources", {
+        page: 1,
+        page_size: app.API_PAGE_SIZE,
+        sort_by: "urgency_score",
+        resource_type: app.state.resourceTypeFilter,
+        action: buildActionForApi(),
+        q: app.state.query,
+      })),
+      api.requestJson("/api/forecast-config", 1),
+    ]);
+    app.state.forecastConfigPayload = forecastPayload;
     const items = payload.items || [];
     if (!keepSelection) app.state.selectedResourceId = "";
     list.setItems(items);
@@ -73,7 +79,11 @@
 
   function formatDateTime(value) {
     if (!value) return "-";
-    const d = new Date(value);
+    let normalized = value;
+    if (typeof normalized === "number" && normalized > 0 && normalized < 1e12) {
+      normalized *= 1000;
+    }
+    const d = new Date(normalized);
     if (Number.isNaN(d.getTime())) return String(value);
     return new Intl.DateTimeFormat("zh-CN", {
       month: "2-digit",
@@ -115,12 +125,7 @@
       return;
     }
     app.els.taskResource.textContent = resource.resource_id || "-";
-    if (list.isK8s(resource)) {
-      app.els.taskCapability.textContent = "仅分析";
-      app.els.taskHistory.innerHTML = `<div class="analysis-only">K8S Workload 当前仅提供分析建议，不执行自动调配。</div>`;
-      return;
-    }
-    app.els.taskCapability.textContent = "可预检 / 可调配";
+    app.els.taskCapability.textContent = list.isK8s(resource) ? "K8S 可预检 / 可调配" : "可预检 / 可调配";
     app.els.taskHistory.innerHTML = `<div class="empty-list is-compact">正在读取调配记录...</div>`;
     try {
       const payload = await api.requestJson(`/api/resources/${encodeURIComponent(resource.resource_id)}/scaling-history?limit=8`, 1);
@@ -135,9 +140,9 @@
     const running = Boolean(status?.running);
     app.els.updateRunning.textContent = running ? "运行中" : "空闲";
     app.els.updatePhase.textContent = status?.phase || status?.step || "-";
-    app.els.updateStarted.textContent = formatDateTime(status?.started_at || status?.start_time);
-    app.els.updateFinished.textContent = formatDateTime(status?.finished_at || status?.end_time || status?.last_success_at);
-    const message = status?.message || status?.error || status?.last_error || "";
+    app.els.updateStarted.textContent = formatDateTime(status?.started_at || status?.start_time || status?.last_started_at);
+    app.els.updateFinished.textContent = formatDateTime(status?.finished_at || status?.end_time || status?.last_success_at || status?.last_finished_at);
+    const message = status?.last_error || status?.error || status?.message || "";
     app.els.updateMessage.textContent = message ? String(message) : "暂无更新消息。";
   }
 
@@ -147,11 +152,42 @@
     try {
       const status = await api.requestJson("/api/update-status", 1);
       updateStatusText(status);
+      return status;
     } catch (e) {
       app.els.updateRunning.textContent = "读取失败";
       app.els.updatePhase.textContent = "-";
       app.els.updateMessage.textContent = String(e.message || e);
+      return null;
     }
+  }
+
+  function stopUpdatePolling() {
+    if (updatePollTimer !== null) {
+      window.clearTimeout(updatePollTimer);
+      updatePollTimer = null;
+    }
+  }
+
+  function startUpdatePolling() {
+    stopUpdatePolling();
+    updatePollWasRunning = true;
+    const poll = async () => {
+      const status = await refreshUpdateStatus();
+      if (!status) return;
+      const running = Boolean(status.running);
+      if (running) {
+        updatePollWasRunning = true;
+        updatePollTimer = window.setTimeout(poll, 1500);
+        return;
+      }
+      updatePollTimer = null;
+      if (updatePollWasRunning && !status.last_error) {
+        loadQueue({ keepSelection: true }).catch((e) => {
+          app.els.summaryText.textContent = `刷新失败：${String(e.message || e)}`;
+        });
+      }
+    };
+    updatePollTimer = window.setTimeout(poll, 600);
   }
 
   const VM_CLUSTER_DEFAULT = {
@@ -163,6 +199,17 @@
     ssh_key: "",
     openstack_rc: "/root/admin-openrc",
     auto_confirm_resize: false,
+    command_timeout_seconds: 300,
+  };
+
+  const K8S_SCALING_CLUSTER_DEFAULT = {
+    cloud_type: "k8s",
+    cluster: "",
+    control_host: "",
+    ssh_user: "root",
+    ssh_port: 22,
+    ssh_key: "",
+    kubeconfig: "/root/.kube/config",
     command_timeout_seconds: 300,
   };
 
@@ -207,12 +254,13 @@
         </div>
         <div class="config-grid">
           ${configInput("集群名", "cluster", cluster)}
-          ${configInput("类型", "cloud_type", cfg.cloud_type || "openstack")}
+          ${configInput("类型", "cloud_type", cfg.cloud_type || "openstack", { placeholder: "openstack 或 k8s" })}
           ${configInput("控制节点", "control_host", cfg.control_host || "")}
           ${configInput("SSH 用户", "ssh_user", cfg.ssh_user || "root")}
           ${configInput("SSH 端口", "ssh_port", cfg.ssh_port || 22, { type: "number" })}
           ${configInput("SSH Key", "ssh_key", cfg.ssh_key || "")}
           ${configInput("OpenStack RC", "openstack_rc", cfg.openstack_rc || "")}
+          ${configInput("Kubeconfig", "kubeconfig", cfg.kubeconfig || "", { placeholder: "/root/.kube/config" })}
           ${configInput("命令超时秒", "command_timeout_seconds", cfg.command_timeout_seconds || 300, { type: "number" })}
           ${configInput("自动确认 resize", "auto_confirm_resize", Boolean(cfg.auto_confirm_resize), { type: "checkbox" })}
         </div>
@@ -244,6 +292,29 @@
     `).join("");
   }
 
+  function renderForecastModelRows(payload) {
+    if (!app.els.forecastModelList) return;
+    const supported = Array.isArray(payload?.supported_methods) ? payload.supported_methods : [];
+    const enabled = new Set(payload?.enabled_methods || []);
+    const ensembleEnabled = Boolean(payload?.enable_ensemble);
+    app.els.forecastModelList.innerHTML = `
+      <div class="config-row" data-config-kind="forecast">
+        <div class="config-row-title">
+          <strong>候选模型</strong>
+        </div>
+        <div class="config-grid">
+          ${supported.map((method) => configInput(
+            method.label || method.key,
+            `method:${method.key}`,
+            enabled.has(method.key),
+            { type: "checkbox" }
+          )).join("")}
+          ${configInput("Ensemble", "enable_ensemble", ensembleEnabled, { type: "checkbox" })}
+        </div>
+      </div>
+    `;
+  }
+
   function setConfigMessage(message, isError = false) {
     if (!app.els.clusterConfigMessage) return;
     app.els.clusterConfigMessage.textContent = message || "";
@@ -254,16 +325,25 @@
     if (!app.els.vmClusterList || !app.els.k8sClusterList) return;
     app.els.vmClusterList.innerHTML = `<div class="empty-list is-compact">正在读取 VM 调配集群...</div>`;
     app.els.k8sClusterList.innerHTML = `<div class="empty-list is-compact">正在读取 K8S 监控接入...</div>`;
+    if (app.els.forecastModelList) {
+      app.els.forecastModelList.innerHTML = `<div class="empty-list is-compact">正在读取预测模型配置...</div>`;
+    }
     try {
-      const payload = await api.requestJson("/api/cluster-configs", 1);
+      const [payload, forecastPayload] = await Promise.all([
+        api.requestJson("/api/cluster-configs", 1),
+        api.requestJson("/api/forecast-config", 1),
+      ]);
       app.state.clusterConfigPayload = payload;
+      app.state.forecastConfigPayload = forecastPayload;
       renderVmClusterRows(payload.vm_scaling_clusters || {});
       renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
+      renderForecastModelRows(forecastPayload);
       setConfigMessage("配置已加载。");
     } catch (e) {
       const msg = String(e.message || e);
       app.els.vmClusterList.innerHTML = `<div class="empty-list is-compact">读取失败：${list.escapeHtml(msg)}</div>`;
       app.els.k8sClusterList.innerHTML = "";
+      if (app.els.forecastModelList) app.els.forecastModelList.innerHTML = "";
       setConfigMessage(msg, true);
     }
   }
@@ -291,6 +371,7 @@
         ssh_port: rowValue(row, "ssh_port") || 22,
         ssh_key: rowValue(row, "ssh_key"),
         openstack_rc: rowValue(row, "openstack_rc"),
+        kubeconfig: rowValue(row, "kubeconfig"),
         command_timeout_seconds: rowValue(row, "command_timeout_seconds") || 300,
         auto_confirm_resize: rowValue(row, "auto_confirm_resize"),
       };
@@ -315,14 +396,31 @@
     return { vm_scaling_clusters: vm, k8s_prometheus_clusters: k8s };
   }
 
+  function collectForecastConfig() {
+    const enabledMethods = [];
+    app.els.forecastModelList?.querySelectorAll('[data-config-name^="method:"]').forEach((input) => {
+      if (input.checked) enabledMethods.push(input.dataset.configName.replace("method:", ""));
+    });
+    const ensembleInput = app.els.forecastModelList?.querySelector('[data-config-name="enable_ensemble"]');
+    return {
+      enabled_methods: enabledMethods,
+      enable_ensemble: Boolean(ensembleInput?.checked),
+    };
+  }
+
   async function saveClusterConfigs() {
     setConfigMessage("正在保存配置...");
     try {
-      const payload = await api.postJson("/api/cluster-configs", collectClusterConfigs(), "PUT");
+      const [payload, forecastPayload] = await Promise.all([
+        api.postJson("/api/cluster-configs", collectClusterConfigs(), "PUT"),
+        api.postJson("/api/forecast-config", collectForecastConfig(), "PUT"),
+      ]);
       app.state.clusterConfigPayload = payload;
+      app.state.forecastConfigPayload = forecastPayload;
       renderVmClusterRows(payload.vm_scaling_clusters || {});
       renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
-      setConfigMessage("配置已保存。后续 VM 调配和 K8S 数据更新会读取这些配置。");
+      renderForecastModelRows(forecastPayload);
+      setConfigMessage("配置已保存。后续 VM 调配、K8S 数据更新和重新预测会读取这些配置。");
     } catch (e) {
       setConfigMessage(String(e.message || e), true);
     }
@@ -346,7 +444,7 @@
       const payload = await api.postJson("/api/cluster-configs/k8s-fetch", { clusters: names });
       setConfigMessage(payload.message || "K8S 数据拉取任务已提交。");
       setView("updates");
-      setTimeout(() => refreshUpdateStatus(), 600);
+      startUpdatePolling();
     } catch (e) {
       setConfigMessage(String(e.message || e), true);
     }
@@ -357,6 +455,14 @@
     let idx = Object.keys(current).length + 1;
     while (current[`cluster-openstack-${idx}`]) idx += 1;
     current[`cluster-openstack-${idx}`] = { ...VM_CLUSTER_DEFAULT };
+    renderVmClusterRows(current);
+  }
+
+  function addK8sScalingClusterRow() {
+    const current = collectClusterConfigs().vm_scaling_clusters;
+    let idx = Object.keys(current).length + 1;
+    while (current[`cluster-k8s-${idx}`]) idx += 1;
+    current[`cluster-k8s-${idx}`] = { ...K8S_SCALING_CLUSTER_DEFAULT };
     renderVmClusterRows(current);
   }
 
@@ -371,6 +477,7 @@
   function bindClusterConfigEvents() {
     app.els.clusterConfigSave?.addEventListener("click", saveClusterConfigs);
     app.els.vmClusterAdd?.addEventListener("click", addVmClusterRow);
+    app.els.k8sScalingClusterAdd?.addEventListener("click", addK8sScalingClusterRow);
     app.els.k8sClusterAdd?.addEventListener("click", addK8sClusterRow);
     app.els.k8sDiagnose?.addEventListener("click", diagnoseK8sConfigs);
     app.els.k8sFetch?.addEventListener("click", fetchK8sPrometheusData);

@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from resource_predict.data.updater import (
     mark_external_update_failed,
+    mark_external_update_finished,
     mark_external_update_started,
     run_upsert_with_data,
 )
@@ -33,6 +34,8 @@ def run_k8s_prometheus_upsert(
         result = run_upsert_with_data(items, fail_if_busy=fail_if_busy, out_dir=out_dir)
         if not result.get("success"):
             mark_external_update_failed(str(result.get("error") or "K8S Prometheus 数据拉取失败"))
+        else:
+            mark_external_update_finished(result)
         return result
     except Exception as exc:
         mark_external_update_failed(str(exc))

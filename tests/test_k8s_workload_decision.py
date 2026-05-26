@@ -59,6 +59,45 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         self.assertEqual(advice["metric_actions"]["cpu"], "insufficient_data")
         self.assertEqual(advice["metric_actions"]["memory"], "insufficient_data")
 
+    def test_target_spec_includes_requests_limits_and_replicas(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 2,
+                "cpu_request_cores": 0.5,
+                "cpu_limit_cores": 1.0,
+                "memory_request_gb": 1.0,
+                "memory_limit_gb": 2.0,
+            },
+            "data_quality": {
+                "cpu": {"level": "good"},
+                "memory": {"level": "good"},
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu": np.array([0.92, 0.95, 0.98]),
+                "memory": np.array([0.82, 0.86, 0.9]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_out_candidate")
+        self.assertFalse(advice["analysis_only"])
+        self.assertGreater(advice["target_spec"]["cpu_request_cores"], 0.5)
+        self.assertGreater(advice["target_spec"]["memory_request_gb"], 1.0)
+        self.assertGreater(advice["target_spec"]["replicas"], 2)
+        self.assertEqual(
+            advice["target_k8s_policy"]["recommendations"]["replicas"]["target_replicas"],
+            advice["target_spec"]["replicas"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

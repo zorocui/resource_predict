@@ -94,10 +94,12 @@ class OutputIsolationTest(unittest.TestCase):
                     "replicas_observed": 1,
                 },
             }
-            with patch("resource_predict.pipeline.generate_predictions_only", return_value=[{"resource_id": k8s_item["resource_id"]}]):
+            with patch("resource_predict.pipeline.generate_predictions_only", return_value=[{"resource_id": k8s_item["resource_id"]}]) as mock_generate:
                 result = run_upsert_with_data([k8s_item], out_dir=root / "k8s", fail_if_busy=True)
 
             self.assertTrue(result["success"], result)
+            mock_generate.assert_called_once()
+            self.assertEqual(str(root / "k8s"), mock_generate.call_args.kwargs.get("out_dir"))
             self.assertEqual(before, vm_raw.read_text(encoding="utf-8"))
             prepared, _meta = read_raw_dataset(root / "k8s" / "raw_data.json")
             self.assertEqual([x["resource_id"] for x in prepared], [k8s_item["resource_id"]])
@@ -120,4 +122,3 @@ class OutputIsolationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

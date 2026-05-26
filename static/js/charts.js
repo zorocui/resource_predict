@@ -325,11 +325,13 @@
         }).join("")}
       </div>`;
 
-    if (list.isK8s(resource)) {
-      app.els.detailActions.innerHTML = `<div class="analysis-only">K8S Workload 当前仅提供分析建议，不执行自动调配。</div>`;
-    } else {
-      app.els.detailActions.innerHTML = window.ScalingUI.buildControls(resource.resource_id, action, confidence, !!advice.has_mixed_signals);
-    }
+    app.els.detailActions.innerHTML = window.ScalingUI.buildControls(
+      resource.resource_id,
+      action,
+      confidence,
+      !!advice.has_mixed_signals,
+      { analysisOnly: Boolean(advice.analysis_only), resourceType: list.resourceTypeOf(resource) }
+    );
   }
 
   function renderMetricTabs(resource, activeMetric) {

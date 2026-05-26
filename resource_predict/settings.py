@@ -56,8 +56,8 @@ class GenerationConfig:
 
 @dataclass(frozen=True)
 class ForecastConfig:
-    # 启用的预测模型集合；可包含 arima、sarima、prophet。
-    enabled_methods: Tuple[str, ...] = ("seasonal_naive", "rolling_mean", "prophet")
+    # 启用的预测模型集合；可包含 arima、sarima、prophet、seasonal_naive、rolling_mean。
+    enabled_methods: Tuple[str, ...] = ("seasonal_naive", "prophet")
     # 预测使用率上限裁剪模式：auto_train_max 会参考训练集最大值自动放宽。
     usage_clip_upper_mode: str = "auto_train_max"
     # fixed 裁剪模式下的固定上限；1.0 表示 100%。
@@ -79,7 +79,7 @@ class ForecastConfig:
     # Rolling backtest folds used for model selection stability. 1 keeps the old single holdout behavior.
     rolling_backtest_folds: int = 3
     # Whether to add an inverse-error weighted ensemble candidate to model selection.
-    enable_ensemble: bool = True
+    enable_ensemble: bool = False
     # Recent robust z-score threshold that routes anomalous series to robust candidates.
     anomaly_route_zscore_threshold: float = 3.5
 

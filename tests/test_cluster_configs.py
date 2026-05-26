@@ -36,6 +36,23 @@ class ClusterConfigsTest(unittest.TestCase):
         self.assertEqual(cfg["ssh_port"], 2222)
         self.assertEqual(cfg["allowed_flavors"], ["m1.small"])
 
+    def test_scaling_config_accepts_k8s_control_cluster(self):
+        payload = normalize_vm_scaling_clusters(
+            {
+                "cluster-k8s-a": {
+                    "cloud_type": "k8s",
+                    "control_host": "192.168.1.20",
+                    "ssh_user": "root",
+                    "kubeconfig": "/root/.kube/config",
+                }
+            }
+        )
+
+        cfg = payload["cluster-k8s-a"]
+        self.assertEqual(cfg["cloud_type"], "k8s")
+        self.assertEqual(cfg["ssh_port"], 22)
+        self.assertEqual(cfg["kubeconfig"], "/root/.kube/config")
+
     def test_vm_scaling_config_requires_control_host(self):
         with self.assertRaises(ClusterConfigValidationError):
             normalize_vm_scaling_clusters({"cluster-a": {"ssh_user": "root"}})
@@ -92,9 +109,11 @@ class ClusterConfigsTest(unittest.TestCase):
             with patch.object(k8s_ingest, "settings", SimpleNamespace(app=SimpleNamespace(out_dir=tmp))):
                 with patch.object(k8s_ingest, "fetch_k8s_prometheus_items", return_value=items):
                     with patch.object(k8s_ingest, "run_upsert_with_data", return_value={"success": True}) as upsert:
-                        result = k8s_ingest.run_k8s_prometheus_upsert(clusters=["cluster-a"], fail_if_busy=True)
+                        with patch.object(k8s_ingest, "mark_external_update_finished") as mark_finished:
+                            result = k8s_ingest.run_k8s_prometheus_upsert(clusters=["cluster-a"], fail_if_busy=True)
 
         self.assertTrue(result["success"])
+        mark_finished.assert_called_once_with(result)
         upsert.assert_called_once_with(
             items,
             fail_if_busy=True,

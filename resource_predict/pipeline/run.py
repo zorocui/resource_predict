@@ -26,6 +26,7 @@ from resource_predict.pipeline.partial import load_existing_forecast_items, merg
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
 from resource_predict.pipeline.prepare import ExternalProvider, build_prepared_data
 from resource_predict.pipeline.write_outputs import write_prediction_outputs
+from resource_predict.services.forecast_config import read_forecast_config
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +145,9 @@ def generate_forecasts(
         metric_partial_enabled,
     )
 
+    forecast_config = read_forecast_config()
     active_methods: List[str] = []
-    enabled_methods = set(settings.forecast.enabled_methods)
+    enabled_methods = set(forecast_config["enabled_methods"])
     if "arima" in enabled_methods:
         active_methods.append("arima")
     if "sarima" in enabled_methods:
@@ -250,7 +252,7 @@ def generate_forecasts(
         preds_by_method: Dict[str, pd.Series],
         metrics_by_method: Dict[str, Dict[str, float]],
     ) -> Optional[pd.Series]:
-        if not preds_by_method or not bool(settings.forecast.enable_ensemble):
+        if not preds_by_method or not bool(forecast_config["enable_ensemble"]):
             return None
         weighted_values = None
         total_weight = 0.0
