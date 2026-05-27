@@ -77,6 +77,15 @@ def _target_utilization(tier: str, action: str) -> float:
     return 0.68
 
 
+def _workload_kind(spec: Dict[str, Any]) -> str:
+    raw = spec.get("workload_kind") or spec.get("owner_kind") or ""
+    return str(raw).strip().lower().replace("-", "")
+
+
+def _supports_replica_scaling(spec: Dict[str, Any]) -> bool:
+    return _workload_kind(spec) in {"deployment", "statefulset", "replicaset"}
+
+
 def _recommend_k8s_policy(
     *,
     spec: Dict[str, Any],
@@ -145,6 +154,8 @@ def _recommend_k8s_policy(
         policy["notes"].append("consider HPA when CPU drives the recommendation")
     if any(v == "scale_in_candidate" for v in metric_actions.values()):
         policy["notes"].append("apply gradually and observe one cooldown window")
+    if _workload_kind(spec) == "daemonset":
+        policy["notes"].append("DaemonSet replicas follow node scheduling; only requests/limits are adjustable here")
     policy["ready_for_execution"] = bool(policy["recommendations"])
     return policy
 
@@ -180,7 +191,9 @@ def _recommend_replicas(
     metric_actions: Dict[str, str],
     tier: str,
 ) -> Dict[str, Any] | None:
-    current = _positive_int(spec.get("replicas_observed") or spec.get("replicas") or spec.get("current_replicas"))
+    if not _supports_replica_scaling(spec):
+        return None
+    current = _positive_int(spec.get("replicas") or spec.get("current_replicas") or spec.get("replicas_observed"))
     if current is None:
         return None
     actions = set(metric_actions.values())

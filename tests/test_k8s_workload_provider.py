@@ -25,17 +25,23 @@ class FakePrometheusClient:
     def query_range(self, query: str, *, start: float, end: float, step: int):
         self.queries.append(query)
         if "container_cpu_usage_seconds_total" in query:
-            return [
+            rows = [
                 self._range_row("ns", "api-rs-a", "app", "node-1", [0.2, 0.4]),
                 self._range_row("ns", "api-rs-b", "sidecar", "node-2", [0.1, 0.2]),
                 self._range_row("ns", "orphan", "app", "node-3", [9.0, 9.0]),
             ]
+            if self._includes_pod_container(query):
+                rows.append(self._range_row("ns", "api-rs-a", "POD", "node-1", [5.0, 5.0]))
+            return rows
         if "container_memory_working_set_bytes" in query:
-            return [
+            rows = [
                 self._range_row("ns", "api-rs-a", "app", "node-1", [0.5 * GIB, 0.6 * GIB]),
                 self._range_row("ns", "api-rs-b", "sidecar", "node-2", [0.5 * GIB, 0.8 * GIB]),
                 self._range_row("ns", "orphan", "app", "node-3", [9.0 * GIB, 9.0 * GIB]),
             ]
+            if self._includes_pod_container(query):
+                rows.append(self._range_row("ns", "api-rs-a", "POD", "node-1", [5.0 * GIB, 5.0 * GIB]))
+            return rows
         return []
 
     def query(self, query: str, *, ts=None):
@@ -63,22 +69,39 @@ class FakePrometheusClient:
                     1,
                 )
             ]
-        if "requests_cpu_cores" in query or 'resource="cpu"' in query and "requests" in query:
+        if "kube_deployment_spec_replicas" in query:
             return [
+                self._instant_row({"namespace": "ns", "deployment": "api"}, 3),
+            ]
+        if (
+            "kube_deployment_status_replicas" in query
+            or "kube_statefulset_replicas" in query
+            or "kube_statefulset_status_replicas" in query
+            or "kube_daemonset_status_desired_number_scheduled" in query
+        ):
+            return []
+        if "requests_cpu_cores" in query or 'resource="cpu"' in query and "requests" in query:
+            rows = [
                 self._resource_row("ns", "api-rs-a", "app", 1.0),
                 self._resource_row("ns", "api-rs-b", "sidecar", 1.0),
                 self._resource_row("ns", "orphan", "app", 10.0),
             ]
+            if self._includes_pod_container(query):
+                rows.append(self._resource_row("ns", "api-rs-a", "POD", 0.5))
+            return rows
         if "limits_cpu_cores" in query or 'resource="cpu"' in query and "limits" in query:
-            return []
+            return [self._resource_row("ns", "api-rs-a", "POD", 0.5)] if self._includes_pod_container(query) else []
         if "requests_memory_bytes" in query or 'resource="memory"' in query and "requests" in query:
-            return []
+            return [self._resource_row("ns", "api-rs-a", "POD", 0.5 * GIB)] if self._includes_pod_container(query) else []
         if "limits_memory_bytes" in query or 'resource="memory"' in query and "limits" in query:
-            return [
+            rows = [
                 self._resource_row("ns", "api-rs-a", "app", 1.0 * GIB),
                 self._resource_row("ns", "api-rs-b", "sidecar", 1.0 * GIB),
                 self._resource_row("ns", "orphan", "app", 10.0 * GIB),
             ]
+            if self._includes_pod_container(query):
+                rows.append(self._resource_row("ns", "api-rs-a", "POD", 0.5 * GIB))
+            return rows
         return []
 
     @staticmethod
@@ -98,6 +121,75 @@ class FakePrometheusClient:
     @staticmethod
     def _instant_row(metric: dict, value: float) -> dict:
         return {"metric": metric, "value": [BASE_TS, str(value)]}
+
+    @staticmethod
+    def _includes_pod_container(query: str) -> bool:
+        return 'container!="POD"' not in query
+
+
+class AsymmetricResourcePrometheusClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def query_range(self, query: str, *, start: float, end: float, step: int):
+        if "container_cpu_usage_seconds_total" in query:
+            return [
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-0", "alertmanager", "node-1", [0.01, 0.02]),
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-0", "config-reloader", "node-1", [0.01, 0.02]),
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-1", "alertmanager", "node-2", [0.01, 0.02]),
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-1", "config-reloader", "node-2", [0.01, 0.02]),
+            ]
+        if "container_memory_working_set_bytes" in query:
+            return [
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-0", "alertmanager", "node-1", [10 * 1024 ** 2, 20 * 1024 ** 2]),
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-0", "config-reloader", "node-1", [1 * 1024 ** 2, 2 * 1024 ** 2]),
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-1", "alertmanager", "node-2", [10 * 1024 ** 2, 20 * 1024 ** 2]),
+                FakePrometheusClient._range_row("monitoring", "alertmanager-main-1", "config-reloader", "node-2", [1 * 1024 ** 2, 2 * 1024 ** 2]),
+            ]
+        return []
+
+    def query(self, query: str, *, ts=None):
+        if "kube_pod_owner" in query:
+            return [
+                FakePrometheusClient._instant_row(
+                    {
+                        "namespace": "monitoring",
+                        "pod": "alertmanager-main-0",
+                        "owner_kind": "StatefulSet",
+                        "owner_name": "alertmanager-main",
+                    },
+                    1,
+                ),
+                FakePrometheusClient._instant_row(
+                    {
+                        "namespace": "monitoring",
+                        "pod": "alertmanager-main-1",
+                        "owner_kind": "StatefulSet",
+                        "owner_name": "alertmanager-main",
+                    },
+                    1,
+                ),
+            ]
+        if "kube_statefulset_replicas" in query:
+            return [FakePrometheusClient._instant_row({"namespace": "monitoring", "statefulset": "alertmanager-main"}, 2)]
+        if "requests_cpu_cores" in query or 'resource="cpu"' in query and "requests" in query:
+            return []
+        if "limits_cpu_cores" in query or 'resource="cpu"' in query and "limits" in query:
+            return [
+                FakePrometheusClient._resource_row("monitoring", "alertmanager-main-0", "config-reloader", 0.1),
+                FakePrometheusClient._resource_row("monitoring", "alertmanager-main-1", "config-reloader", 0.1),
+            ]
+        if "requests_memory_bytes" in query or 'resource="memory"' in query and "requests" in query:
+            return [
+                FakePrometheusClient._resource_row("monitoring", "alertmanager-main-0", "alertmanager", 200 * 1024 ** 2),
+                FakePrometheusClient._resource_row("monitoring", "alertmanager-main-1", "alertmanager", 200 * 1024 ** 2),
+            ]
+        if "limits_memory_bytes" in query or 'resource="memory"' in query and "limits" in query:
+            return [
+                FakePrometheusClient._resource_row("monitoring", "alertmanager-main-0", "config-reloader", 25 * 1024 ** 2),
+                FakePrometheusClient._resource_row("monitoring", "alertmanager-main-1", "config-reloader", 25 * 1024 ** 2),
+            ]
+        return []
 
 
 class K8SWorkloadProviderTest(unittest.TestCase):
@@ -142,12 +234,16 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         self.assertEqual(item["spec"]["workload_name"], "api")
         self.assertEqual(item["spec"]["pods_observed"], ["api-rs-a", "api-rs-b"])
         self.assertEqual(item["spec"]["containers_observed"], ["app", "sidecar"])
+        self.assertEqual(item["spec"]["replicas"], 3)
         self.assertEqual(item["spec"]["replicas_observed"], 2)
         self.assertEqual(item["spec"]["nodes"], ["node-1", "node-2"])
-        self.assertEqual(item["spec"]["cpu_request_cores"], 2.0)
-        self.assertEqual(item["spec"]["memory_limit_gb"], 2.0)
+        self.assertEqual(item["spec"]["cpu_request_cores"], 1.0)
+        self.assertEqual(item["spec"]["memory_limit_gb"], 1.0)
+        self.assertEqual(item["spec"]["cpu_request_cores_total"], 2.0)
+        self.assertEqual(item["spec"]["memory_limit_gb_total"], 2.0)
         self.assertEqual(item["spec"]["cpu_metric_mode"], "cpu_usage/cpu_request")
         self.assertEqual(item["spec"]["memory_metric_mode"], "memory_working_set/memory_limit")
+        self.assertTrue(any('container!="POD"' in query for query in FakePrometheusClient.queries))
         self.assertEqual(len(item["metrics"]["cpu"]["values"]), 2)
         self.assertAlmostEqual(item["metrics"]["cpu"]["values"][0], 0.15)
         self.assertAlmostEqual(item["metrics"]["cpu"]["values"][1], 0.3)
@@ -172,6 +268,7 @@ class K8SWorkloadProviderTest(unittest.TestCase):
 
         self.assertTrue(report["ok"])
         self.assertEqual(report["counts"]["workloads_resolved"], 1)
+        self.assertEqual(report["counts"]["workload_replica_rows"], 1)
         self.assertEqual(report["counts"]["orphan_container_series"], 1)
         self.assertEqual(report["sample_workloads"], [
             {"namespace": "ns", "workload_kind": "Deployment", "workload_name": "api"}
@@ -217,6 +314,28 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         cpu_queries = [q for q in FakePrometheusClient.queries if "container_cpu_usage_seconds_total" in q]
         self.assertTrue(cpu_queries)
         self.assertTrue(all("[10m]" in query for query in cpu_queries))
+
+    def test_fetch_target_keeps_asymmetric_container_requests_and_limits_separate(self):
+        target = PrometheusTarget(
+            cluster="cluster-k8s-1",
+            prometheus_url="http://prometheus.example",
+            namespace_regex="",
+            bearer_token="",
+            basic_auth="",
+            history_days=1,
+            step_seconds=300,
+            request_timeout_seconds=5,
+        )
+
+        with patch.object(provider, "PrometheusClient", AsymmetricResourcePrometheusClient):
+            items = provider._fetch_target(target, limit=0)
+
+        self.assertEqual(len(items), 1)
+        spec = items[0]["spec"]
+        self.assertIsNone(spec["cpu_request_cores"])
+        self.assertAlmostEqual(spec["cpu_limit_cores"], 0.1)
+        self.assertAlmostEqual(spec["memory_request_gb"], 200 / 1024)
+        self.assertAlmostEqual(spec["memory_limit_gb"], 25 / 1024)
 
     def test_data_quality_uses_seconds_for_gap_threshold(self):
         idx = pd.date_range("2026-01-01", periods=24, freq="300s")

@@ -92,6 +92,8 @@
       chartModalChart: document.getElementById("chart-modal-chart"),
     },
     chartAuxiliaryVisible: true,
+    chartRangeKey: "3d",
+    chartModeKey: "trend",
     detailChartInstance: null,
     modalChartInstance: null,
     chartDataByKey: new Map(),

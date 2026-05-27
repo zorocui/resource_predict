@@ -290,9 +290,11 @@ def _build_k8s_commands(
         workload_kind = "statefulset"
     elif workload_kind in {"ds", "daemonset"}:
         workload_kind = "daemonset"
+    elif workload_kind in {"rs", "replicaset"}:
+        workload_kind = "replicaset"
     if not workload_name:
-        raise ScalingPlanError(f"K8S resource {resource_id} is missing workload_name/deployment/statefulset")
-    if workload_kind not in {"deployment", "statefulset", "daemonset"}:
+        raise ScalingPlanError(f"K8S resource {resource_id} is missing workload_name/deployment/statefulset/daemonset")
+    if workload_kind not in {"deployment", "statefulset", "daemonset", "replicaset"}:
         raise ScalingPlanError(f"K8S workload kind {workload_kind or '-'} is not supported")
     container = str(spec.get("container") or "").strip()
     observed_containers = spec.get("containers_observed")
@@ -312,28 +314,26 @@ def _build_k8s_commands(
     target_ref = f"{workload_kind}/{workload_name}"
     warnings: List[str] = []
     commands: List[str] = []
-    if cpu_request is not None or memory_request is not None or cpu_limit is not None or memory_limit is not None:
-        request_parts = []
-        limit_parts = []
-        if cpu_request is not None:
-            request_parts.append(f"cpu={_format_k8s_cpu(cpu_request)}")
-        if memory_request is not None:
-            request_parts.append(f"memory={_format_k8s_memory(memory_request)}")
-        if cpu_limit is not None:
-            limit_parts.append(f"cpu={_format_k8s_cpu(cpu_limit)}")
-        if memory_limit is not None:
-            limit_parts.append(f"memory={_format_k8s_memory(memory_limit)}")
-        container_arg = f" --containers={shlex.quote(container)}" if container else ""
+    container_targets = _container_targets(target)
+    if container_targets:
+        for target_container, container_target in container_targets:
+            cmd = _build_k8s_resource_command(kube, namespace, target_ref, target_container, container_target)
+            if cmd:
+                commands.append(cmd)
+    elif cpu_request is not None or memory_request is not None or cpu_limit is not None or memory_limit is not None:
+        container_target = {
+            "cpu_request_cores": cpu_request,
+            "cpu_limit_cores": cpu_limit,
+            "memory_request_gb": memory_request,
+            "memory_limit_gb": memory_limit,
+        }
+        cmd = _build_k8s_resource_command(kube, namespace, target_ref, container, container_target)
         if not container:
             warnings.append("no single container was identified; kubectl will apply resources to all containers")
-        cmd = f"{kube} -n {shlex.quote(namespace)} set resources {shlex.quote(target_ref)}{container_arg}"
-        if request_parts:
-            cmd += f" --requests={','.join(request_parts)}"
-        if limit_parts:
-            cmd += f" --limits={','.join(limit_parts)}"
-        commands.append(cmd)
+        if cmd:
+            commands.append(cmd)
     if replicas > 0 and workload_kind != "daemonset":
-        current_replicas = _positive_int(spec.get("replicas_observed") or spec.get("replicas"), 0)
+        current_replicas = _positive_int(spec.get("replicas") or spec.get("replicas_observed"), 0)
         if current_replicas != replicas:
             commands.append(f"{kube} -n {shlex.quote(namespace)} scale {shlex.quote(target_ref)} --replicas={replicas}")
     elif replicas > 0 and workload_kind == "daemonset":
@@ -351,6 +351,58 @@ def _build_k8s_commands(
             "replicas": replicas if replicas > 0 else None,
         }
     }
+
+
+def _container_targets(target: Dict[str, Any]) -> List[tuple[str, Dict[str, Any]]]:
+    raw = target.get("containers")
+    if not isinstance(raw, dict):
+        return []
+    out: List[tuple[str, Dict[str, Any]]] = []
+    for name, values in raw.items():
+        container = str(name or "").strip()
+        if not container or not isinstance(values, dict):
+            continue
+        normalized = {
+            "cpu_request_cores": _num(values.get("cpu_request_cores")),
+            "cpu_limit_cores": _num(values.get("cpu_limit_cores")),
+            "memory_request_gb": _num(values.get("memory_request_gb")),
+            "memory_limit_gb": _num(values.get("memory_limit_gb")),
+        }
+        if any(value is not None for value in normalized.values()):
+            out.append((container, normalized))
+    return out
+
+
+def _build_k8s_resource_command(
+    kube: str,
+    namespace: str,
+    target_ref: str,
+    container: str,
+    target: Dict[str, Any],
+) -> str:
+    request_parts = []
+    limit_parts = []
+    cpu_request = _num(target.get("cpu_request_cores") or target.get("cpu_cores"))
+    cpu_limit = _num(target.get("cpu_limit_cores") or target.get("cpu_cores"))
+    memory_request = _num(target.get("memory_request_gb") or target.get("memory_gb"))
+    memory_limit = _num(target.get("memory_limit_gb") or target.get("memory_gb"))
+    if cpu_request is not None:
+        request_parts.append(f"cpu={_format_k8s_cpu(cpu_request)}")
+    if memory_request is not None:
+        request_parts.append(f"memory={_format_k8s_memory(memory_request)}")
+    if cpu_limit is not None:
+        limit_parts.append(f"cpu={_format_k8s_cpu(cpu_limit)}")
+    if memory_limit is not None:
+        limit_parts.append(f"memory={_format_k8s_memory(memory_limit)}")
+    if not request_parts and not limit_parts:
+        return ""
+    container_arg = f" --containers={shlex.quote(container)}" if container else ""
+    cmd = f"{kube} -n {shlex.quote(namespace)} set resources {shlex.quote(target_ref)}{container_arg}"
+    if request_parts:
+        cmd += f" --requests={','.join(request_parts)}"
+    if limit_parts:
+        cmd += f" --limits={','.join(limit_parts)}"
+    return cmd
 
 
 def _format_k8s_cpu(cpu: float) -> str:

@@ -150,7 +150,7 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
     step = int(target.step_seconds)
     end = time.time()
     start = end - max(step * 2, 600)
-    selector = 'container!="",pod!=""'
+    selector = 'container!="",container!="POD",pod!=""'
     if target.namespace_regex:
         selector += f',namespace=~"{target.namespace_regex}"'
     owner_selector = 'pod!=""'
@@ -183,8 +183,10 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
         pod_owners_raw = _pod_owner_values(client, owner_selector)
         replicaset_owners = _replicaset_owner_values(client, replicaset_owner_selector)
         pod_owners = _resolve_controller_owners(pod_owners_raw, replicaset_owners)
+        replica_values = _replica_values_by_workload(client, replicaset_owner_selector)
         query_counts["pod_owner_rows"] = len(pod_owners_raw)
         query_counts["replicaset_owner_rows"] = len(replicaset_owners)
+        query_counts["workload_replica_rows"] = len(replica_values)
 
         all_container_keys = set(cpu_usage) | set(mem_usage)
         workload_keys = {_workload_key(key, pod_owners) for key in all_container_keys}
@@ -276,7 +278,7 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
     end = time.time()
     start = end - int(target.history_days) * 86400
     step = int(target.step_seconds)
-    selector = 'container!="",pod!=""'
+    selector = 'container!="",container!="POD",pod!=""'
     if target.namespace_regex:
         selector += f',namespace=~"{target.namespace_regex}"'
     owner_selector = 'pod!=""'
@@ -321,6 +323,7 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
     replicaset_owners = _replicaset_owner_values(client, replicaset_owner_selector)
     if replicaset_owners:
         pod_owners = _resolve_controller_owners(pod_owners, replicaset_owners)
+    replica_values = _replica_values_by_workload(client, replicaset_owner_selector)
 
     workload_keys = sorted(
         wk
@@ -371,6 +374,11 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
         mem_norm = _regularize_series(mem_norm, step)
         namespace, owner_kind, owner_name = key
         meta = metadata_by_workload.get(key, {})
+        replicas_observed = len(meta.get("pods", []))
+        cpu_request_total = cpu_request_by_workload.get(key)
+        cpu_limit_total = cpu_limit_by_workload.get(key)
+        mem_request_total = mem_request_by_workload.get(key)
+        mem_limit_total = mem_limit_by_workload.get(key)
         spec = {
             "cluster": target.cluster,
             "namespace": namespace,
@@ -380,11 +388,16 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
             "workload_name": owner_name,
             "pods_observed": sorted(meta.get("pods", [])),
             "containers_observed": sorted(meta.get("containers", [])),
-            "replicas_observed": len(meta.get("pods", [])),
-            "cpu_request_cores": cpu_request_by_workload.get(key),
-            "cpu_limit_cores": cpu_limit_by_workload.get(key),
-            "memory_request_gb": _bytes_to_gb(mem_request_by_workload.get(key)),
-            "memory_limit_gb": _bytes_to_gb(mem_limit_by_workload.get(key)),
+            "replicas": replica_values.get(key),
+            "replicas_observed": replicas_observed,
+            "cpu_request_cores": _per_pod_value(cpu_request_total, replicas_observed),
+            "cpu_limit_cores": _per_pod_value(cpu_limit_total, replicas_observed),
+            "memory_request_gb": _bytes_to_gb(_per_pod_value(mem_request_total, replicas_observed)),
+            "memory_limit_gb": _bytes_to_gb(_per_pod_value(mem_limit_total, replicas_observed)),
+            "cpu_request_cores_total": cpu_request_total,
+            "cpu_limit_cores_total": cpu_limit_total,
+            "memory_request_gb_total": _bytes_to_gb(mem_request_total),
+            "memory_limit_gb_total": _bytes_to_gb(mem_limit_total),
             "cpu_metric_mode": cpu_metric,
             "memory_metric_mode": mem_metric,
         }
@@ -604,6 +617,36 @@ def _resolve_controller_owners(
     return resolved
 
 
+def _replica_values_by_workload(client: PrometheusClient, selector: str) -> Dict[WorkloadKey, int]:
+    queries = [
+        ("Deployment", "deployment", f"kube_deployment_spec_replicas{{{selector}}}"),
+        ("Deployment", "deployment", f"kube_deployment_status_replicas{{{selector}}}"),
+        ("StatefulSet", "statefulset", f"kube_statefulset_replicas{{{selector}}}"),
+        ("StatefulSet", "statefulset", f"kube_statefulset_status_replicas{{{selector}}}"),
+        ("DaemonSet", "daemonset", f"kube_daemonset_status_desired_number_scheduled{{{selector}}}"),
+    ]
+    out: Dict[WorkloadKey, int] = {}
+    for kind, label_name, query in queries:
+        try:
+            rows = client.query(query)
+        except Exception:
+            continue
+        for row in rows:
+            metric = row.get("metric", {})
+            value = row.get("value", [])
+            if not isinstance(metric, dict) or not isinstance(value, list) or len(value) < 2:
+                continue
+            namespace = str(metric.get("namespace") or "")
+            workload_name = str(metric.get(label_name) or "")
+            try:
+                replicas = int(float(value[1]))
+            except Exception:
+                continue
+            if namespace and workload_name and replicas >= 0:
+                out[(namespace, kind, workload_name)] = replicas
+    return out
+
+
 def _workload_key(
     key: ContainerKey,
     pod_owners: Dict[Tuple[str, str], Tuple[str, str]],
@@ -680,6 +723,13 @@ def _select_denominator(*candidates: Tuple[Optional[float], str]) -> Tuple[Optio
         if value and value > 0:
             return float(value), name
     return None, ""
+
+
+def _per_pod_value(value: Optional[float], replicas: int) -> Optional[float]:
+    if value is None:
+        return None
+    divisor = max(1, int(replicas or 0))
+    return float(value) / divisor
 
 
 def _normalize_series(

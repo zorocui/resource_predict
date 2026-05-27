@@ -145,7 +145,7 @@
   }
 
   async function pollTask(taskId, container, deps) {
-    const statusEl = container?.querySelector('[data-role="scaling-status"]');
+    const statusEl = container?.querySelector('[data-role="scaling-status"], [data-role="manual-scaling-status"]');
     for (let i = 0; i < 90; i++) {
       try {
         const payload = await deps.requestJson(`/api/scaling-tasks/${encodeURIComponent(taskId)}`, 1);
@@ -186,7 +186,10 @@
     const resourceId = container?.dataset.scalingResource || "";
     const resourceType = container?.dataset.scalingResourceType || "";
     const mode = btn.dataset.scalingMode || "dry_run";
+    const source = btn.dataset.scalingSource || "suggested";
     if (!container || !resourceId) return;
+    const targetSpec = source === "manual" ? collectManualTargetSpec(container) : null;
+    if (source === "manual" && !targetSpec) return;
     let confirmCreateFlavor = mode === "dry_run";
     if (mode === "execute") {
       const ok = window.confirm("确认执行调配命令？后端会登录资源所在集群的控制节点并修改资源规格。");
@@ -195,7 +198,7 @@
         ? false
         : window.confirm("如果 OpenStack 中没有匹配目标规格的 flavor，是否允许后端创建新 flavor 后再调配？");
     }
-    const statusEl = container.querySelector('[data-role="scaling-status"]');
+    const statusEl = container.querySelector('[data-role="scaling-status"], [data-role="manual-scaling-status"]');
     container.querySelectorAll("[data-scaling-mode]").forEach((x) => { x.disabled = true; });
     if (statusEl) statusEl.textContent = mode === "dry_run" ? "正在提交预检..." : "正在提交调配...";
     renderModal({ resource_id: resourceId, mode, status: "submitting" }, "submitting");
@@ -204,6 +207,8 @@
         mode,
         confirm: mode === "execute",
         confirm_create_flavor: confirmCreateFlavor,
+        target_source: source,
+        ...(targetSpec ? { target_spec: targetSpec } : {}),
       });
       const taskId = payload.task_id || payload.task?.task_id;
       if (!taskId) throw new Error("后端未返回 task_id");
@@ -240,6 +245,131 @@
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !modalEl.hidden) closeModal();
   });
+  document.addEventListener("click", (event) => {
+    const toggle = event.target.closest("[data-scaling-choice-toggle]");
+    if (!toggle) return;
+    const root = toggle.closest("[data-scaling-choice-root]");
+    const panel = root?.querySelector("[data-scaling-choice-panel]");
+    if (!panel) return;
+    const nextOpen = panel.hidden;
+    panel.hidden = !nextOpen;
+    toggle.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+  });
+
+  function collectManualTargetSpec(container) {
+    const panel = container.classList.contains("manual-scaling-panel")
+      ? container
+      : container.parentElement?.querySelector(".manual-scaling-panel");
+    const statusEl = panel?.querySelector('[data-role="manual-scaling-status"]');
+    const target = { containers: {} };
+    let hasValue = false;
+    panel?.querySelectorAll("[data-manual-container]").forEach((row) => {
+      const name = row.dataset.manualContainer || "";
+      if (!name) return;
+      const values = {};
+      row.querySelectorAll("[data-manual-field]").forEach((input) => {
+        const raw = String(input.value || "").trim();
+        if (raw === "") return;
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value < 0) return;
+        values[input.dataset.manualField] = value;
+      });
+      if (Object.keys(values).length) {
+        target.containers[name] = values;
+        hasValue = true;
+      }
+    });
+    const replicasInput = panel?.querySelector("[data-manual-replicas]");
+    if (replicasInput && String(replicasInput.value || "").trim() !== "") {
+      const replicas = Number(replicasInput.value);
+      if (Number.isInteger(replicas) && replicas > 0) {
+        target.replicas = replicas;
+        hasValue = true;
+      }
+    }
+    if (!hasValue) {
+      if (statusEl) {
+        statusEl.textContent = "请先填写至少一个目标规格";
+        statusEl.classList.add("is-failed");
+      }
+      return null;
+    }
+    if (!Object.keys(target.containers).length) delete target.containers;
+    if (statusEl) {
+      statusEl.textContent = "";
+      statusEl.classList.remove("is-failed");
+    }
+    return target;
+  }
+
+  function buildManualK8sControls(resource, resourceId, resourceType) {
+    const spec = resource?.spec || {};
+    const containers = containersFor(spec);
+    if (!containers.length) return "";
+    const kind = String(spec.workload_kind || spec.owner_kind || "").trim().toLowerCase();
+    const isDaemonSet = kind === "daemonset";
+    const currentReplicas = spec.replicas ?? spec.current_replicas ?? spec.replicas_observed ?? "";
+    const rows = containers.map((name) => `
+      <div class="manual-container-row" data-manual-container="${escapeHtml(name)}">
+        ${manualInput("CPU req", "cpu_request_cores", "C")}
+        ${manualInput("CPU limit", "cpu_limit_cores", "C")}
+        ${manualInput("Mem req", "memory_request_gb", "GB")}
+        ${manualInput("Mem limit", "memory_limit_gb", "GB")}
+      </div>`).join("");
+    const replicas = isDaemonSet
+      ? `<div class="manual-note">DaemonSet 副本数由节点调度决定，这里只调整容器资源。</div>`
+      : `<label class="manual-replicas"><span>控制器副本数</span><input data-manual-replicas type="number" min="1" step="1" placeholder="${escapeHtml(currentReplicas)}" /></label>`;
+    return `
+      <div class="manual-scaling-panel" data-scaling-resource="${escapeHtml(resourceId)}" data-scaling-resource-type="${escapeHtml(resourceType || "")}">
+        <div class="manual-scaling-head"><strong>手动目标规格</strong><span>留空字段不会变更</span></div>
+        <div class="manual-container-grid">${rows}</div>
+        ${replicas}
+        <div class="manual-scaling-actions">
+          <button type="button" class="scale-btn" data-scaling-mode="dry_run" data-scaling-source="manual">手动预检</button>
+          <button type="button" class="scale-btn scale-execute" data-scaling-mode="execute" data-scaling-source="manual">按手动规格调配</button>
+          <span class="scaling-status" data-role="manual-scaling-status"></span>
+        </div>
+      </div>`;
+  }
+
+  function containersFor(spec) {
+    const observed = Array.isArray(spec.containers_observed) ? spec.containers_observed : [];
+    const out = observed.map((x) => String(x || "").trim()).filter(Boolean);
+    const single = String(spec.container || "").trim();
+    if (single && !out.includes(single)) out.push(single);
+    return out;
+  }
+
+  function manualInput(label, field, unit) {
+    return `<label><span>${escapeHtml(label)}</span><input data-manual-field="${escapeHtml(field)}" type="number" min="0" step="0.001" placeholder="${escapeHtml(unit)}" /></label>`;
+  }
+
+  function buildControls(resourceId, action, confidence, hasMixed, options = {}) {
+    const analysisOnly = Boolean(options.analysisOnly);
+    const disabled = analysisOnly || action === "hold" || action === "insufficient_data" || action === "mixed";
+    const risky = confidence === "low" || hasMixed;
+    const disabledAttr = disabled ? " disabled" : "";
+    const disabledText = analysisOnly ? "当前建议缺少可执行目标，不能按建议调配" : "当前建议无需执行调配";
+    const manualControls = options.resourceType === "k8s_workload"
+      ? buildManualK8sControls(options.resource || {}, resourceId, options.resourceType)
+      : "";
+    const suggestedStatus = disabled ? `<span class="scaling-status" data-role="scaling-status">${disabledText}</span>` : `<span class="scaling-status" data-role="scaling-status"></span>`;
+    return `
+      <div class="scaling-choice" data-scaling-choice-root>
+        <button type="button" class="scale-btn scale-primary" data-scaling-choice-toggle aria-expanded="false">调配</button>
+        <div class="scaling-choice-panel" data-scaling-choice-panel hidden>
+          <div class="scaling-choice-section">
+            <div class="scaling-choice-head"><strong>按建议调配</strong><span>使用当前预测生成的目标规格</span></div>
+            <div class="scaling-controls" data-scaling-resource="${escapeHtml(resourceId)}" data-scaling-resource-type="${escapeHtml(options.resourceType || "")}">
+              <button type="button" class="scale-btn" data-scaling-mode="dry_run" data-scaling-source="suggested"${disabledAttr}>建议预检</button>
+              <button type="button" class="scale-btn scale-execute${risky ? " is-risky" : ""}" data-scaling-mode="execute" data-scaling-source="suggested"${disabledAttr}>按建议调配</button>
+              ${suggestedStatus}
+            </div>
+          </div>
+          ${manualControls ? `<div class="scaling-choice-section">${manualControls}</div>` : ""}
+        </div>
+      </div>`;
+  }
 
   window.ScalingUI = { buildControls, closeModal, start };
 })();

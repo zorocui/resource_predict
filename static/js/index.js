@@ -223,20 +223,27 @@
 
   function configInput(label, name, value, options = {}) {
     const type = options.type || "text";
+    const disabled = options.disabled ? "disabled" : "";
+    const disabledClass = options.disabled ? " is-disabled" : "";
     if (type === "checkbox") {
       return `
-        <label class="config-field is-checkbox">
+        <label class="config-field is-checkbox${disabledClass}">
           <span>${label}</span>
-          <input data-config-name="${name}" type="checkbox" ${value ? "checked" : ""} />
+          <input data-config-name="${name}" type="checkbox" ${value ? "checked" : ""} ${disabled} />
         </label>
       `;
     }
     return `
-      <label class="config-field">
+      <label class="config-field${disabledClass}">
         <span>${label}</span>
-        <input data-config-name="${name}" type="${type}" value="${list.escapeHtml(value ?? "")}" placeholder="${list.escapeHtml(options.placeholder || "")}" />
+        <input data-config-name="${name}" type="${type}" value="${list.escapeHtml(value ?? "")}" placeholder="${list.escapeHtml(options.placeholder || "")}" ${disabled} />
       </label>
     `;
+  }
+
+  function isK8sScalingCluster(cfg) {
+    const type = String(cfg?.cloud_type || cfg?.type || "openstack").trim().toLowerCase();
+    return type === "k8s" || type === "kubernetes";
   }
 
   function renderVmClusterRows(clusters) {
@@ -246,26 +253,30 @@
       app.els.vmClusterList.innerHTML = `<div class="empty-list is-compact">暂无 VM 调配集群配置。</div>`;
       return;
     }
-    app.els.vmClusterList.innerHTML = entries.map(([cluster, cfg]) => `
-      <div class="config-row" data-config-kind="vm" data-original-cluster="${list.escapeHtml(cluster)}">
+    app.els.vmClusterList.innerHTML = entries.map(([cluster, cfg]) => {
+      const isK8s = isK8sScalingCluster(cfg);
+      return `
+      <div class="config-row" data-config-kind="vm" data-scaling-cloud-type="${isK8s ? "k8s" : "openstack"}" data-original-cluster="${list.escapeHtml(cluster)}">
         <div class="config-row-title">
           <strong>${list.escapeHtml(cluster)}</strong>
+          <span class="resource-type-badge">${isK8s ? "K8S" : "OpenStack"}</span>
           <button class="link-btn" type="button" data-config-remove>删除</button>
         </div>
         <div class="config-grid">
           ${configInput("集群名", "cluster", cluster)}
-          ${configInput("类型", "cloud_type", cfg.cloud_type || "openstack", { placeholder: "openstack 或 k8s" })}
+          ${configInput("类型", "cloud_type", isK8s ? "k8s" : "openstack", { disabled: true })}
           ${configInput("控制节点", "control_host", cfg.control_host || "")}
           ${configInput("SSH 用户", "ssh_user", cfg.ssh_user || "root")}
           ${configInput("SSH 端口", "ssh_port", cfg.ssh_port || 22, { type: "number" })}
           ${configInput("SSH Key", "ssh_key", cfg.ssh_key || "")}
-          ${configInput("OpenStack RC", "openstack_rc", cfg.openstack_rc || "")}
-          ${configInput("Kubeconfig", "kubeconfig", cfg.kubeconfig || "", { placeholder: "/root/.kube/config" })}
+          ${configInput("OpenStack RC", "openstack_rc", cfg.openstack_rc || "", { disabled: isK8s })}
+          ${configInput("Kubeconfig", "kubeconfig", cfg.kubeconfig || "", { placeholder: "/root/.kube/config", disabled: !isK8s })}
           ${configInput("命令超时秒", "command_timeout_seconds", cfg.command_timeout_seconds || 300, { type: "number" })}
-          ${configInput("自动确认 resize", "auto_confirm_resize", Boolean(cfg.auto_confirm_resize), { type: "checkbox" })}
+          ${configInput("自动确认 resize", "auto_confirm_resize", Boolean(cfg.auto_confirm_resize), { type: "checkbox", disabled: isK8s })}
         </div>
       </div>
-    `).join("");
+    `;
+    }).join("");
   }
 
   function renderK8sClusterRows(clusters) {
@@ -363,18 +374,26 @@
       if (!cluster) return;
       const originalCluster = row.dataset.originalCluster || cluster;
       const original = app.state.clusterConfigPayload?.vm_scaling_clusters?.[originalCluster] || {};
+      const cloudType = row.dataset.scalingCloudType || rowValue(row, "cloud_type") || "openstack";
+      const isK8s = cloudType === "k8s";
       vm[cluster] = {
         ...original,
-        cloud_type: rowValue(row, "cloud_type") || "openstack",
+        cloud_type: isK8s ? "k8s" : "openstack",
         control_host: rowValue(row, "control_host"),
         ssh_user: rowValue(row, "ssh_user"),
         ssh_port: rowValue(row, "ssh_port") || 22,
         ssh_key: rowValue(row, "ssh_key"),
-        openstack_rc: rowValue(row, "openstack_rc"),
-        kubeconfig: rowValue(row, "kubeconfig"),
         command_timeout_seconds: rowValue(row, "command_timeout_seconds") || 300,
-        auto_confirm_resize: rowValue(row, "auto_confirm_resize"),
       };
+      if (isK8s) {
+        vm[cluster].kubeconfig = rowValue(row, "kubeconfig");
+        delete vm[cluster].openstack_rc;
+        delete vm[cluster].auto_confirm_resize;
+      } else {
+        vm[cluster].openstack_rc = rowValue(row, "openstack_rc");
+        vm[cluster].auto_confirm_resize = rowValue(row, "auto_confirm_resize");
+        delete vm[cluster].kubeconfig;
+      }
     });
     const k8s = [];
     app.els.k8sClusterList?.querySelectorAll('[data-config-kind="k8s"]').forEach((row) => {

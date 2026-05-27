@@ -362,7 +362,7 @@ h1 {
 .risk-row {
   position: relative;
   display: grid;
-  grid-template-columns: 4px minmax(0, 1fr) minmax(180px, 230px);
+  grid-template-columns: 4px minmax(0, 1fr) minmax(230px, 280px);
   gap: 12px;
   width: 100%;
   min-width: 0;
@@ -498,10 +498,10 @@ h1 {
   font-size: 12px;
   line-height: 1.45;
   max-width: 100%;
-  overflow: visible;
-  overflow-wrap: anywhere;
+  overflow: hidden;
   text-align: right;
-  white-space: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .info-tooltip {
@@ -698,10 +698,11 @@ h1 {
 
 .decision-summary strong {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
   color: var(--text);
   font-size: 15px;
   line-height: 1.35;
+  word-break: normal;
 }
 
 .decision-summary small {
@@ -910,6 +911,17 @@ h1 {
   background: #fff;
 }
 
+.config-field.is-disabled {
+  opacity: .58;
+}
+
+.config-field.is-disabled input {
+  cursor: not-allowed;
+  border-color: rgba(148, 163, 184, .45);
+  background: #eef2f7;
+  color: #64748b;
+}
+
 .config-field.is-checkbox {
   align-content: end;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1033,6 +1045,57 @@ h1 {
   font-weight: 800;
 }
 
+.scaling-choice {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.scale-primary {
+  justify-self: start;
+  border-color: var(--info);
+  background: var(--info);
+  color: #fff;
+}
+
+.scaling-choice-panel {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid rgba(15, 23, 42, .1);
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8fafc;
+}
+
+.scaling-choice-panel[hidden] {
+  display: none;
+}
+
+.scaling-choice-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.scaling-choice-section + .scaling-choice-section {
+  border-top: 1px solid rgba(15, 23, 42, .08);
+  padding-top: 10px;
+}
+
+.scaling-choice-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+}
+
+.scaling-choice-head span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .scaling-controls {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr);
@@ -1063,10 +1126,86 @@ h1 {
 .scaling-status.is-success { color: var(--success); }
 .scaling-status.is-failed { color: var(--danger); }
 
+.manual-scaling-panel {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid rgba(15, 23, 42, .1);
+  border-radius: 8px;
+  padding: 10px;
+  background: #fff;
+}
+
+.manual-scaling-head,
+.manual-scaling-actions {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.manual-scaling-head span,
+.manual-note {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.manual-container-grid {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.manual-container-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
+  gap: 8px;
+  align-items: end;
+  min-width: 0;
+}
+
+.manual-container-row label,
+.manual-replicas {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.manual-container-row input,
+.manual-replicas input {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font: inherit;
+}
+
+.manual-replicas {
+  max-width: 100%;
+}
+
 .metric-tabs {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
+}
+
+.metric-tab-group,
+.chart-control-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.chart-control-group {
+  margin-left: auto;
 }
 
 .metric-tabs button {
@@ -1077,6 +1216,12 @@ h1 {
   background: #fff;
   color: #334155;
   font-weight: 900;
+}
+
+.chart-control-group button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .metric-tabs button.active {
@@ -1456,7 +1601,9 @@ h1 {
 
   .target-text {
     grid-column: 1 / -1;
+    overflow-wrap: anywhere;
     text-align: left;
+    white-space: normal;
   }
 
   .reason-grid,
@@ -1470,6 +1617,20 @@ h1 {
 
   .scaling-controls {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .manual-scaling-head,
+  .manual-scaling-actions,
+  .manual-container-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .manual-note {
+    grid-column: 1 / -1;
+  }
+
+  .chart-control-group {
+    margin-left: 0;
   }
 
   .scaling-status {

@@ -36,6 +36,8 @@ def register_scaling_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) 
                 mode=mode,
                 operator=str(body.get("operator") or ""),
                 allow_create_flavor=bool(body.get("confirm_create_flavor")),
+                target_spec_override=body.get("target_spec"),
+                target_source=str(body.get("target_source") or ""),
             )
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 409

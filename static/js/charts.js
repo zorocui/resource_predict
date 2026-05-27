@@ -3,13 +3,28 @@
   const api = window.ResourceApi;
   const list = window.ResourceList;
   const CHART_TIME_ZONE = "UTC";
+  const MINUTE_MS = 60 * 1000;
+  const HOUR_MS = 60 * MINUTE_MS;
+  const DAY_MS = 24 * HOUR_MS;
+  const CHART_RANGES = [
+    { key: "24h", label: "24h", durationMs: DAY_MS },
+    { key: "3d", label: "3d", durationMs: 3 * DAY_MS },
+    { key: "7d", label: "7d", durationMs: 7 * DAY_MS },
+    { key: "all", label: "全部", durationMs: null },
+  ];
+  const CHART_MODES = [
+    { key: "trend", label: "趋势" },
+    { key: "peak", label: "峰值" },
+    { key: "raw", label: "原始" },
+  ];
 
   function toPairs(xMs, y) {
     const res = [];
     for (let i = 0; i < xMs.length; i++) {
       let ts = xMs[i];
       if (typeof ts === "number" && ts < 1e12) ts *= 1000;
-      res.push([ts, y[i]]);
+      const val = Number(y[i]);
+      if (Number.isFinite(ts) && Number.isFinite(val)) res.push([ts, val]);
     }
     return res;
   }
@@ -39,20 +54,87 @@
     return `${mm}-${dd} ${hh}:${pick("minute") || "00"}`;
   }
 
-  function buildTimeAxisConfig(xTrain, xTest, xPredFuture) {
+  function chartRange() {
+    return CHART_RANGES.find((item) => item.key === app.chartRangeKey) || CHART_RANGES[1];
+  }
+
+  function chartMode() {
+    return CHART_MODES.find((item) => item.key === app.chartModeKey) || CHART_MODES[0];
+  }
+
+  function collectTimes(groups) {
     const bucket = [];
-    for (const arr of [xTrain, xTest, xPredFuture]) {
-      if (!Array.isArray(arr)) continue;
-      for (const t of arr) {
-        const ms = normalizeTsMs(t);
+    for (const group of groups) {
+      if (!Array.isArray(group)) continue;
+      for (const pair of group) {
+        const ms = normalizeTsMs(Array.isArray(pair) ? pair[0] : pair);
         if (Number.isFinite(ms)) bucket.push(ms);
       }
     }
-    if (!bucket.length) return { spanMs: 0 };
     bucket.sort((a, b) => a - b);
-    const spanMs = bucket[bucket.length - 1] - bucket[0];
+    return bucket;
+  }
+
+  function resolveChartWindow(xTrain, xTest, xPredFuture) {
+    const allTimes = collectTimes([xTrain, xTest, xPredFuture]);
+    if (!allTimes.length) return { min: undefined, max: undefined, spanMs: 0 };
+    const fullMin = allTimes[0];
+    const fullMax = allTimes[allTimes.length - 1];
+    const selectedRange = chartRange();
+    if (!selectedRange.durationMs) {
+      return { min: fullMin, max: fullMax, spanMs: fullMax - fullMin };
+    }
+    const futureTimes = collectTimes([xPredFuture]);
+    const observedTimes = collectTimes([xTrain, xTest]);
+    const anchor = futureTimes[0] || observedTimes[observedTimes.length - 1] || fullMax;
+    const min = Math.max(fullMin, anchor - selectedRange.durationMs);
+    return { min, max: fullMax, spanMs: fullMax - min };
+  }
+
+  function filterPairsByWindow(pairs, windowInfo) {
+    if (!Array.isArray(pairs) || !pairs.length) return [];
+    const min = Number.isFinite(windowInfo?.min) ? windowInfo.min : -Infinity;
+    const max = Number.isFinite(windowInfo?.max) ? windowInfo.max : Infinity;
+    return pairs.filter((pair) => pair[0] >= min && pair[0] <= max);
+  }
+
+  function chooseBucketMs(spanMs, pointCount) {
+    if (chartMode().key === "raw" || !Number.isFinite(spanMs) || spanMs <= 12 * HOUR_MS) return 0;
+    if (spanMs <= 3 * DAY_MS) return 15 * MINUTE_MS;
+    if (spanMs <= 14 * DAY_MS) return HOUR_MS;
+    return pointCount > 2000 ? 6 * HOUR_MS : HOUR_MS;
+  }
+
+  function aggregatePairs(pairs, bucketMs) {
+    if (!bucketMs || pairs.length < 3) return pairs;
+    const modeKey = chartMode().key;
+    const buckets = new Map();
+    for (const [ts, value] of pairs) {
+      const bucketTs = Math.floor(ts / bucketMs) * bucketMs;
+      const current = buckets.get(bucketTs) || { sum: 0, count: 0, max: -Infinity };
+      current.sum += value;
+      current.count += 1;
+      current.max = Math.max(current.max, value);
+      buckets.set(bucketTs, current);
+    }
+    return Array.from(buckets.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([ts, stats]) => [ts, modeKey === "peak" ? stats.max : stats.sum / stats.count]);
+  }
+
+  function prepareSeriesData(pairs, windowInfo) {
+    const visible = filterPairsByWindow(pairs, windowInfo);
+    return aggregatePairs(visible, chooseBucketMs(windowInfo.spanMs, visible.length));
+  }
+
+  function buildTimeAxisConfigFromPairs(groups, windowInfo) {
+    const bucket = collectTimes(groups);
+    if (!bucket.length) return { spanMs: 0 };
+    const start = Number.isFinite(windowInfo?.min) ? windowInfo.min : bucket[0];
+    const end = Number.isFinite(windowInfo?.max) ? windowInfo.max : bucket[bucket.length - 1];
+    const spanMs = end - start;
     const pad = Math.max(spanMs * 0.02, 60 * 1000);
-    return { min: bucket[0] - pad, max: bucket[bucket.length - 1] + pad, spanMs };
+    return { min: start - pad, max: end + pad, spanMs };
   }
 
   function metricThresholds(metricKey) {
@@ -71,12 +153,17 @@
     const xPredFuture = Array.isArray(chartData.x_pred_ms) ? chartData.x_pred_ms : [];
     const anchorTs = xTrain.length ? xTrain[xTrain.length - 1] : null;
     const anchorVal = yTrain.length ? yTrain[yTrain.length - 1] : null;
+    const rawTrainPairs = toPairs(xTrain, yTrain);
+    const rawTestPairs = toPairs(anchorTs == null ? xTest : [anchorTs].concat(xTest), anchorVal == null ? yTest : [anchorVal].concat(yTest));
+    const windowInfo = resolveChartWindow(xTrain, xTest, xPredFuture);
+    const activeMode = chartMode();
     const series = [{
       name: "历史",
       type: "line",
-      data: toPairs(xTrain, yTrain),
+      data: prepareSeriesData(rawTrainPairs, windowInfo),
       showSymbol: false,
-      lineStyle: { color: "#2563eb", width: 2.4 },
+      sampling: "lttb",
+      lineStyle: { color: "#2563eb", width: 1.35, opacity: activeMode.key === "raw" ? 0.55 : 0.78 },
       itemStyle: { color: "#2563eb" },
       z: 2,
     }];
@@ -113,9 +200,10 @@
     series.push({
       name: "测试",
       type: "line",
-      data: toPairs(anchorTs == null ? xTest : [anchorTs].concat(xTest), anchorVal == null ? yTest : [anchorVal].concat(yTest)),
+      data: prepareSeriesData(rawTestPairs, windowInfo),
       showSymbol: false,
-      lineStyle: { color: "#dc2626", width: 2.4 },
+      sampling: "lttb",
+      lineStyle: { color: "#dc2626", width: 2.1 },
       itemStyle: { color: "#dc2626" },
       z: 3,
     });
@@ -140,16 +228,18 @@
         predY = predY.concat(futurePred);
       }
       if (!predX.length) continue;
+      const rawPredPairs = toPairs(predX, predY);
       legendData.push(label);
       series.push({
         name: label,
         type: "line",
-        data: toPairs(predX, predY),
+        data: prepareSeriesData(rawPredPairs, windowInfo),
         showSymbol: false,
+        sampling: "lttb",
         lineStyle: {
           type: "dashed",
           color: app.colorMap[m] || "#64748b",
-          width: m === bestMethod ? 3 : 2,
+          width: m === bestMethod ? 2.6 : 1.9,
           opacity: m === bestMethod ? 1 : 0.72,
         },
         itemStyle: { color: app.colorMap[m] || "#64748b" },
@@ -158,12 +248,12 @@
     }
 
     const bestRmse = chartData.metrics?.[bestMethod]?.rmse;
-    const timeAxis = buildTimeAxisConfig(xTrain, xTest, xPredFuture);
+    const timeAxis = buildTimeAxisConfigFromPairs(series.map((item) => item.data), windowInfo);
     return {
       backgroundColor: "transparent",
       animation: false,
       title: {
-        text: `${app.metricTitleMap[metricKey] || metricKey} 预测${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
+        text: `${app.metricTitleMap[metricKey] || metricKey} 预测 · ${activeMode.label}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
         left: "center",
         top: 6,
         textStyle: { color: "#0f172a", fontSize: 13, fontWeight: 800 },
@@ -185,7 +275,7 @@
         },
       },
       legend: { top: 34, left: 8, data: legendData, itemWidth: 12, itemHeight: 7, textStyle: { color: "#475569", fontSize: 10 } },
-      grid: { left: 48, right: 18, top: 70, bottom: timeAxis.spanMs > 14 * 86400000 ? 48 : 40 },
+      grid: { left: 48, right: 18, top: 70, bottom: 58 },
       xAxis: {
         type: "time",
         min: timeAxis.min,
@@ -208,6 +298,20 @@
         axisLabel: { color: "#64748b", formatter: (v) => `${(Number(v) * 100).toFixed(0)}%` },
         splitLine: { lineStyle: { color: "rgba(15,23,42,.08)" } },
       },
+      dataZoom: [
+        { type: "inside", xAxisIndex: 0, filterMode: "none", zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: true },
+        {
+          type: "slider",
+          xAxisIndex: 0,
+          filterMode: "none",
+          height: 18,
+          bottom: 12,
+          borderColor: "rgba(148,163,184,.28)",
+          fillerColor: "rgba(37,99,235,.12)",
+          handleSize: "80%",
+          textStyle: { color: "#64748b", fontSize: 10 },
+        },
+      ],
       series,
     };
   }
@@ -254,12 +358,35 @@
     app.modalChartInstance = null;
   }
 
+  function chartButton(option, group, extraClass = "") {
+    const stateKey = group === "range" ? app.chartRangeKey : app.chartModeKey;
+    return `<button type="button" class="${stateKey === option.key ? "active" : ""}${extraClass}" data-chart-${group}="${list.escapeHtml(option.key)}">${list.escapeHtml(option.label)}</button>`;
+  }
+
+  function chartControlsMarkup() {
+    return `
+      <div class="chart-control-group" aria-label="图表时间范围">
+        ${CHART_RANGES.map((option) => chartButton(option, "range")).join("")}
+      </div>
+      <div class="chart-control-group" aria-label="图表显示模式">
+        ${CHART_MODES.map((option) => chartButton(option, "mode")).join("")}
+      </div>
+    `;
+  }
+
+  function metricButtonsMarkup(resource, activeMetric, modal = false) {
+    const attr = modal ? "data-modal-metric-key" : "data-metric-key";
+    return list.metricKeysFor(resource).map((key) => (
+      `<button type="button" class="${key === activeMetric ? "active" : ""}" ${attr}="${list.escapeHtml(key)}">${list.escapeHtml(app.metricTitleMap[key])}</button>`
+    )).join("");
+  }
+
   function renderModalMetricTabs(resource, activeMetric) {
     if (!app.els.chartModalMetricTabs) return;
-    const metricKeys = list.metricKeysFor(resource);
-    app.els.chartModalMetricTabs.innerHTML = metricKeys.map((key) => (
-      `<button type="button" class="${key === activeMetric ? "active" : ""}" data-modal-metric-key="${list.escapeHtml(key)}">${list.escapeHtml(app.metricTitleMap[key])}</button>`
-    )).join("");
+    app.els.chartModalMetricTabs.innerHTML = `
+      <div class="metric-tab-group">${metricButtonsMarkup(resource, activeMetric, true)}</div>
+      ${chartControlsMarkup()}
+    `;
   }
 
   function renderSpec(resource) {
@@ -274,13 +401,14 @@
           ["集群", spec.cluster],
           ["Namespace", spec.namespace],
           ["Workload", [spec.workload_kind || spec.owner_kind, spec.workload_name || spec.owner_name].filter(Boolean).join("/")],
-          ["副本数", spec.replicas_observed],
+          ["副本数", spec.replicas],
+          ["观测 Pod 数", spec.replicas_observed],
           ["容器", Array.isArray(spec.containers_observed) ? spec.containers_observed.join(", ") : spec.container],
           ["节点", Array.isArray(spec.nodes) ? spec.nodes.join(", ") : spec.node],
-          ["CPU Request", formatMaybe(spec.cpu_request_cores, "C")],
-          ["CPU Limit", formatMaybe(spec.cpu_limit_cores, "C")],
-          ["内存 Request", formatMaybe(spec.memory_request_gb, "GB")],
-          ["内存 Limit", formatMaybe(spec.memory_limit_gb, "GB")],
+          ["CPU Request / Pod", formatMaybe(spec.cpu_request_cores, "C")],
+          ["CPU Limit / Pod", formatMaybe(spec.cpu_limit_cores, "C")],
+          ["内存 Request / Pod", formatMaybe(spec.memory_request_gb, "GB")],
+          ["内存 Limit / Pod", formatMaybe(spec.memory_limit_gb, "GB")],
           ["CPU 基准", spec.cpu_metric_mode],
           ["内存基准", spec.memory_metric_mode],
         ]
@@ -297,14 +425,28 @@
       .join("");
   }
 
+  function displayResourceId(resource, fallbackResourceId = "") {
+    const raw = String(resource?.resource_id || fallbackResourceId || "");
+    if (!list.isK8s(resource) && !raw.startsWith("k8s:")) return raw;
+    return raw.replace(/^k8s:/, "").split(":").filter(Boolean).join(" / ");
+  }
+
+  function displayDetailTitle(resource, fallbackResourceId = "") {
+    if (resource && list.isK8s(resource)) return list.titleFor(resource);
+    const raw = String(resource?.resource_id || fallbackResourceId || "");
+    if (raw.startsWith("k8s:")) {
+      const parts = raw.split(":").filter(Boolean);
+      return parts[parts.length - 1] || displayResourceId(resource, fallbackResourceId);
+    }
+    return raw || "-";
+  }
+
   function renderAdvice(resource) {
     const advice = resource?.scaling_advice || {};
     const action = list.actionOf(resource);
     const confidence = list.confidenceOf(resource);
     const stats = advice.stats || {};
-    const resourceLabel = list.isK8s(resource) ? "K8S Workload" : "VM";
     const actionText = list.actionLabel(action);
-    const decisionResource = `${resourceLabel} ${resource.resource_id || ""}`;
     app.els.detailConfidence.innerHTML = `置信度 ${list.escapeHtml(list.CONFIDENCE_LABELS[confidence] || confidence)}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""} ${list.infoTooltip(list.CONFIDENCE_HELP, "置信度计算说明")}`;
     app.els.detailConfidence.className = `confidence-chip is-${confidence}`;
     app.els.detailAdvice.innerHTML = `
@@ -312,10 +454,6 @@
         <div class="decision-row">
           <span class="decision-label">建议动作</span>
           <span class="decision-action">${list.escapeHtml(actionText)}</span>
-        </div>
-        <div class="decision-row">
-          <span class="decision-label">资源对象</span>
-          <strong>${list.escapeHtml(decisionResource)}</strong>
         </div>
         <div class="decision-row">
           <span class="decision-label">目标结果</span>
@@ -339,15 +477,15 @@
       action,
       confidence,
       !!advice.has_mixed_signals,
-      { analysisOnly: Boolean(advice.analysis_only), resourceType: list.resourceTypeOf(resource) }
+      { analysisOnly: Boolean(advice.analysis_only), resourceType: list.resourceTypeOf(resource), resource }
     );
   }
 
   function renderMetricTabs(resource, activeMetric) {
-    const metricKeys = list.metricKeysFor(resource);
-    app.els.metricTabs.innerHTML = metricKeys.map((key) => (
-      `<button type="button" class="${key === activeMetric ? "active" : ""}" data-metric-key="${list.escapeHtml(key)}">${list.escapeHtml(app.metricTitleMap[key])}</button>`
-    )).join("");
+    app.els.metricTabs.innerHTML = `
+      <div class="metric-tab-group">${metricButtonsMarkup(resource, activeMetric)}</div>
+      ${chartControlsMarkup()}
+    `;
   }
 
   async function renderChart(resourceId, metricKey) {
@@ -401,7 +539,8 @@
     app.els.detailEmpty.hidden = true;
     app.els.detailContent.hidden = false;
     app.els.detailPanel.classList.add("is-open");
-    app.els.detailTitle.textContent = resourceId;
+    app.els.detailTitle.textContent = displayDetailTitle(null, resourceId);
+    app.els.detailTitle.title = resourceId;
     app.els.detailSubtitle.textContent = "正在加载详情...";
     app.els.detailAdvice.innerHTML = `<div class="chart-state">正在加载建议和图表...</div>`;
     try {
@@ -416,7 +555,8 @@
       if (!metricKeys.includes(activeMetric)) activeMetric = list.triggerMetric(resource);
       app.state.selectedMetricKey = activeMetric;
       app.els.detailType.textContent = list.typeLabel(resource);
-      app.els.detailTitle.textContent = resource.resource_id || resourceId;
+      app.els.detailTitle.textContent = displayDetailTitle(resource, resourceId);
+      app.els.detailTitle.title = resource.resource_id || resourceId;
       app.els.detailSubtitle.textContent = list.subtitleFor(resource);
       renderAdvice(resource);
       renderSpec(resource);
@@ -438,16 +578,42 @@
     }
   }
 
+  async function refreshChartDisplayControls() {
+    if (!app.state.selectedResourceId || !app.state.selectedMetricKey) return;
+    const resource = await ensureResource(app.state.selectedResourceId);
+    renderMetricTabs(resource, app.state.selectedMetricKey);
+    await renderChart(app.state.selectedResourceId, app.state.selectedMetricKey);
+    if (app.els.chartModal && !app.els.chartModal.hidden) {
+      renderModalMetricTabs(resource, app.state.selectedMetricKey);
+      await openChartModal(app.state.selectedMetricKey);
+    }
+  }
+
+  function handleChartControlClick(event) {
+    const rangeBtn = event.target.closest("button[data-chart-range]");
+    const modeBtn = event.target.closest("button[data-chart-mode]");
+    if (!rangeBtn && !modeBtn) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    if (rangeBtn) app.chartRangeKey = rangeBtn.dataset.chartRange || app.chartRangeKey;
+    if (modeBtn) app.chartModeKey = modeBtn.dataset.chartMode || app.chartModeKey;
+    refreshChartDisplayControls();
+    return true;
+  }
+
   window.addEventListener("resize", () => {
     app.detailChartInstance?.resize();
     app.modalChartInstance?.resize();
   });
+
+  app.els.metricTabs?.addEventListener("click", handleChartControlClick);
 
   app.els.chartModal?.addEventListener("click", (event) => {
     if (event.target.closest("[data-chart-modal-dismiss]")) closeChartModal();
   });
 
   app.els.chartModalMetricTabs?.addEventListener("click", (event) => {
+    if (handleChartControlClick(event)) return;
     const btn = event.target.closest("button[data-modal-metric-key]");
     if (!btn) return;
     openChartModal(btn.dataset.modalMetricKey || app.state.selectedMetricKey);

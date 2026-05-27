@@ -26,6 +26,8 @@ def create_scaling_task(
     mode: str = "dry_run",
     operator: str = "",
     allow_create_flavor: bool = False,
+    target_spec_override: Any = None,
+    target_source: str = "",
 ) -> Dict[str, Any]:
     mode = mode if mode in {"dry_run", "execute"} else "dry_run"
     resource_id = str(resource.get("resource_id", "")).strip()
@@ -46,6 +48,7 @@ def create_scaling_task(
         "mode": mode,
         "operator": operator,
         "allow_create_flavor": bool(allow_create_flavor),
+        "target_source": _target_source(target_spec_override, target_source),
         "status": "queued",
         "created_at_ms": now,
         "updated_at_ms": now,
@@ -64,12 +67,36 @@ def create_scaling_task(
     )
     thread = threading.Thread(
         target=_run_task,
-        args=(task_id, resource),
+        args=(task_id, _resource_with_target_override(resource, target_spec_override, target_source)),
         daemon=True,
         name=f"scaling-{task_id}",
     )
     thread.start()
     return task
+
+
+def _target_source(target_spec_override: Any, target_source: str) -> str:
+    explicit = str(target_source or "").strip().lower()
+    if explicit in {"manual", "suggested"}:
+        return explicit
+    return "manual" if isinstance(target_spec_override, dict) else "suggested"
+
+
+def _resource_with_target_override(
+    resource: Dict[str, Any],
+    target_spec_override: Any,
+    target_source: str,
+) -> Dict[str, Any]:
+    if not isinstance(target_spec_override, dict):
+        return resource
+    patched = dict(resource)
+    advice = dict(patched.get("scaling_advice", {}) if isinstance(patched.get("scaling_advice"), dict) else {})
+    action = str(advice.get("action") or "").strip().lower()
+    advice["action"] = action if action and action != "hold" else "manual"
+    advice["target_spec"] = target_spec_override
+    advice["target_source"] = _target_source(target_spec_override, target_source)
+    patched["scaling_advice"] = advice
+    return patched
 
 
 def get_task(task_id: str) -> Optional[Dict[str, Any]]:
