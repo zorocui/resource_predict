@@ -32,10 +32,22 @@ class GenerationConfig:
     resources: int = 15
     # 每个资源每个指标的历史时间点数量。
     n: int = 240
-    # 从历史序列尾部切出的测试集点数，用于评估模型 RMSE。
-    test_size: int = 72
-    # 向未来预测的点数；当前 freq="h" 时 24 表示预测未来 24 小时。
-    future_steps: int = 24
+    # 未设置资源族专用窗口时使用的兜底测试点数。
+    default_test_size: int = 72
+    # 未设置资源族专用窗口时使用的兜底未来预测点数。
+    default_future_steps: int = 24
+    # VM 可单独覆盖预测窗口点数；None 表示沿用 default_* 兜底点数。
+    vm_test_size: Optional[int] = None
+    vm_future_steps: Optional[int] = None
+    # VM 可按目标时长自动换算点数；设置后优先于 vm_*_size/steps。
+    vm_test_duration: Optional[str] = None
+    vm_future_duration: Optional[str] = None
+    # K8S Workload 可单独覆盖预测窗口点数；None 表示沿用 default_* 兜底点数。
+    workload_test_size: Optional[int] = None
+    workload_future_steps: Optional[int] = None
+    # K8S Workload 默认按真实采样频率换算 24 小时测试/预测窗口。
+    workload_test_duration: Optional[str] = "24h"
+    workload_future_duration: Optional[str] = "24h"
     # 演示数据随机种子基准值，保证多次生成结果可复现。
     base_seed: int = 1000
     # 时间序列频率，传给 pandas/预测流程；"h" 表示小时级数据。

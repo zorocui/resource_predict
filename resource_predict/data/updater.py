@@ -30,6 +30,7 @@ from resource_predict.settings import settings
 from resource_predict.data.io import coerce_metric_series, read_raw_dataset, write_raw_dataset
 from resource_predict.pipeline.constants import RAW_DATA_FILENAME
 from resource_predict.pipeline.output_paths import scoped_out_dir, split_items_by_scope
+from resource_predict.pipeline.windowing import infer_series_freq
 from resource_predict.providers.mock import mock_incremental_provider
 from resource_predict.resource_types import metric_names_for_resource
 
@@ -695,6 +696,12 @@ def _do_update(
             _update_status["resources_updated"] = updated_count
             _update_status["resources_created"] = created_count
             _update_status["created_resource_ids"] = list(created_resource_ids)
+        if prepared:
+            try:
+                first_metric = metric_names_for_resource(prepared[0])[0]
+                freq = infer_series_freq(prepared[0][first_metric].index)
+            except Exception:
+                pass
         write_raw_dataset(raw_path, prepared, freq=freq)
 
         logger.info("[updater] 开始重新预测 …")

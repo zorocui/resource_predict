@@ -607,6 +607,18 @@ deploy/forecast_config.json
 
 预测模型默认启用 `seasonal_naive` 和 `prophet`，默认关闭 `rolling_mean` 与 `ensemble`。可以在 Web 页面的“集群配置 -> 预测模型”中启用或关闭 ARIMA、SARIMA、Prophet、Seasonal naive、Rolling mean 和 Ensemble；保存后会写入 `deploy/forecast_config.json`，后续重新预测时生效。
 
+预测窗口由 `resource_predict/settings.py` 中的 `settings.generation` 控制。系统按资源族分别解析窗口：
+
+| 配置 | 作用 | 默认行为 |
+| --- | --- | --- |
+| `default_test_size` / `default_future_steps` | 未设置资源族专用窗口时的兜底点数 | `72` 个测试点、`24` 个未来预测点 |
+| `vm_test_size` / `vm_future_steps` | VM 专用点数覆盖 | `None`，沿用 `default_*` 兜底；默认 VM mock 为小时级，所以相当于 72 小时测试、24 小时预测 |
+| `vm_test_duration` / `vm_future_duration` | VM 专用时长，优先于 VM 点数 | `None` |
+| `workload_test_size` / `workload_future_steps` | K8S Workload 专用点数覆盖 | `None`，未设置时可继续走 `default_*` 兜底 |
+| `workload_test_duration` / `workload_future_duration` | K8S Workload 专用时长，优先于 Workload 点数 | 默认 `24h` / `24h` |
+
+时长配置会根据真实时间序列采样间隔自动换算为点数。例如 K8S Prometheus 默认 `step_seconds=300`，即 5 分钟一个点，`workload_test_duration="24h"` 会换算为 `288` 个测试点，`workload_future_duration="24h"` 会换算为 `288` 个未来预测点。预测产物会在 `summary_index.meta.forecast_window` 和 `generation_stats.forecast_window` 中记录实际生效的点数、时长来源和采样间隔。
+
 ## 9. 验证与维护
 
 ### 9.1 回归检查

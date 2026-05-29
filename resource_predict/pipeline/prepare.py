@@ -98,7 +98,7 @@ def build_prepared_data(
                     prepared_item[metric_name] = coerce_metric_series(metrics.get(metric_name), metric_name)
 
                 min_len = min(len(prepared_item[m]) for m in metric_names_for_resource(prepared_item))
-                if min_len <= test_size:
+                if test_size > 0 and min_len <= test_size:
                     raise ValueError(
                         f"有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
                     )

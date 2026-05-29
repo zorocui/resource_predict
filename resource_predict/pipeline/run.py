@@ -25,6 +25,7 @@ from resource_predict.pipeline.constants import MANIFEST_FILENAME, RAW_DATA_FILE
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
 from resource_predict.pipeline.prepare import ExternalProvider, build_prepared_data
+from resource_predict.pipeline.windowing import infer_series_freq, resolve_forecast_window
 from resource_predict.pipeline.write_outputs import write_prediction_outputs
 from resource_predict.services.forecast_config import read_forecast_config
 
@@ -55,11 +56,9 @@ def generate_forecasts(
     """
     cfg = settings.generation
     out_dir = out_dir or settings.app.out_dir
-    test_size = test_size if test_size is not None else cfg.test_size
-    future_steps = future_steps if future_steps is not None else cfg.future_steps
+    explicit_test_size = test_size
+    explicit_future_steps = future_steps
     timing_enabled = bool(model_timing_mode and model_timing_mode.lower().strip() == "on")
-    if future_steps <= 0:
-        raise ValueError("future_steps 必须为正整数")
     if cfg.detail_chunk_size <= 0:
         raise ValueError("detail_chunk_size 必须为正整数")
 
@@ -102,15 +101,6 @@ def generate_forecasts(
                 if isinstance(x, dict) and x.get("resource_id") is not None
             }
             metric_partial_enabled = bool(existing_items_for_partial and metric_filter_by_id)
-        for p in prepared_data:
-            rid = p["resource_id"]
-            metric_names = metric_names_for_resource(p)
-            min_len = min(len(p[m]) for m in metric_names)
-            if min_len <= test_size:
-                raise ValueError(
-                    f"{rid} 有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
-                )
-        _log_input_stats(prepared_data, resources_ct, test_size, future_steps, freq, predict_only=True)
     else:
         resources = resources if resources is not None else cfg.resources
         n = n if n is not None else cfg.n
@@ -120,7 +110,7 @@ def generate_forecasts(
         prepared_data = build_prepared_data(
             resources=resources,
             n=n,
-            test_size=test_size,
+            test_size=int(explicit_test_size or 0),
             freq=freq,
             base_seed=base_seed,
             data_provider=data_provider,
@@ -130,7 +120,39 @@ def generate_forecasts(
         resources_ct = len(prepared_data)
         if save_raw and data_provider is None:
             write_raw_dataset(raw_path, prepared_data, freq=freq)
-        _log_input_stats(prepared_data, resources_ct, test_size, future_steps, freq, predict_only=False)
+
+    window = resolve_forecast_window(
+        cfg=cfg,
+        items=prepared_data,
+        explicit_test_size=explicit_test_size,
+        explicit_future_steps=explicit_future_steps,
+    )
+    test_size = window.test_size
+    future_steps = window.future_steps
+    try:
+        freq = infer_series_freq(prepared_data[0]["cpu"].index)
+    except Exception:
+        pass
+    if not predict_only and save_raw:
+        write_raw_dataset(raw_path, prepared_data, freq=freq)
+    for p in prepared_data:
+        rid = p["resource_id"]
+        metric_names = metric_names_for_resource(p)
+        min_len = min(len(p[m]) for m in metric_names)
+        if min_len <= test_size:
+            raise ValueError(
+                f"{rid} 有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
+            )
+    _log_input_stats(
+        prepared_data,
+        resources_ct,
+        test_size,
+        future_steps,
+        freq,
+        predict_only=predict_only,
+        window_source=window.source,
+        sample_interval_seconds=window.sample_interval_seconds,
+    )
 
     max_workers, parallel_metrics_enabled, inner_metric_workers = resolve_parallel_plan(
         resources_ct=resources_ct,
@@ -560,6 +582,15 @@ def generate_forecasts(
         active_methods=active_methods,
         test_size=test_size,
         future_steps=future_steps,
+        forecast_window={
+            "resource_family": window.resource_family,
+            "test_size": window.test_size,
+            "future_steps": window.future_steps,
+            "test_duration": window.test_duration,
+            "future_duration": window.future_duration,
+            "sample_interval_seconds": window.sample_interval_seconds,
+            "source": window.source,
+        },
         detail_chunk_size=int(cfg.detail_chunk_size),
         predicted_count=predicted_count,
         partial_resource_ids=partial_resource_ids,
@@ -602,6 +633,8 @@ def _log_input_stats(
     freq: str,
     *,
     predict_only: bool,
+    window_source: str,
+    sample_interval_seconds: Optional[float],
 ) -> None:
     cpu_lens = [len(p["cpu"]) for p in prepared_data]
     n_min, n_max = min(cpu_lens), max(cpu_lens)
@@ -615,7 +648,7 @@ def _log_input_stats(
     if predict_only:
         logger.info(
             "[progress] 仅预测模式：resources=%d, n_input=[%d~%d] (avg=%.1f), "
-            "test_size=%d, future_steps=%d, freq=%s",
+            "test_size=%d, future_steps=%d, freq=%s, sample_interval_seconds=%s, window_source=%s",
             resources_ct,
             n_min,
             n_max,
@@ -623,11 +656,13 @@ def _log_input_stats(
             test_size,
             future_steps,
             freq_display,
+            sample_interval_seconds,
+            window_source,
         )
     else:
         logger.info(
             "[progress] 开始生成：resources=%d, n_input=[%d~%d] (avg=%.1f), "
-            "test_size=%d, future_steps=%d, freq=%s",
+            "test_size=%d, future_steps=%d, freq=%s, sample_interval_seconds=%s, window_source=%s",
             resources_ct,
             n_min,
             n_max,
@@ -635,4 +670,6 @@ def _log_input_stats(
             test_size,
             future_steps,
             freq_display,
+            sample_interval_seconds,
+            window_source,
         )

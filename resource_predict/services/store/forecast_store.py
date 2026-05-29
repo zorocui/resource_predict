@@ -151,10 +151,15 @@ class _SingleForecastStore:
     def _resolve_test_size(self, summary_obj: Optional[Dict[str, Any]]) -> int:
         meta = (summary_obj or {}).get("meta", {}) or {}
         raw_ts = meta.get("test_size")
+        default_test_size = getattr(
+            self._generation_cfg,
+            "default_test_size",
+            getattr(self._generation_cfg, "test_size", 72),
+        )
         try:
-            return self._generation_cfg.test_size if raw_ts is None else int(raw_ts)
+            return default_test_size if raw_ts is None else int(raw_ts)
         except Exception:
-            return self._generation_cfg.test_size
+            return default_test_size
 
     def get_resource_detail(self, resource_id: str) -> Optional[Dict[str, Any]]:
         summary = self.get_summary()
