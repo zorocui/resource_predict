@@ -127,14 +127,40 @@ def generate_forecasts(
         pass
     if not predict_only and save_raw:
         write_raw_dataset(raw_path, prepared_data, freq=freq)
+    skipped_short: List[str] = []
     for p in prepared_data:
         rid = p["resource_id"]
         metric_names = metric_names_for_resource(p)
         min_len = min(len(p[m]) for m in metric_names)
         if min_len <= test_size:
-            raise ValueError(
-                f"{rid} 有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
+            if predict_only:
+                skipped_short.append(rid)
+            else:
+                raise ValueError(
+                    f"{rid} 有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
+                )
+    if skipped_short:
+        for rid in skipped_short:
+            logger.warning(
+                "[progress] 跳过有效点数不足的资源（predict_only 模式）：%s"
+                "（序列长度 ≤ test_size=%d）",
+                rid, test_size,
             )
+        prepared_data = [
+            p for p in prepared_data if p["resource_id"] not in set(skipped_short)
+        ]
+        resources_ct = len(prepared_data)
+        if partial_resource_ids:
+            partial_resource_ids = {
+                rid for rid in partial_resource_ids if rid not in set(skipped_short)
+            }
+        if resources_ct == 0:
+            logger.warning(
+                "[progress] 所有待预测资源均因有效点数不足被跳过，"
+                "本次不执行预测（test_size=%d）",
+                test_size,
+            )
+            return []
     _log_input_stats(
         prepared_data,
         resources_ct,
