@@ -6,6 +6,9 @@ from typing import Dict, List
 import numpy as np
 
 from resource_predict.settings import settings
+from resource_predict.utils import compute_metric_stats, resolve_policy_tier
+
+_VM_TIER_FIELDS = ("namespace", "cluster", "owner_name", "service", "app", "env")
 
 
 def _normalize_spec(spec: Dict[str, object]) -> Dict[str, int]:
@@ -27,23 +30,6 @@ _METRIC_TO_DIM = {
     "memory": "memory_gb",
     "disk": "disk_gb",
 }
-
-
-def _policy_tier_for_spec(spec: Dict[str, object]) -> str:
-    cfg = settings.decision
-    explicit = str((spec or {}).get("policy_tier") or "").lower().strip()
-    if explicit in {"conservative", "balanced", "aggressive"}:
-        return explicit
-    text = " ".join(
-        str((spec or {}).get(k) or "").lower()
-        for k in ("namespace", "cluster", "owner_name", "service", "app", "env")
-    )
-    if any(x and x in text for x in cfg.conservative_namespaces):
-        return "conservative"
-    if any(x and x in text for x in cfg.aggressive_namespaces):
-        return "aggressive"
-    default = str(cfg.default_policy_tier or "balanced").lower().strip()
-    return default if default in {"conservative", "balanced", "aggressive"} else "balanced"
 
 
 def _policy_thresholds(tier: str) -> Dict[str, float]:
@@ -349,28 +335,6 @@ def _max_consecutive(values: np.ndarray, predicate) -> int:
     return best
 
 
-def _metric_stats(values: np.ndarray) -> Dict[str, float]:
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return {
-            "avg": 0.0,
-            "p95": 0.0,
-            "peak": 0.0,
-            "valley": 0.0,
-            "gap": 0.0,
-            "std": 0.0,
-        }
-    peak = float(np.max(arr))
-    valley = float(np.min(arr))
-    return {
-        "avg": float(np.mean(arr)),
-        "p95": float(np.percentile(arr, 95)),
-        "peak": peak,
-        "valley": valley,
-        "gap": peak - valley,
-        "std": float(np.std(arr)),
-    }
-
 
 def _trend_features(values: np.ndarray, window: int) -> Dict[str, float]:
     arr = np.asarray(values, dtype=float)
@@ -523,7 +487,7 @@ def build_scaling_advice(
     - stats: 每个指标的统计与趋势特征（avg/p95/peak/gap/slope/...）
     """
     cfg = settings.decision
-    policy_tier = _policy_tier_for_spec(current_spec or {})
+    policy_tier = resolve_policy_tier(current_spec or {}, fields=_VM_TIER_FIELDS)
     policy_thresholds = _policy_thresholds(policy_tier)
     by_metric: Dict[str, Dict[str, float]] = {}
     metric_actions: Dict[str, str] = {}
@@ -532,7 +496,7 @@ def build_scaling_advice(
 
     for metric in ("cpu", "memory", "disk"):
         vals = np.asarray(metric_future_values.get(metric, np.array([])), dtype=float)
-        st = _metric_stats(vals)
+        st = compute_metric_stats(vals, extended=True, filter_nonfinite=False)
         tr = _trend_features(vals, cfg.trend_window_points)
         st.update(tr)
         high_streak = _max_consecutive(vals, lambda x: x >= cfg.consecutive_high_threshold)

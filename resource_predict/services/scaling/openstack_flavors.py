@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import shlex
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from resource_predict.services.scaling.command_runner import run_ssh_command
+from resource_predict.utils import parse_float_or_none, require_float
 
 
 logger = logging.getLogger(__name__)
 _CACHE: Dict[str, Dict[str, Any]] = {}
+# 保护 _CACHE 的读写，避免多个调配线程并发触发 flavor 发现时出现竞态
+_CACHE_LOCK = threading.Lock()
 
 
 class FlavorDiscoveryError(RuntimeError):
@@ -44,9 +48,12 @@ def discover_openstack_flavors(cluster_name: str, cluster_config: Dict[str, Any]
     cache_seconds = int(cluster_config.get("flavor_cache_seconds", 300))
     cache_key = _cache_key(cluster_name, cluster_config)
     now = time.time()
-    cached = _CACHE.get(cache_key)
-    if cached and now - float(cached.get("ts", 0)) <= cache_seconds:
-        return list(cached.get("flavors", []))
+
+    # 快速读缓存（锁内），命中直接返回，避免无谓的 SSH 调用
+    with _CACHE_LOCK:
+        cached = _CACHE.get(cache_key)
+        if cached and now - float(cached.get("ts", 0)) <= cache_seconds:
+            return list(cached.get("flavors", []))
 
     command = f"{_openstack_prefix(cluster_config)}openstack flavor list -f json"
     timeout = int(cluster_config.get("flavor_discovery_timeout_seconds") or cluster_config.get("command_timeout_seconds", 300))
@@ -66,7 +73,11 @@ def discover_openstack_flavors(cluster_name: str, cluster_config: Dict[str, Any]
         flavors = [flavor for flavor in flavors if flavor.name in allowed]
     if not flavors:
         raise FlavorDiscoveryError(f"no OpenStack flavors discovered for cluster {cluster_name}")
-    _CACHE[cache_key] = {"ts": now, "flavors": flavors}
+
+    # 写回缓存（锁内）；其他并发线程若已写入同 key，覆盖无害（数据相同）
+    with _CACHE_LOCK:
+        _CACHE[cache_key] = {"ts": time.time(), "flavors": flavors}
+
     logger.info("[scaling] discovered openstack flavors: cluster=%s count=%d", cluster_name, len(flavors))
     return flavors
 
@@ -78,10 +89,10 @@ def select_flavor_for_target(
     current_spec: Dict[str, Any],
     flavors: List[Flavor],
 ) -> tuple[Flavor, List[str]]:
-    target_cpu = _required_num(target_spec.get("cpu_cores"), "target cpu_cores")
-    target_mem = _required_num(target_spec.get("memory_gb"), "target memory_gb")
-    target_disk = _required_num(target_spec.get("disk_gb"), "target disk_gb")
-    current_disk = _num(current_spec.get("disk_gb")) or target_disk
+    target_cpu = require_float(target_spec.get("cpu_cores"), "target cpu_cores", error_cls=FlavorDiscoveryError)
+    target_mem = require_float(target_spec.get("memory_gb"), "target memory_gb", error_cls=FlavorDiscoveryError)
+    target_disk = require_float(target_spec.get("disk_gb"), "target disk_gb", error_cls=FlavorDiscoveryError)
+    current_disk = parse_float_or_none(current_spec.get("disk_gb")) or target_disk
     warnings: List[str] = []
 
     exact = [
@@ -128,9 +139,9 @@ def _parse_flavors(rows: Any) -> List[Flavor]:
         if not isinstance(row, dict):
             continue
         name = str(row.get("Name") or row.get("name") or "").strip()
-        vcpus = _num(row.get("VCPUs") or row.get("vcpus"))
-        ram_mb = _num(row.get("RAM") or row.get("ram"))
-        disk_gb = _num(row.get("Disk") or row.get("disk"))
+        vcpus = parse_float_or_none(row.get("VCPUs") or row.get("vcpus"))
+        ram_mb = parse_float_or_none(row.get("RAM") or row.get("ram"))
+        disk_gb = parse_float_or_none(row.get("Disk") or row.get("disk"))
         if not name or vcpus is None or ram_mb is None or disk_gb is None:
             continue
         flavors.append(Flavor(name=name, vcpus=vcpus, memory_gb=ram_mb / 1024.0, disk_gb=disk_gb, raw=row))
@@ -173,20 +184,6 @@ def _cache_key(cluster_name: str, cluster_config: Dict[str, Any]) -> str:
     rc = str(cluster_config.get("openstack_rc", "")).strip()
     allowed = ",".join(sorted(_allowed_flavors(cluster_config)))
     return f"{cluster_name}|{user}@{host}|{rc}|{allowed}"
-
-
-def _required_num(value: Any, name: str) -> float:
-    n = _num(value)
-    if n is None:
-        raise FlavorDiscoveryError(f"missing {name}")
-    return n
-
-
-def _num(value: Any) -> Optional[float]:
-    try:
-        return float(value)
-    except Exception:
-        return None
 
 
 def _fmt_num(value: float) -> str:

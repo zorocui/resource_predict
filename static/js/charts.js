@@ -75,11 +75,13 @@
     return bucket;
   }
 
-  function resolveChartWindow(xTrain, xTest, xPredFuture) {
+  function resolveChartWindow(xTrain, xTest, xPredFuture, isVm) {
     const allTimes = collectTimes([xTrain, xTest, xPredFuture]);
     if (!allTimes.length) return { min: undefined, max: undefined, spanMs: 0 };
     const fullMin = allTimes[0];
     const fullMax = allTimes[allTimes.length - 1];
+    // VM 资源始终显示全部原始数据
+    if (isVm) return { min: fullMin, max: fullMax, spanMs: fullMax - fullMin };
     const selectedRange = chartRange();
     if (!selectedRange.durationMs) {
       return { min: fullMin, max: fullMax, spanMs: fullMax - fullMin };
@@ -98,8 +100,9 @@
     return pairs.filter((pair) => pair[0] >= min && pair[0] <= max);
   }
 
-  function chooseBucketMs(spanMs, pointCount) {
-    if (chartMode().key === "raw" || !Number.isFinite(spanMs) || spanMs <= 12 * HOUR_MS) return 0;
+  function chooseBucketMs(spanMs, pointCount, isVm) {
+    // VM 资源直接显示原始数据点，不做聚合
+    if (isVm || chartMode().key === "raw" || !Number.isFinite(spanMs) || spanMs <= 12 * HOUR_MS) return 0;
     if (spanMs <= 3 * DAY_MS) return 15 * MINUTE_MS;
     if (spanMs <= 14 * DAY_MS) return HOUR_MS;
     return pointCount > 2000 ? 6 * HOUR_MS : HOUR_MS;
@@ -122,9 +125,9 @@
       .map(([ts, stats]) => [ts, modeKey === "peak" ? stats.max : stats.sum / stats.count]);
   }
 
-  function prepareSeriesData(pairs, windowInfo) {
+  function prepareSeriesData(pairs, windowInfo, isVm) {
     const visible = filterPairsByWindow(pairs, windowInfo);
-    return aggregatePairs(visible, chooseBucketMs(windowInfo.spanMs, visible.length));
+    return aggregatePairs(visible, chooseBucketMs(windowInfo.spanMs, visible.length, isVm));
   }
 
   function buildTimeAxisConfigFromPairs(groups, windowInfo) {
@@ -144,8 +147,9 @@
     };
   }
 
-  function buildChartOption(chartData, metricKey) {
+  function buildChartOption(chartData, metricKey, displayUnit = "percent", resource = null) {
     const bestMethod = chartData.best_method;
+    const isVm = resource ? !list.isK8s(resource) : false;
     const xTrain = Array.isArray(chartData.x_train_ms) ? chartData.x_train_ms : [];
     const yTrain = Array.isArray(chartData.y_train) ? chartData.y_train : [];
     const xTest = Array.isArray(chartData.x_test_ms) ? chartData.x_test_ms : [];
@@ -155,20 +159,24 @@
     const anchorVal = yTrain.length ? yTrain[yTrain.length - 1] : null;
     const rawTrainPairs = toPairs(xTrain, yTrain);
     const rawTestPairs = toPairs(anchorTs == null ? xTest : [anchorTs].concat(xTest), anchorVal == null ? yTest : [anchorVal].concat(yTest));
-    const windowInfo = resolveChartWindow(xTrain, xTest, xPredFuture);
+    const windowInfo = resolveChartWindow(xTrain, xTest, xPredFuture, isVm);
     const activeMode = chartMode();
+    // VM 资源强制显示原始数据模式标题
+    const modeLabel = isVm ? "原始" : activeMode.label;
+    const isPercentMode = displayUnit === "percent";
     const series = [{
       name: "历史",
       type: "line",
-      data: prepareSeriesData(rawTrainPairs, windowInfo),
+      data: prepareSeriesData(rawTrainPairs, windowInfo, isVm),
       showSymbol: false,
       sampling: "lttb",
-      lineStyle: { color: "#2563eb", width: 1.35, opacity: activeMode.key === "raw" ? 0.55 : 0.78 },
+      lineStyle: { color: "#2563eb", width: 1.35, opacity: (isVm || activeMode.key === "raw") ? 0.55 : 0.78 },
       itemStyle: { color: "#2563eb" },
       z: 2,
     }];
 
-    if (app.chartAuxiliaryVisible) {
+    // 只在百分比模式下显示阈值辅助线；绝对值模式（cores/GB）下阈值无意义
+    if (app.chartAuxiliaryVisible && isPercentMode) {
       const futureStart = xPredFuture.length ? normalizeTsMs(xPredFuture[0]) : null;
       const futureEnd = xPredFuture.length ? normalizeTsMs(xPredFuture[xPredFuture.length - 1]) : null;
       const thresholds = metricThresholds(metricKey);
@@ -200,7 +208,7 @@
     series.push({
       name: "测试",
       type: "line",
-      data: prepareSeriesData(rawTestPairs, windowInfo),
+      data: prepareSeriesData(rawTestPairs, windowInfo, isVm),
       showSymbol: false,
       sampling: "lttb",
       lineStyle: { color: "#dc2626", width: 2.1 },
@@ -233,7 +241,7 @@
       series.push({
         name: label,
         type: "line",
-        data: prepareSeriesData(rawPredPairs, windowInfo),
+        data: prepareSeriesData(rawPredPairs, windowInfo, isVm),
         showSymbol: false,
         sampling: "lttb",
         lineStyle: {
@@ -253,7 +261,7 @@
       backgroundColor: "transparent",
       animation: false,
       title: {
-        text: `${app.metricTitleMap[metricKey] || metricKey} 预测 · ${activeMode.label}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
+        text: `${app.metricTitleMap[metricKey] || metricKey} 预测 · ${modeLabel}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
         left: "center",
         top: 6,
         textStyle: { color: "#0f172a", fontSize: 13, fontWeight: 800 },
@@ -268,7 +276,7 @@
             const raw = Array.isArray(p.value) ? p.value[1] : p.value;
             const num = Number(raw);
             html += Number.isFinite(num)
-              ? `${p.marker}${p.seriesName}: ${(num * 100).toFixed(2)}%<br/>`
+              ? `${p.marker}${p.seriesName}: ${list.formatStatValue(num, displayUnit)}<br/>`
               : `${p.marker}${p.seriesName}: ${raw}<br/>`;
           }
           return html;
@@ -295,7 +303,15 @@
       yAxis: {
         type: "value",
         min: 0,
-        axisLabel: { color: "#64748b", formatter: (v) => `${(Number(v) * 100).toFixed(0)}%` },
+        axisLabel: {
+          color: "#64748b",
+          formatter: (v) => {
+            if (!Number.isFinite(v)) return "-";
+            if (displayUnit === "cores") return `${Math.round(v)} C`;
+            if (displayUnit === "gb") return `${Math.round(v)} GB`;
+            return `${Math.round(v * 100)}%`;
+          },
+        },
         splitLine: { lineStyle: { color: "rgba(15,23,42,.08)" } },
       },
       dataZoom: [
@@ -363,7 +379,9 @@
     return `<button type="button" class="${stateKey === option.key ? "active" : ""}${extraClass}" data-chart-${group}="${list.escapeHtml(option.key)}">${list.escapeHtml(option.label)}</button>`;
   }
 
-  function chartControlsMarkup() {
+  function chartControlsMarkup(resource) {
+    // VM 资源不显示时间范围和显示模式选择器
+    if (resource && !list.isK8s(resource)) return "";
     return `
       <div class="chart-control-group" aria-label="图表时间范围">
         ${CHART_RANGES.map((option) => chartButton(option, "range")).join("")}
@@ -385,16 +403,18 @@
     if (!app.els.chartModalMetricTabs) return;
     app.els.chartModalMetricTabs.innerHTML = `
       <div class="metric-tab-group">${metricButtonsMarkup(resource, activeMetric, true)}</div>
-      ${chartControlsMarkup()}
+      ${chartControlsMarkup(resource)}
     `;
   }
 
   function renderSpec(resource) {
     const spec = resource?.spec || {};
+    // 原始值为 null/undefined/"" 时返回 null，让外层 filter 能识别并隐藏该字段
+    // 只有真实存在的值才格式化为 "数字 单位"
     const formatMaybe = (value, unit, digits = 2) => {
-      if (value === undefined || value === null || value === "") return "-";
+      if (value === undefined || value === null || value === "") return null;
       const text = list.formatNumber(value, digits);
-      return text === "-" ? "-" : `${text} ${unit}`;
+      return text === "-" ? null : `${text} ${unit}`;
     };
     const entries = list.isK8s(resource)
       ? [
@@ -415,12 +435,14 @@
       : [
           ["集群", spec.cluster],
           ["IP", spec.ip],
-          ["CPU", `${list.formatNumber(spec.cpu_cores, 0)} 核`],
-          ["内存", `${list.formatNumber(spec.memory_gb, 0)} GB`],
-          ["磁盘", `${list.formatNumber(spec.disk_gb, 0)} GB`],
+          ["CPU", formatMaybe(spec.cpu_cores, "核", 0)],
+          ["内存", formatMaybe(spec.memory_gb, "GB", 0)],
+          ["磁盘", formatMaybe(spec.disk_gb, "GB", 0)],
         ];
     app.els.detailSpec.innerHTML = entries
-      .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
+      .filter(([, value]) =>
+        value !== undefined && value !== null && String(value).trim() !== "" && String(value) !== "-"
+      )
       .map(([label, value]) => `<div class="spec-item"><span>${list.escapeHtml(label)}</span><strong title="${list.escapeHtml(value)}">${list.escapeHtml(value)}</strong></div>`)
       .join("");
   }
@@ -464,10 +486,11 @@
         ${list.metricKeysFor(resource).map((key) => {
           const st = stats[key] || {};
           const mAction = String(advice.metric_actions?.[key] || "hold");
+          const unit = list.resolveDisplayUnit(resource, key);
           return `<div class="reason-item">
             <span class="reason-metric">${list.escapeHtml(app.metricTitleMap[key])}</span>
             <strong class="reason-action">${list.escapeHtml(list.actionLabel(mAction))}</strong>
-            <small class="reason-stats">平均 ${list.formatPct(st.avg)} · P95 ${list.formatPct(st.p95)} · 峰值 ${list.formatPct(st.peak)}</small>
+            <small class="reason-stats">平均 ${list.formatStatValue(st.avg, unit)} · P95 ${list.formatStatValue(st.p95, unit)} · 峰值 ${list.formatStatValue(st.peak, unit)}</small>
           </div>`;
         }).join("")}
       </div>`;
@@ -484,11 +507,11 @@
   function renderMetricTabs(resource, activeMetric) {
     app.els.metricTabs.innerHTML = `
       <div class="metric-tab-group">${metricButtonsMarkup(resource, activeMetric)}</div>
-      ${chartControlsMarkup()}
+      ${chartControlsMarkup(resource)}
     `;
   }
 
-  async function renderChart(resourceId, metricKey) {
+  async function renderChart(resourceId, metricKey, resource = null) {
     disposeDetailChart();
     app.els.detailChart.innerHTML = "";
     const key = `${resourceId}:${metricKey}`;
@@ -501,8 +524,9 @@
       app.els.detailChart.innerHTML = `<div class="chart-state is-error">ECharts 未加载</div>`;
       return;
     }
+    const displayUnit = list.resolveDisplayUnit(resource, metricKey);
     app.detailChartInstance = echarts.init(app.els.detailChart, null, { renderer: app.ECHARTS_RENDERER });
-    app.detailChartInstance.setOption(buildChartOption(data, metricKey), { notMerge: true, lazyUpdate: false });
+    app.detailChartInstance.setOption(buildChartOption(data, metricKey, displayUnit, resource), { notMerge: true, lazyUpdate: false });
     requestAnimationFrame(() => app.detailChartInstance?.resize());
   }
 
@@ -525,8 +549,9 @@
     renderModalMetricTabs(resource, activeMetric);
     app.els.chartModalChart.innerHTML = "";
     app.modalChartInstance = echarts.init(app.els.chartModalChart, null, { renderer: app.ECHARTS_RENDERER });
-    app.modalChartInstance.setOption(buildChartOption(data, activeMetric), { notMerge: true, lazyUpdate: false });
-    renderChart(app.state.selectedResourceId, activeMetric);
+    const displayUnit = list.resolveDisplayUnit(resource, activeMetric);
+    app.modalChartInstance.setOption(buildChartOption(data, activeMetric, displayUnit, resource), { notMerge: true, lazyUpdate: false });
+    renderChart(app.state.selectedResourceId, activeMetric, resource);
     requestAnimationFrame(() => app.modalChartInstance?.resize());
   }
 
@@ -561,19 +586,20 @@
       renderAdvice(resource);
       renderSpec(resource);
       renderMetricTabs(resource, activeMetric);
-      await renderChart(resource.resource_id || resourceId, activeMetric);
+      await renderChart(resource.resource_id || resourceId, activeMetric, resource);
     } catch (e) {
       app.els.detailSubtitle.textContent = "加载失败";
       app.els.detailAdvice.innerHTML = `<div class="chart-state is-error">详情加载失败：${list.escapeHtml(e.message || e)}</div>`;
     }
   }
 
-  function toggleChartAuxiliary() {
+  async function toggleChartAuxiliary() {
     app.chartAuxiliaryVisible = !app.chartAuxiliaryVisible;
     app.els.chartGuideBtn.textContent = app.chartAuxiliaryVisible ? "辅助线：开" : "辅助线：关";
     app.els.chartGuideBtn.setAttribute("aria-pressed", app.chartAuxiliaryVisible ? "true" : "false");
     if (app.state.selectedResourceId && app.state.selectedMetricKey) {
-      renderChart(app.state.selectedResourceId, app.state.selectedMetricKey);
+      const resource = await ensureResource(app.state.selectedResourceId);
+      renderChart(app.state.selectedResourceId, app.state.selectedMetricKey, resource);
       if (app.els.chartModal && !app.els.chartModal.hidden) openChartModal();
     }
   }
@@ -582,7 +608,7 @@
     if (!app.state.selectedResourceId || !app.state.selectedMetricKey) return;
     const resource = await ensureResource(app.state.selectedResourceId);
     renderMetricTabs(resource, app.state.selectedMetricKey);
-    await renderChart(app.state.selectedResourceId, app.state.selectedMetricKey);
+    await renderChart(app.state.selectedResourceId, app.state.selectedMetricKey, resource);
     if (app.els.chartModal && !app.els.chartModal.hidden) {
       renderModalMetricTabs(resource, app.state.selectedMetricKey);
       await openChartModal(app.state.selectedMetricKey);

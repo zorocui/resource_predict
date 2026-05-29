@@ -81,6 +81,10 @@ def _effective_spec(plan: Any) -> Dict[str, Any]:
             effective["flavor"] = selected["name"]
             effective["target_flavor"] = selected["name"]
     effective["last_scaled_at_epoch_ms"] = int(time.time() * 1000)
+    # K8S 副本数：将目标副本同步到 replicas_observed，
+    # 使前端在调配完成后立即显示正确的副本数，无需等待下一次 Prometheus 拉取。
+    if effective.get("replicas") is not None:
+        effective["replicas_observed"] = effective["replicas"]
     return effective
 
 

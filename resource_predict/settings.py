@@ -180,12 +180,19 @@ class K8SPrometheusConfig:
     history_days: int = 7
     # Prometheus range query 步长，单位秒；300 表示 5 分钟一个点。
     step_seconds: int = 300
+    # rate() 计算窗口，例如 "5m"、"10m"；建议为 step_seconds 的 2~4 倍。
+    # 单集群未配置时使用该值作为默认值。
+    rate_window: str = "5m"
     # 全局命名空间过滤正则；单集群未配置 namespace_regex 时使用该值。
     namespace_regex: str = ""
     # Prometheus HTTP 请求超时时间，单位秒。
     request_timeout_seconds: int = 30
     # 多集群拉取时是否遇到任一集群失败就立即中断；False 表示尽量保留成功集群。
     fail_fast: bool = False
+    # 是否启用 K8S Prometheus 后台定时拉取；关闭时仍可手动通过 API 或 CLI 触发。
+    scheduled_update_enabled: bool = False
+    # K8S Prometheus 定时拉取间隔，单位分钟。
+    scheduled_update_interval_minutes: int = 360
 
 
 @dataclass(frozen=True)

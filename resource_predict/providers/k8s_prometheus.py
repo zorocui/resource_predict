@@ -66,6 +66,7 @@ class PrometheusTarget:
     history_days: int
     step_seconds: int
     request_timeout_seconds: int
+    rate_window: str = "5m"
 
 
 ContainerKey = Tuple[str, str, str]
@@ -164,7 +165,7 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
     query_counts: Dict[str, int] = {}
     try:
         cpu_usage_rows = client.query_range(
-            f"rate(container_cpu_usage_seconds_total{{{selector}}}[10m])",
+            f"rate(container_cpu_usage_seconds_total{{{selector}}}[{target.rate_window}])",
             start=start,
             end=end,
             step=step,
@@ -335,10 +336,10 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
     )
     cpu_usage_by_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners)
     mem_usage_by_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners)
-    cpu_request_by_workload = _sum_values_by_workload(cpu_request, target.cluster, pod_owners)
-    cpu_limit_by_workload = _sum_values_by_workload(cpu_limit, target.cluster, pod_owners)
-    mem_request_by_workload = _sum_values_by_workload(mem_request, target.cluster, pod_owners)
-    mem_limit_by_workload = _sum_values_by_workload(mem_limit, target.cluster, pod_owners)
+    cpu_request_by_workload, cpu_request_pod_counts = _sum_values_by_workload(cpu_request, target.cluster, pod_owners)
+    cpu_limit_by_workload, cpu_limit_pod_counts = _sum_values_by_workload(cpu_limit, target.cluster, pod_owners)
+    mem_request_by_workload, mem_request_pod_counts = _sum_values_by_workload(mem_request, target.cluster, pod_owners)
+    mem_limit_by_workload, mem_limit_pod_counts = _sum_values_by_workload(mem_limit, target.cluster, pod_owners)
     metadata_by_workload = _workload_metadata(
         target.cluster,
         set(cpu_usage) | set(mem_usage),
@@ -374,11 +375,23 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
         mem_norm = _regularize_series(mem_norm, step)
         namespace, owner_kind, owner_name = key
         meta = metadata_by_workload.get(key, {})
-        replicas_observed = len(meta.get("pods", []))
+        # 优先使用 kube-state-metrics 上报的控制器副本数（spec/status replicas），
+        # 它来自 K8s API 是权威值；仅当 kube-state-metrics 无数据时才回退到
+        # Prometheus 中有容器指标的 pod 数，避免某个 pod 未上报指标时低估副本数。
+        kube_replicas = replica_values.get(key)
+        if kube_replicas is not None and kube_replicas > 0:
+            replicas_observed = kube_replicas
+        else:
+            replicas_observed = len(meta.get("pods", []))
         cpu_request_total = cpu_request_by_workload.get(key)
         cpu_limit_total = cpu_limit_by_workload.get(key)
         mem_request_total = mem_request_by_workload.get(key)
         mem_limit_total = mem_limit_by_workload.get(key)
+        # 用实际有该指标的 pod 数做除数，避免未上报指标的 pod 拉低单 pod 均值
+        cpu_request_pod_ct = cpu_request_pod_counts.get(key, replicas_observed)
+        cpu_limit_pod_ct = cpu_limit_pod_counts.get(key, replicas_observed)
+        mem_request_pod_ct = mem_request_pod_counts.get(key, replicas_observed)
+        mem_limit_pod_ct = mem_limit_pod_counts.get(key, replicas_observed)
         spec = {
             "cluster": target.cluster,
             "namespace": namespace,
@@ -390,10 +403,10 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
             "containers_observed": sorted(meta.get("containers", [])),
             "replicas": replica_values.get(key),
             "replicas_observed": replicas_observed,
-            "cpu_request_cores": _per_pod_value(cpu_request_total, replicas_observed),
-            "cpu_limit_cores": _per_pod_value(cpu_limit_total, replicas_observed),
-            "memory_request_gb": _bytes_to_gb(_per_pod_value(mem_request_total, replicas_observed)),
-            "memory_limit_gb": _bytes_to_gb(_per_pod_value(mem_limit_total, replicas_observed)),
+            "cpu_request_cores": _per_pod_value(cpu_request_total, cpu_request_pod_ct),
+            "cpu_limit_cores": _per_pod_value(cpu_limit_total, cpu_limit_pod_ct),
+            "memory_request_gb": _bytes_to_gb(_per_pod_value(mem_request_total, mem_request_pod_ct)),
+            "memory_limit_gb": _bytes_to_gb(_per_pod_value(mem_limit_total, mem_limit_pod_ct)),
             "cpu_request_cores_total": cpu_request_total,
             "cpu_limit_cores_total": cpu_limit_total,
             "memory_request_gb_total": _bytes_to_gb(mem_request_total),
@@ -448,6 +461,7 @@ def _resolve_targets() -> List[PrometheusTarget]:
                 history_days=int(cfg.history_days),
                 step_seconds=int(cfg.step_seconds),
                 request_timeout_seconds=int(cfg.request_timeout_seconds),
+                rate_window=str(data.get("rate_window") or cfg.rate_window or "5m").strip(),
             )
         )
     if invalid:
@@ -496,6 +510,7 @@ def _target_to_dict(item: Any) -> Dict[str, Any]:
         "namespace_regex": getattr(item, "namespace_regex", ""),
         "bearer_token": getattr(item, "bearer_token", ""),
         "basic_auth": getattr(item, "basic_auth", ""),
+        "rate_window": getattr(item, "rate_window", ""),
     }
 
 
@@ -684,14 +699,21 @@ def _sum_values_by_workload(
     values_by_container: Dict[ContainerKey, float],
     cluster: str,
     pod_owners: Dict[Tuple[str, str], Tuple[str, str]],
-) -> Dict[WorkloadKey, float]:
+) -> Tuple[Dict[WorkloadKey, float], Dict[WorkloadKey, int]]:
     out: Dict[WorkloadKey, float] = {}
+    pod_counts: Dict[WorkloadKey, set] = {}
     for key, value in values_by_container.items():
         wk = _workload_key(key, pod_owners)
         if wk is None:
             continue
         out[wk] = out.get(wk, 0.0) + float(value)
-    return out
+        # 记录有该指标的 pod（namespace + pod_name），用于后续按 pod 数求均值
+        namespace, pod, _container = key
+        pod_counts.setdefault(wk, set()).add((namespace, pod))
+    pod_counts_int: Dict[WorkloadKey, int] = {
+        wk: len(pods) for wk, pods in pod_counts.items()
+    }
+    return out, pod_counts_int
 
 
 def _workload_metadata(

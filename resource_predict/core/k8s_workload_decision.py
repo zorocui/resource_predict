@@ -6,18 +6,14 @@ import numpy as np
 
 from resource_predict.resource_types import resource_type_of
 from resource_predict.settings import settings
+from resource_predict.utils import (
+    compute_metric_stats,
+    parse_positive_finite,
+    parse_positive_int,
+    resolve_policy_tier,
+)
 
-
-def _stats(values: np.ndarray) -> Dict[str, float]:
-    arr = np.asarray(values, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return {"avg": 0.0, "p95": 0.0, "peak": 0.0}
-    return {
-        "avg": float(np.mean(arr)),
-        "p95": float(np.percentile(arr, 95)),
-        "peak": float(np.max(arr)),
-    }
+_K8S_TIER_FIELDS = ("namespace", "cluster", "owner_name", "workload_name", "pod")
 
 
 def _quality_level(resource: Dict[str, Any], metric: str) -> str:
@@ -36,31 +32,6 @@ def _has_denominator(spec: Dict[str, Any], metric: str) -> bool:
     if metric == "memory":
         return bool(spec.get("memory_limit_gb") or spec.get("memory_request_gb"))
     return False
-
-
-def _num(value: Any) -> float | None:
-    try:
-        v = float(value)
-    except Exception:
-        return None
-    return v if np.isfinite(v) and v > 0 else None
-
-
-def _policy_tier(spec: Dict[str, Any]) -> str:
-    cfg = settings.decision
-    explicit = str(spec.get("policy_tier") or "").lower().strip()
-    if explicit in {"conservative", "balanced", "aggressive"}:
-        return explicit
-    text = " ".join(
-        str(spec.get(k) or "").lower()
-        for k in ("namespace", "cluster", "owner_name", "workload_name", "pod")
-    )
-    if any(x and x in text for x in cfg.conservative_namespaces):
-        return "conservative"
-    if any(x and x in text for x in cfg.aggressive_namespaces):
-        return "aggressive"
-    default = str(cfg.default_policy_tier or "balanced").lower().strip()
-    return default if default in {"conservative", "balanced", "aggressive"} else "balanced"
 
 
 def _target_utilization(tier: str, action: str) -> float:
@@ -95,8 +66,8 @@ def _recommend_k8s_policy(
 ) -> Dict[str, Any]:
     policy: Dict[str, Any] = {"policy_tier": tier, "recommendations": {}, "notes": []}
     bases = {
-        "cpu": _num(spec.get("cpu_request_cores")) or _num(spec.get("cpu_limit_cores")),
-        "memory": _num(spec.get("memory_limit_gb")) or _num(spec.get("memory_request_gb")),
+        "cpu": parse_positive_finite(spec.get("cpu_request_cores")) or parse_positive_finite(spec.get("cpu_limit_cores")),
+        "memory": parse_positive_finite(spec.get("memory_limit_gb")) or parse_positive_finite(spec.get("memory_request_gb")),
     }
     for metric, base in bases.items():
         action = metric_actions.get(metric, "hold")
@@ -115,7 +86,7 @@ def _recommend_k8s_policy(
             request = _round_k8s_even_target(target, action=action, base=base)
             if request is None:
                 continue
-            limit_base = _num(spec.get("cpu_limit_cores"))
+            limit_base = parse_positive_finite(spec.get("cpu_limit_cores"))
             limit = _round_k8s_even_target_limit(
                 request * 1.25,
                 action=action,
@@ -133,7 +104,7 @@ def _recommend_k8s_policy(
             request = _round_k8s_even_target(target, action=action, base=base)
             if request is None:
                 continue
-            limit_base = _num(spec.get("memory_limit_gb"))
+            limit_base = parse_positive_finite(spec.get("memory_limit_gb"))
             limit = _round_k8s_even_target_limit(
                 request * 1.2,
                 action=action,
@@ -193,7 +164,7 @@ def _recommend_replicas(
 ) -> Dict[str, Any] | None:
     if not _supports_replica_scaling(spec):
         return None
-    current = _positive_int(spec.get("replicas") or spec.get("current_replicas") or spec.get("replicas_observed"))
+    current = parse_positive_int(spec.get("replicas") or spec.get("current_replicas") or spec.get("replicas_observed"))
     if current is None:
         return None
     actions = set(metric_actions.values())
@@ -236,14 +207,6 @@ def _recommend_replicas(
         "target_utilization": target_util,
         "action": "scale_in_candidate",
     }
-
-
-def _positive_int(value: Any) -> int | None:
-    try:
-        parsed = int(float(value))
-    except Exception:
-        return None
-    return parsed if parsed > 0 else None
 
 
 def _target_spec_from_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
@@ -300,9 +263,9 @@ def build_k8s_workload_advice(
     spec = resource.get("spec", {})
     if not isinstance(spec, dict):
         spec = {}
-    tier = _policy_tier(spec)
+    tier = resolve_policy_tier(spec, fields=_K8S_TIER_FIELDS)
 
-    by_metric = {m: _stats(metric_future_values.get(m, np.array([]))) for m in ("cpu", "memory")}
+    by_metric = {m: compute_metric_stats(metric_future_values.get(m, np.array([]))) for m in ("cpu", "memory")}
     metric_actions: Dict[str, str] = {}
     metric_reasons: Dict[str, str] = {}
     blockers: list[str] = []

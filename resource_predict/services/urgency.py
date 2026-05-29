@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List
 
+from resource_predict.utils import parse_float_or_none
+
 
 def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     """Compute list sorting urgency from scaling advice and target spec changes."""
@@ -26,12 +28,6 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     if not isinstance(risk_profile, dict):
         risk_profile = {}
 
-    def _num(v: Any, default: float = 0.0) -> float:
-        try:
-            return float(v)
-        except Exception:
-            return default
-
     def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
         return max(lo, min(hi, v))
 
@@ -54,8 +50,8 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
             return 0.0
         ratios = []
         for dim in ("cpu_cores", "memory_gb", "disk_gb"):
-            cur = _num(spec.get(dim), 0.0)
-            nxt = _num(target.get(dim), 0.0)
+            cur = parse_float_or_none(spec.get(dim)) or 0.0
+            nxt = parse_float_or_none(target.get(dim)) or 0.0
             if cur <= 0 or nxt <= 0:
                 continue
             if action == "scale_out":
@@ -76,12 +72,12 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         if not isinstance(st, dict):
             continue
         metric_action = str(metric_actions.get(metric, action)).lower()
-        avg = _num(st.get("avg"))
-        p95 = _num(st.get("p95"))
-        peak = _num(st.get("peak"))
-        gap = _num(st.get("gap"))
-        slope = _num(st.get("slope"))
-        delta = _num(st.get("window_mean_delta"))
+        avg = parse_float_or_none(st.get("avg")) or 0.0
+        p95 = parse_float_or_none(st.get("p95")) or 0.0
+        peak = parse_float_or_none(st.get("peak")) or 0.0
+        gap = parse_float_or_none(st.get("gap")) or 0.0
+        slope = parse_float_or_none(st.get("slope")) or 0.0
+        delta = parse_float_or_none(st.get("window_mean_delta")) or 0.0
 
         if metric_action in {"scale_out", "scale_out_candidate"}:
             trend_pressure = 0.0
@@ -115,7 +111,7 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     return round(
         (35.0 if action in {"scale_out", "scale_out_candidate"} else 18.0)
         + confidence_bonus
-        + min(20.0, 0.2 * _num(risk_profile.get("risk_score")))
+        + min(20.0, 0.2 * (parse_float_or_none(risk_profile.get("risk_score")) or 0.0))
         + max(metric_scores)
         + 0.25 * sum(sorted(metric_scores, reverse=True)[1:])
         + 4.0 * max(0, len(metric_scores) - 1)

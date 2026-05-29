@@ -831,6 +831,17 @@ h1 {
   gap: 12px;
 }
 
+.config-head {
+  position: sticky;
+  top: -14px;
+  z-index: 10;
+  background: var(--surface);
+  padding: 10px 14px;
+  margin: -10px -14px 0;
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+}
+
 .config-head h2 {
   font-size: 18px;
 }

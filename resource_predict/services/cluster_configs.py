@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
+from resource_predict.utils import parse_positive_int
+
 
 VM_SCALING_CONFIG_PATH = Path("deploy") / "clusters.json"
 K8S_PROMETHEUS_CONFIG_PATH = Path("deploy") / "k8s_prometheus_clusters.json"
@@ -39,7 +41,7 @@ def normalize_vm_scaling_clusters(clusters: Any) -> Dict[str, Dict[str, Any]]:
         cfg = dict(item)
         cfg["cloud_type"] = str(cfg.get("cloud_type") or "openstack").strip() or "openstack"
         _require(cfg, ("control_host", "ssh_user"), f"VM 调配集群 {cluster}")
-        cfg["ssh_port"] = _positive_int(cfg.get("ssh_port"), 22)
+        cfg["ssh_port"] = parse_positive_int(cfg.get("ssh_port"), default=22)
         normalized[cluster] = cfg
     return normalized
 
@@ -87,6 +89,7 @@ def normalize_k8s_prometheus_clusters(clusters: Any) -> List[Dict[str, Any]]:
         cfg["namespace_regex"] = str(cfg.get("namespace_regex") or "").strip()
         cfg["bearer_token"] = str(cfg.get("bearer_token") or "").strip()
         cfg["basic_auth"] = str(cfg.get("basic_auth") or "").strip()
+        cfg["rate_window"] = str(cfg.get("rate_window") or "").strip()
         normalized.append(cfg)
     return normalized
 
@@ -120,11 +123,3 @@ def _require(cfg: Dict[str, Any], keys: tuple[str, ...], label: str) -> None:
     missing = [key for key in keys if not str(cfg.get(key) or "").strip()]
     if missing:
         raise ClusterConfigValidationError(f"{label} 缺少必填字段: {', '.join(missing)}")
-
-
-def _positive_int(value: Any, default: int) -> int:
-    try:
-        parsed = int(value)
-    except Exception:
-        parsed = default
-    return parsed if parsed > 0 else default

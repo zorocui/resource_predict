@@ -84,6 +84,38 @@
     return `${(n * 100).toFixed(0)}%`;
   }
 
+  /**
+   * 根据资源类型和指标 key 判断图表 Y 轴显示单位。
+   * K8S Workload 在缺少 request/limit 时，后端使用绝对值模式
+   * （cpu_usage_cores / memory_working_set_gb），前端需要对应显示
+   * Cores / GB 而非百分比。
+   */
+  function resolveDisplayUnit(resource, metricKey) {
+    if (!resource) return "percent";
+    if (!isK8s(resource)) return "percent";
+    const spec = resource.spec || {};
+    if (metricKey === "cpu") {
+      const mode = String(spec.cpu_metric_mode || "");
+      if (mode.includes("cpu_usage_cores") || mode === "raw") return "cores";
+    }
+    if (metricKey === "memory") {
+      const mode = String(spec.memory_metric_mode || "");
+      if (mode.includes("memory_working_set_gb") || mode === "raw") return "gb";
+    }
+    return "percent";
+  }
+
+  /**
+   * 按 displayUnit 格式化统计值（用于 tooltip、Y 轴、建议面板等）。
+   */
+  function formatStatValue(value, displayUnit) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "-";
+    if (displayUnit === "cores") return `${n.toFixed(2)} C`;
+    if (displayUnit === "gb") return `${n.toFixed(2)} GB`;
+    return `${(n * 100).toFixed(1)}%`;
+  }
+
   function formatNumber(value, digits = 1) {
     const n = Number(value);
     if (!Number.isFinite(n)) return "-";
@@ -101,7 +133,8 @@
     return metricKeysFor(item).map((key) => {
       const stat = stats[key] || {};
       const action = String(metricActions[key] || "hold");
-      const p95 = stat.p95 !== undefined ? `P95 ${formatPct(stat.p95)}` : "";
+      const unit = resolveDisplayUnit(item, key);
+      const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)}` : "";
       return `<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(app.metricTitleMap[key])} ${escapeHtml(actionLabel(action))}${p95 ? ` · ${escapeHtml(p95)}` : ""}</span>`;
     }).join("");
   }
@@ -110,47 +143,75 @@
     const advice = item?.scaling_advice || {};
     if (isK8s(item)) {
       const target = advice.target_spec || {};
-      const cpuReq = formatNumber(target.cpu_request_cores ?? target.cpu_cores, 2);
-      const cpuLimit = formatNumber(target.cpu_limit_cores, 2);
-      const memReq = formatNumber(target.memory_request_gb ?? target.memory_gb, 2);
-      const memLimit = formatNumber(target.memory_limit_gb, 2);
-      const replicas = formatNumber(target.replicas, 0);
+      // 只在值真正存在时才显示；null/undefined 时该字段留空，不显示占位符
+      const cpuReq = target.cpu_request_cores != null ? formatNumber(target.cpu_request_cores, 2) : null;
+      const cpuLimit = target.cpu_limit_cores != null ? formatNumber(target.cpu_limit_cores, 2) : null;
+      const memReq = target.memory_request_gb != null ? formatNumber(target.memory_request_gb, 2) : null;
+      const memLimit = target.memory_limit_gb != null ? formatNumber(target.memory_limit_gb, 2) : null;
+      const replicas = target.replicas != null ? formatNumber(target.replicas, 0) : null;
       const parts = [];
-      if (cpuReq !== "-") {
-        parts.push(`CPU request ${cpuReq}C${cpuLimit !== "-" ? ` / limit ${cpuLimit}C` : ""}`);
+      // CPU 行：有 request 或 limit 才显示，缺失的一方留空
+      if (cpuReq || cpuLimit) {
+        let cpuText = "";
+        if (cpuReq) cpuText += `CPU request ${cpuReq}C`;
+        if (cpuLimit) cpuText += `${cpuText ? " / " : "CPU "}limit ${cpuLimit}C`;
+        parts.push(cpuText);
       }
-      if (memReq !== "-") {
-        parts.push(`内存 request ${memReq}GB${memLimit !== "-" ? ` / limit ${memLimit}GB` : ""}`);
+      // 内存行：同理
+      if (memReq || memLimit) {
+        let memText = "";
+        if (memReq) memText += `内存 request ${memReq}GB`;
+        if (memLimit) memText += `${memText ? " / " : "内存 "}limit ${memLimit}GB`;
+        parts.push(memText);
       }
-      if (replicas !== "-") parts.push(`副本 ${replicas}`);
+      if (replicas) parts.push(`副本 ${replicas}`);
       if (parts.length) return `目标 ${parts.join(" · ")}`;
       return advice.analysis_only ? "仅分析，缺少可执行目标" : "K8S 目标待确认";
     }
     const target = advice.target_spec || {};
-    const cpu = formatNumber(target.cpu_cores, 0);
-    const memory = formatNumber(target.memory_gb, 0);
-    const disk = formatNumber(target.disk_gb, 0);
-    if (cpu === "-" && memory === "-" && disk === "-") return "目标规格待确认";
-    return `目标规格 ${cpu}C / ${memory}GB / ${disk}GB`;
+    const hasCpu = target.cpu_cores != null && Number.isFinite(Number(target.cpu_cores));
+    const hasMem = target.memory_gb != null && Number.isFinite(Number(target.memory_gb));
+    const hasDisk = target.disk_gb != null && Number.isFinite(Number(target.disk_gb));
+    if (!hasCpu && !hasMem && !hasDisk) return "目标规格待确认";
+    const parts = [];
+    if (hasCpu) parts.push(`${formatNumber(target.cpu_cores, 0)}C`);
+    if (hasMem) parts.push(`${formatNumber(target.memory_gb, 0)}GB`);
+    if (hasDisk) parts.push(`${formatNumber(target.disk_gb, 0)}GB`);
+    return `目标规格 ${parts.join(" / ")}`;
+  }
+
+  function currentReplicas(spec) {
+    // 调配成功后 snapshot 会把目标副本数写入 spec.replicas，
+    // 但 spec.replicas_observed 需要等到下次数据拉取才会同步。
+    // 优先显示 spec.replicas，保证调配后前端立即反映真实副本数。
+    const fromReplicas = spec.replicas !== undefined && spec.replicas !== null && spec.replicas !== ""
+      ? Number(spec.replicas) : null;
+    const fromObserved = spec.replicas_observed !== undefined && spec.replicas_observed !== null && spec.replicas_observed !== ""
+      ? Number(spec.replicas_observed) : null;
+    // 若两者均存在且不一致，取较大值（调配刚完成时 replicas > replicas_observed）
+    if (fromReplicas !== null && fromObserved !== null) return Math.max(fromReplicas, fromObserved);
+    return fromReplicas ?? fromObserved;
   }
 
   function subtitleFor(item) {
     const spec = item?.spec || {};
     if (isK8s(item)) {
+      const replicas = currentReplicas(spec);
       return [
         spec.cluster,
         spec.namespace,
         [spec.workload_kind || spec.owner_kind, spec.workload_name || spec.owner_name].filter(Boolean).join("/"),
-        spec.replicas_observed ? `${formatNumber(spec.replicas_observed, 0)} 副本` : "",
+        replicas !== null && replicas !== undefined ? `${formatNumber(replicas, 0)} 副本` : "",
       ].filter(Boolean).join(" / ") || "-";
     }
-    return [
+    const parts = [
       spec.cluster,
       spec.ip,
-      `${formatNumber(spec.cpu_cores, 0)}C`,
-      `${formatNumber(spec.memory_gb, 0)}GB`,
-      `${formatNumber(spec.disk_gb, 0)}GB`,
-    ].filter((x) => x && !String(x).startsWith("-")).join(" / ") || "-";
+    ].filter(Boolean);
+    if (spec.cpu_cores != null && Number.isFinite(Number(spec.cpu_cores))) parts.push(`${formatNumber(spec.cpu_cores, 0)}C`);
+    if (spec.memory_gb != null && Number.isFinite(Number(spec.memory_gb))) parts.push(`${formatNumber(spec.memory_gb, 0)}GB`);
+    if (spec.disk_gb != null && Number.isFinite(Number(spec.disk_gb))) parts.push(`${formatNumber(spec.disk_gb, 0)}GB`);
+    return parts.join(" / ") || "-";
   }
 
   function titleFor(item) {
@@ -372,11 +433,13 @@
     escapeHtml,
     formatNumber,
     formatPct,
+    formatStatValue,
     infoTooltip,
     isPod: (item) => resourceTypeOf(item) === "k8s_pod",
     isK8s,
     metricKeysFor,
     renderRows,
+    resolveDisplayUnit,
     resourceTypeOf,
     selectResource,
     setItems,

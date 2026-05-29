@@ -95,24 +95,46 @@
     }).format(d);
   }
 
+  const TASK_STATUS_LABELS = {
+    queued: "排队中",
+    running: "执行中",
+    waiting_confirm: "等待确认",
+    confirming: "确认中",
+    success: "成功",
+    failed: "失败",
+  };
+
+  const TASK_MODE_LABELS = {
+    dry_run: "预检",
+    execute: "调配",
+  };
+
   function renderTaskHistory(tasks) {
     if (!app.els.taskHistory) return;
     if (!tasks.length) {
       app.els.taskHistory.innerHTML = `<div class="empty-list is-compact">当前资源还没有调配记录。</div>`;
       return;
     }
-    app.els.taskHistory.innerHTML = tasks.map((task) => `
+    app.els.taskHistory.innerHTML = tasks.map((task) => {
+      const status = String(task.status || "");
+      const statusLabel = TASK_STATUS_LABELS[status] || status || "-";
+      const modeLabel = TASK_MODE_LABELS[String(task.mode || "")] || task.mode || "调配任务";
+      const plan = task.plan || {};
+      const actionLabel = plan.action ? `（${list.escapeHtml(plan.action)}）` : "";
+      const createdAt = task.created_at_ms || task.updated_at_ms || "";
+      return `
       <div class="task-item">
         <div>
-          <strong>${list.escapeHtml(task.mode || task.action || "调配任务")}</strong>
+          <strong>${list.escapeHtml(modeLabel)}${actionLabel}</strong>
           <span>${list.escapeHtml(task.task_id || "")}</span>
         </div>
         <div>
-          <span class="task-status">${list.escapeHtml(task.status || "-")}</span>
-          <small>${list.escapeHtml(formatDateTime(task.created_at || task.updated_at || task.finished_at))}</small>
+          <span class="task-status is-${list.escapeHtml(status)}">${list.escapeHtml(statusLabel)}</span>
+          <small>${list.escapeHtml(formatDateTime(createdAt))}</small>
         </div>
       </div>
-    `).join("");
+    `;
+    }).join("");
   }
 
   async function renderTaskPanel() {
@@ -219,6 +241,7 @@
     namespace_regex: "",
     bearer_token: "",
     basic_auth: "",
+    rate_window: "",
   };
 
   function configInput(label, name, value, options = {}) {
@@ -291,6 +314,7 @@
         <div class="config-row-title">
           <strong>${list.escapeHtml(cfg.cluster || "未命名接入")}</strong>
           <button class="link-btn" type="button" data-config-remove>删除</button>
+          <button class="link-btn" type="button" data-k8s-fetch-single>拉取</button>
         </div>
         <div class="config-grid">
           ${configInput("集群名", "cluster", cfg.cluster || "")}
@@ -298,6 +322,7 @@
           ${configInput("Namespace 正则", "namespace_regex", cfg.namespace_regex || "", { placeholder: "prod|default" })}
           ${configInput("Bearer Token", "bearer_token", cfg.bearer_token || "")}
           ${configInput("Basic Auth", "basic_auth", cfg.basic_auth || "", { placeholder: "base64(user:password)" })}
+          ${configInput("Rate 窗口", "rate_window", cfg.rate_window || "", { placeholder: "5m" })}
         </div>
       </div>
     `).join("");
@@ -410,6 +435,7 @@
         namespace_regex: rowValue(row, "namespace_regex"),
         bearer_token: rowValue(row, "bearer_token"),
         basic_auth: rowValue(row, "basic_auth"),
+        rate_window: rowValue(row, "rate_window"),
       });
     });
     return { vm_scaling_clusters: vm, k8s_prometheus_clusters: k8s };
@@ -456,12 +482,15 @@
     }
   }
 
-  async function fetchK8sPrometheusData() {
-    setConfigMessage("正在提交 K8S 数据拉取任务...");
+  async function fetchK8sPrometheusData(clusterNames) {
+    const names = Array.isArray(clusterNames)
+      ? clusterNames
+      : collectClusterConfigs().k8s_prometheus_clusters.map((item) => item.cluster).filter(Boolean);
+    const label = names.length === 1 ? names[0] : `${names.length} 个集群`;
+    setConfigMessage(`正在提交 ${label} 的 K8S 数据拉取任务...`);
     try {
-      const names = collectClusterConfigs().k8s_prometheus_clusters.map((item) => item.cluster).filter(Boolean);
       const payload = await api.postJson("/api/cluster-configs/k8s-fetch", { clusters: names });
-      setConfigMessage(payload.message || "K8S 数据拉取任务已提交。");
+      setConfigMessage(payload.message || `${label} K8S 数据拉取任务已提交。`);
       setView("updates");
       startUpdatePolling();
     } catch (e) {
@@ -499,13 +528,25 @@
     app.els.k8sScalingClusterAdd?.addEventListener("click", addK8sScalingClusterRow);
     app.els.k8sClusterAdd?.addEventListener("click", addK8sClusterRow);
     app.els.k8sDiagnose?.addEventListener("click", diagnoseK8sConfigs);
-    app.els.k8sFetch?.addEventListener("click", fetchK8sPrometheusData);
+    app.els.k8sFetch?.addEventListener("click", () => fetchK8sPrometheusData());
     [app.els.vmClusterList, app.els.k8sClusterList].forEach((root) => {
       root?.addEventListener("click", (event) => {
         const remove = event.target.closest("[data-config-remove]");
-        if (!remove) return;
-        remove.closest(".config-row")?.remove();
-        setConfigMessage("配置已在页面移除，保存后生效。");
+        if (remove) {
+          remove.closest(".config-row")?.remove();
+          setConfigMessage("配置已在页面移除，保存后生效。");
+          return;
+        }
+        const fetchSingle = event.target.closest("[data-k8s-fetch-single]");
+        if (fetchSingle) {
+          const row = fetchSingle.closest("[data-config-kind='k8s']");
+          const cluster = rowValue(row, "cluster");
+          if (!cluster) {
+            setConfigMessage("请先填写集群名并保存配置。", true);
+            return;
+          }
+          fetchK8sPrometheusData([cluster]);
+        }
       });
     });
   }

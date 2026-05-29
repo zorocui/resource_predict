@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from resource_predict.services.scaling.openstack_flavors import NoSuitableFlavorError, discover_openstack_flavors, select_flavor_for_target
+from resource_predict.utils import parse_float_or_none, parse_positive_int, require_float
 
 
 class ScalingPlanError(ValueError):
@@ -182,8 +183,8 @@ def _build_openstack_commands(
     if bool(cluster_config.get("auto_confirm_resize", False)):
         commands.append(build_openstack_resize_confirm_command(instance_id, cluster_config))
 
-    current_disk = _num(spec.get("disk_gb"))
-    target_disk = _num(target.get("disk_gb"))
+    current_disk = parse_float_or_none(spec.get("disk_gb"))
+    target_disk = parse_float_or_none(target.get("disk_gb"))
     if current_disk is not None and target_disk is not None and target_disk < current_disk:
         warnings.append("OpenStack disk shrink is not automated in phase 1; handle disk reduction manually")
     elif current_disk is not None and target_disk is not None and target_disk > current_disk:
@@ -217,10 +218,10 @@ def _new_flavor_spec(
     target: Dict[str, Any],
     cluster_config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    cpu = _required_num(target.get("cpu_cores"), "target cpu_cores")
-    memory = _required_num(target.get("memory_gb"), "target memory_gb")
-    target_disk = _required_num(target.get("disk_gb"), "target disk_gb")
-    current_disk = _num(spec.get("disk_gb")) or target_disk
+    cpu = require_float(target.get("cpu_cores"), "target cpu_cores", error_cls=ScalingPlanError)
+    memory = require_float(target.get("memory_gb"), "target memory_gb", error_cls=ScalingPlanError)
+    target_disk = require_float(target.get("disk_gb"), "target disk_gb", error_cls=ScalingPlanError)
+    current_disk = parse_float_or_none(spec.get("disk_gb")) or target_disk
     disk = max(target_disk, current_disk)
     prefix = str(cluster_config.get("auto_flavor_name_prefix") or "rp").strip() or "rp"
     name = str(target.get("auto_flavor_name") or "").strip()
@@ -248,8 +249,8 @@ def build_openstack_resize_confirm_command(instance_id: str, cluster_config: Dic
 
 
 def _openstack_resize_confirm_command_body(instance_id: str, cluster_config: Dict[str, Any]) -> str:
-    interval = _positive_int(cluster_config.get("resize_confirm_poll_interval_seconds"), 15)
-    wait_seconds = _positive_int(cluster_config.get("resize_confirm_wait_seconds"), 240)
+    interval = parse_positive_int(cluster_config.get("resize_confirm_poll_interval_seconds"), 15)
+    wait_seconds = parse_positive_int(cluster_config.get("resize_confirm_wait_seconds"), 240)
     interval = max(5, interval)
     attempts = max(1, (wait_seconds + interval - 1) // interval)
     instance = shlex.quote(instance_id)
@@ -301,11 +302,11 @@ def _build_k8s_commands(
     if not container and isinstance(observed_containers, list) and len(observed_containers) == 1:
         container = str(observed_containers[0] or "").strip()
 
-    cpu_request = _num(target.get("cpu_request_cores") or target.get("cpu_cores"))
-    cpu_limit = _num(target.get("cpu_limit_cores") or target.get("cpu_cores"))
-    memory_request = _num(target.get("memory_request_gb") or target.get("memory_gb"))
-    memory_limit = _num(target.get("memory_limit_gb") or target.get("memory_gb"))
-    replicas = _positive_int(target.get("replicas"), 0)
+    cpu_request = parse_float_or_none(target.get("cpu_request_cores") or target.get("cpu_cores"))
+    cpu_limit = parse_float_or_none(target.get("cpu_limit_cores") or target.get("cpu_cores"))
+    memory_request = parse_float_or_none(target.get("memory_request_gb") or target.get("memory_gb"))
+    memory_limit = parse_float_or_none(target.get("memory_limit_gb") or target.get("memory_gb"))
+    replicas = parse_positive_int(target.get("replicas"), 0)
 
     kubeconfig = str(cluster_config.get("kubeconfig", "")).strip()
     kube = "kubectl"
@@ -333,13 +334,13 @@ def _build_k8s_commands(
         if cmd:
             commands.append(cmd)
     if replicas > 0 and workload_kind != "daemonset":
-        current_replicas = _positive_int(spec.get("replicas") or spec.get("replicas_observed"), 0)
+        current_replicas = parse_positive_int(spec.get("replicas") or spec.get("replicas_observed"), 0)
         if current_replicas != replicas:
             commands.append(f"{kube} -n {shlex.quote(namespace)} scale {shlex.quote(target_ref)} --replicas={replicas}")
     elif replicas > 0 and workload_kind == "daemonset":
         warnings.append("DaemonSet replicas are controlled by node scheduling; replica scaling command was skipped")
-    current_disk = _num(spec.get("disk_gb"))
-    target_disk = _num(target.get("disk_gb"))
+    current_disk = parse_float_or_none(spec.get("disk_gb"))
+    target_disk = parse_float_or_none(target.get("disk_gb"))
     if current_disk is not None and target_disk is not None and target_disk != current_disk:
         warnings.append("K8S phase 1 only adjusts CPU/memory requests/limits; storage capacity is not changed")
     return commands, warnings, {
@@ -363,10 +364,10 @@ def _container_targets(target: Dict[str, Any]) -> List[tuple[str, Dict[str, Any]
         if not container or not isinstance(values, dict):
             continue
         normalized = {
-            "cpu_request_cores": _num(values.get("cpu_request_cores")),
-            "cpu_limit_cores": _num(values.get("cpu_limit_cores")),
-            "memory_request_gb": _num(values.get("memory_request_gb")),
-            "memory_limit_gb": _num(values.get("memory_limit_gb")),
+            "cpu_request_cores": parse_float_or_none(values.get("cpu_request_cores")),
+            "cpu_limit_cores": parse_float_or_none(values.get("cpu_limit_cores")),
+            "memory_request_gb": parse_float_or_none(values.get("memory_request_gb")),
+            "memory_limit_gb": parse_float_or_none(values.get("memory_limit_gb")),
         }
         if any(value is not None for value in normalized.values()):
             out.append((container, normalized))
@@ -382,10 +383,10 @@ def _build_k8s_resource_command(
 ) -> str:
     request_parts = []
     limit_parts = []
-    cpu_request = _num(target.get("cpu_request_cores") or target.get("cpu_cores"))
-    cpu_limit = _num(target.get("cpu_limit_cores") or target.get("cpu_cores"))
-    memory_request = _num(target.get("memory_request_gb") or target.get("memory_gb"))
-    memory_limit = _num(target.get("memory_limit_gb") or target.get("memory_gb"))
+    cpu_request = parse_float_or_none(target.get("cpu_request_cores") or target.get("cpu_cores"))
+    cpu_limit = parse_float_or_none(target.get("cpu_limit_cores") or target.get("cpu_cores"))
+    memory_request = parse_float_or_none(target.get("memory_request_gb") or target.get("memory_gb"))
+    memory_limit = parse_float_or_none(target.get("memory_limit_gb") or target.get("memory_gb"))
     if cpu_request is not None:
         request_parts.append(f"cpu={_format_k8s_cpu(cpu_request)}")
     if memory_request is not None:
@@ -415,28 +416,6 @@ def _format_k8s_memory(memory_gb: float) -> str:
     if float(memory_gb).is_integer():
         return f"{int(memory_gb)}Gi"
     return f"{int(round(memory_gb * 1024))}Mi"
-
-
-def _num(value: Any) -> float | None:
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-def _required_num(value: Any, name: str) -> float:
-    n = _num(value)
-    if n is None:
-        raise ScalingPlanError(f"missing {name}")
-    return n
-
-
-def _positive_int(value: Any, default: int) -> int:
-    try:
-        out = int(value)
-    except Exception:
-        return default
-    return out if out > 0 else default
 
 
 def _fmt_spec_part(value: float) -> str:
