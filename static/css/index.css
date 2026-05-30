@@ -1046,16 +1046,6 @@ h1 {
   gap: 8px;
 }
 
-.analysis-only {
-  border: 1px solid rgba(37, 99, 235, .18);
-  border-radius: 8px;
-  padding: 9px 10px;
-  background: #eff6ff;
-  color: #1d4ed8;
-  font-size: 12px;
-  font-weight: 800;
-}
-
 .scaling-choice {
   display: grid;
   gap: 10px;

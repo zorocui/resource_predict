@@ -18,20 +18,6 @@
       .replaceAll("'", "&#39;");
   }
 
-  function buildControls(resourceId, action, confidence, hasMixed, options = {}) {
-    const analysisOnly = Boolean(options.analysisOnly);
-    const disabled = analysisOnly || action === "hold" || action === "insufficient_data" || action === "mixed";
-    const risky = confidence === "low" || hasMixed;
-    const disabledAttr = disabled ? " disabled" : "";
-    const disabledText = analysisOnly ? "当前建议缺少可执行目标，暂不能调配" : "当前建议无需执行调配";
-    return `
-      <div class="scaling-controls" data-scaling-resource="${escapeHtml(resourceId)}" data-scaling-resource-type="${escapeHtml(options.resourceType || "")}">
-        <button type="button" class="scale-btn" data-scaling-mode="dry_run"${disabledAttr}>预检</button>
-        <button type="button" class="scale-btn scale-execute${risky ? " is-risky" : ""}" data-scaling-mode="execute"${disabledAttr}>调配</button>
-        <span class="scaling-status" data-role="scaling-status">${disabled ? disabledText : ""}</span>
-      </div>`;
-  }
-
   function summarizeTask(task) {
     const status = String(task?.status || "");
     const mode = String(task?.mode || "");

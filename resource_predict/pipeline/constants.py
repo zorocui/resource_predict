@@ -1,4 +1,4 @@
-from resource_predict.resource_types import METRIC_NAMES, POD_METRIC_NAMES, metric_names_for_resource, resource_type_of
+from resource_predict.resource_types import METRIC_NAMES
 
 MANIFEST_FILENAME = "manifest.json"
 SUMMARY_INDEX_FILENAME = "summary_index.json"
@@ -8,9 +8,6 @@ GENERATION_STATS_FILENAME = "generation_stats.json"
 
 __all__ = [
     "METRIC_NAMES",
-    "POD_METRIC_NAMES",
-    "metric_names_for_resource",
-    "resource_type_of",
     "MANIFEST_FILENAME",
     "SUMMARY_INDEX_FILENAME",
     "DETAILS_DIRNAME",

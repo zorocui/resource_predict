@@ -89,7 +89,7 @@ def merge_partial_forecast_items(
             if not best or not isinstance(futures, dict) or best not in futures:
                 return
             future_by_metric[metric] = np.asarray(futures.get(best) or [], dtype=float)
-        if resource_type_of(item) in {"k8s_pod", "k8s_workload"} and len(future_by_metric) == len(metric_names):
+        if resource_type_of(item) == "k8s_workload" and len(future_by_metric) == len(metric_names):
             item["scaling_advice"] = build_k8s_workload_advice(
                 future_by_metric,
                 resource=item,

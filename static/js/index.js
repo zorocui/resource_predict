@@ -21,10 +21,6 @@
     if (app.state.activeView === "configs") refreshClusterConfigs();
   }
 
-  function buildActionForApi() {
-    return "";
-  }
-
   async function loadQueue({ keepSelection = false } = {}) {
     app.els.summaryText.textContent = "正在加载资源...";
     const [payload, forecastPayload] = await Promise.all([
@@ -33,7 +29,7 @@
         page_size: app.API_PAGE_SIZE,
         sort_by: "urgency_score",
         resource_type: app.state.resourceTypeFilter,
-        action: buildActionForApi(),
+        action: "",
         q: app.state.query,
       })),
       api.requestJson("/api/forecast-config", 1),

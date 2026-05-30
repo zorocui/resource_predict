@@ -123,7 +123,7 @@ def resolve_forecast_window(
 
 def _resource_family(item: dict[str, Any]) -> str:
     rtype = resource_type_of(item)
-    if rtype in {"k8s_workload", "k8s_pod"}:
+    if rtype == "k8s_workload":
         return "workload"
     return "vm"
 

@@ -11,7 +11,6 @@
     metricTitleMap: { cpu: "CPU", memory: "内存", disk: "磁盘" },
     viewMetricMap: {
       openstack_vm: ["cpu", "memory", "disk"],
-      k8s_pod: ["cpu", "memory"],
       k8s_workload: ["cpu", "memory"],
     },
     state: {

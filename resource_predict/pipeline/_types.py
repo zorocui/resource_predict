@@ -1,7 +1,7 @@
 """pipeline 模块共享数据结构。"""
 from __future__ import annotations
 
-from typing import Any, Dict, NamedTuple
+from typing import Any, Dict
 
 
 class WorkerContext:
@@ -35,14 +35,3 @@ class WorkerContext:
         self.metric_filter_by_id = metric_filter_by_id
         self.metric_partial_enabled = metric_partial_enabled
         self.existing_partial_ids = existing_partial_ids
-
-
-class FitResult(NamedTuple):
-    """_fit_one_metric 的返回结构。"""
-
-    preds: Dict[str, Any]
-    metrics: Dict[str, Dict[str, float]]
-    best: str
-    preds_future: Dict[str, Any]
-    timing: Dict[str, float]
-    diagnostics: Dict[str, Any]

@@ -406,7 +406,7 @@ class CacheLockTest(unittest.TestCase):
         with patch(
             "resource_predict.services.scaling.openstack_flavors.run_ssh_command",
             side_effect=AssertionError("SSH 不应被调用"),
-        ) as mock_ssh:
+        ):
             flavors = discover_openstack_flavors(cluster_name, cluster_config)
 
         self.assertEqual(len(flavors), 1)

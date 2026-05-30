@@ -117,7 +117,7 @@ class OutputHealthTest(unittest.TestCase):
             ],
         )
 
-    def test_check_outputs_rejects_legacy_pod(self):
+    def test_check_outputs_rejects_unknown_resource_type(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             summary, raw, details = valid_artifacts()
@@ -133,7 +133,7 @@ class OutputHealthTest(unittest.TestCase):
             report = check_outputs(base)
 
         self.assertFalse(report["ok"])
-        self.assertTrue(any("旧 Pod 粒度资源" in err for err in report["errors"]))
+        self.assertTrue(any("不支持的资源类型" in err for err in report["errors"]))
         self.assertTrue(any("缺少 resource_type=k8s_workload" in err for err in report["errors"]))
 
     def test_check_outputs_rejects_detail_missing_k8s_policy(self):

@@ -94,7 +94,8 @@ def worker(
         futures_for_advice[metric_name] = future_pred[best].to_numpy(dtype=float)
 
     advice = None
-    if resource_type in {"k8s_pod", "k8s_workload"} and len(futures_for_advice) == len(metric_names):
+    # 根据资源类型构建对应的 scaling_advice
+    if resource_type == "k8s_workload" and len(futures_for_advice) == len(metric_names):
         advice = build_k8s_workload_advice(futures_for_advice, resource=source)
     elif len(futures_for_advice) == len(METRIC_NAMES):
         advice = build_scaling_advice(

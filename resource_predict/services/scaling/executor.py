@@ -72,7 +72,7 @@ def build_scaling_plan(
             cluster_config,
             allow_create_flavor=allow_create_flavor,
         )
-    elif resource_type in {"k8s_container", "k8s_workload"}:
+    elif resource_type == "k8s_workload":
         commands, warnings, details = _build_k8s_commands(resource_id, spec, target, cluster_config)
     else:
         raise ScalingPlanError(f"unsupported resource type: {resource_type}")
@@ -98,12 +98,14 @@ def _detect_resource_type(
         "openstack": "openstack_vm",
         "openstack_vm": "openstack_vm",
         "vm": "openstack_vm",
-        "k8s": "k8s_container",
-        "kubernetes": "k8s_container",
-        "container": "k8s_container",
-        "k8s_container": "k8s_container",
+        "k8s": "k8s_workload",
+        "kubernetes": "k8s_workload",
+        "container": "k8s_workload",
+        "k8s_container": "k8s_workload",
         "k8s_workload": "k8s_workload",
         "workload": "k8s_workload",
+        "k8s_pod": "k8s_workload",
+        "pod": "k8s_workload",
     }
     if value in aliases:
         return aliases[value]

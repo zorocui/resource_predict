@@ -44,18 +44,16 @@
 
   function resourceTypeOf(item) {
     const raw = String(item?.resource_type || "").toLowerCase().replaceAll("-", "_");
-    if (raw === "k8s_workload" || raw === "k8s_controller" || raw === "workload" || raw === "controller") return "k8s_workload";
-    if (raw === "k8s_pod" || raw === "pod") return "k8s_pod";
-    return "openstack_vm";
+    if (raw === "openstack_vm" || raw === "openstack" || raw === "vm") return "openstack_vm";
+    return "k8s_workload";
   }
 
   function isK8s(item) {
-    return resourceTypeOf(item) === "k8s_workload" || resourceTypeOf(item) === "k8s_pod";
+    return resourceTypeOf(item) === "k8s_workload";
   }
 
   function typeLabel(item) {
     if (resourceTypeOf(item) === "k8s_workload") return "Workload";
-    if (resourceTypeOf(item) === "k8s_pod") return "Pod";
     return "VM";
   }
 
@@ -76,12 +74,6 @@
   function metricKeysFor(item) {
     const type = resourceTypeOf(item);
     return app.viewMetricMap[type] || app.viewMetricMap.openstack_vm;
-  }
-
-  function formatPct(value) {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return "-";
-    return `${(n * 100).toFixed(0)}%`;
   }
 
   /**
@@ -311,7 +303,6 @@
       ["当前范围", summaryItems.length],
       ["VM", byType.VM || 0],
       ["Workload", byType.Workload || 0],
-      ["Pod", byType.Pod || 0],
       ["需扩容", counts.scale_out],
       ["需缩容", counts.scale_in],
       ["混合信号", counts.mixed],
@@ -368,7 +359,6 @@
   function setItems(items) {
     app.state.loadedItems = items || [];
     app.state.visibleItems = applyClientFilters(app.state.loadedItems);
-    app.state.total = app.state.visibleItems.length;
     if (app.state.page < 1) app.state.page = 1;
     renderRows();
     if (!app.state.selectedResourceId && app.state.visibleItems.length) {
@@ -422,20 +412,16 @@
   }
 
   window.ResourceList = {
-    ACTION_LABELS,
     CONFIDENCE_LABELS,
     CONFIDENCE_HELP,
-    URGENCY_HELP,
     actionLabel,
     actionOf,
     applyClientFilters,
     confidenceOf,
     escapeHtml,
     formatNumber,
-    formatPct,
     formatStatValue,
     infoTooltip,
-    isPod: (item) => resourceTypeOf(item) === "k8s_pod",
     isK8s,
     metricKeysFor,
     renderRows,

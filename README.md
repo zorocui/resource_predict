@@ -1078,13 +1078,9 @@ python -m pytest -q
 | 规范名 | 来源字符串 | 指标集 |
 | --- | --- | --- |
 | `openstack_vm` | `openstack`, `vm`, `openstack_vm` | `cpu`, `memory`, `disk` |
-| `k8s_workload` | `k8s_workload`, `workload`, `controller`, `k8s_controller` | `cpu`, `memory` |
-| `k8s_pod` | `k8s_pod`, `pod`（仅兼容） | `cpu`, `memory` |
-| `k8s_container` | `k8s`, `kubernetes`, `k8s_container`, `container` | `cpu`, `memory`, `disk` |
+| `k8s_workload` | `k8s_workload`, `workload`, `controller`, `k8s_controller`, `pod`, `k8s_pod`, `k8s`, `kubernetes`, `container`, `k8s_container` | `cpu`, `memory` |
 
-使用 `resource_type_of(item)` 归一化类型，使用 `metric_names_for_resource(item)` 获取指标名列表。
-
-> 注意：`k8s_container` 为底层归一化类型，正常业务流程中 K8S 资源应以 `k8s_workload` 形式出现。
+使用 `resource_type_of(item)` 归一化类型，使用 `metric_names_for_resource(item)` 获取指标名列表。所有 K8S 相关字符串统一归一到 `k8s_workload`。
 
 ### 11.4 Provider 接口
 

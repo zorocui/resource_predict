@@ -85,12 +85,12 @@ def _check_single_output(out_dir: Path | str, *, require_both_types: bool = True
         _require_type(raw_by_type, "openstack_vm", "raw_data", errors)
         _require_type(raw_by_type, "k8s_workload", "raw_data", errors)
 
-    _reject_legacy_pods(summary_resources, "summary_index", errors)
-    _reject_legacy_pods(raw_resources, "raw_data", errors)
+    _reject_unknown_types(summary_resources, "summary_index", errors)
+    _reject_unknown_types(raw_resources, "raw_data", errors)
 
     details_cache = _load_detail_chunks(base, summary_obj, errors, warnings)
     detail_items = _validate_detail_refs(summary_resources, details_cache, errors)
-    _reject_legacy_pods(detail_items, "details", errors)
+    _reject_unknown_types(detail_items, "details", errors)
     _validate_detail_contracts(detail_items, errors)
 
     for item in summary_resources:
@@ -189,12 +189,13 @@ def _require_type(counts: Counter[str], resource_type: str, label: str, errors: 
         errors.append(f"{label}: 缺少 resource_type={resource_type} 的资源")
 
 
-def _reject_legacy_pods(items: Iterable[Dict[str, Any]], label: str, errors: List[str]) -> None:
+def _reject_unknown_types(items: Iterable[Dict[str, Any]], label: str, errors: List[str]) -> None:
     for item in items:
         if not isinstance(item, dict):
             continue
-        if _resource_type(item) == "k8s_pod":
-            errors.append(f"{label}: 发现旧 Pod 粒度资源 {item.get('resource_id')}")
+        rtype = _resource_type(item)
+        if rtype not in {"openstack_vm", "k8s_workload"}:
+            errors.append(f"{label}: 不支持的资源类型 {rtype}（资源 {item.get('resource_id')}）")
 
 
 def _load_detail_chunks(

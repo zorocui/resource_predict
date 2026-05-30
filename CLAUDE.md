@@ -126,7 +126,7 @@ Runtime overrides can come from `deploy/forecast_config.json` (model toggles) an
 
 ### Resource Type Routing (`resource_types.py`)
 
-`resource_type_of()` normalizes raw type strings to canonical names (`openstack_vm`, `k8s_workload`, `k8s_pod`). `metric_names_for_resource()` returns `("cpu", "memory", "disk")` for VMs and `("cpu", "memory")` for K8S workloads. Always use these helpers rather than hardcoding metric lists.
+`resource_type_of()` normalizes raw type strings to canonical names (`openstack_vm`, `k8s_workload`). All K8S-related strings (pod, k8s, kubernetes, container, etc.) are unified to `k8s_workload`. `metric_names_for_resource()` returns `("cpu", "memory", "disk")` for VMs and `("cpu", "memory")` for K8S workloads. Always use these helpers rather than hardcoding metric lists.
 
 ## Conventions
 
