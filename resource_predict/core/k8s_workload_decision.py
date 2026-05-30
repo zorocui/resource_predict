@@ -28,7 +28,7 @@ def _quality_level(resource: Dict[str, Any], metric: str) -> str:
 
 def _has_denominator(spec: Dict[str, Any], metric: str) -> bool:
     if metric == "cpu":
-        return bool(spec.get("cpu_request_cores") or spec.get("cpu_limit_cores"))
+        return bool(spec.get("cpu_limit_cores") or spec.get("cpu_request_cores"))
     if metric == "memory":
         return bool(spec.get("memory_limit_gb") or spec.get("memory_request_gb"))
     return False
@@ -66,7 +66,7 @@ def _recommend_k8s_policy(
 ) -> Dict[str, Any]:
     policy: Dict[str, Any] = {"policy_tier": tier, "recommendations": {}, "notes": []}
     bases = {
-        "cpu": parse_positive_finite(spec.get("cpu_request_cores")) or parse_positive_finite(spec.get("cpu_limit_cores")),
+        "cpu": parse_positive_finite(spec.get("cpu_limit_cores")) or parse_positive_finite(spec.get("cpu_request_cores")),
         "memory": parse_positive_finite(spec.get("memory_limit_gb")) or parse_positive_finite(spec.get("memory_request_gb")),
     }
     for metric, base in bases.items():
@@ -81,7 +81,12 @@ def _recommend_k8s_policy(
             floor_ratio = 0.5 if tier != "aggressive" else 0.35
             target = max(float(base) * floor_ratio, min(float(base), target))
         else:
-            target = max(float(base), target)
+            # Scale-out: per-replica target stays at base. Replicas already
+            # absorb the headroom in _recommend_replicas, so increasing
+            # per-replica resources here would cause double-scaling
+            # (per-replica increase * replica increase = multiplicative
+            # over-provisioning).
+            target = float(base)
         if metric == "cpu":
             request = _round_k8s_even_target(target, action=action, base=base)
             if request is None:
@@ -127,7 +132,16 @@ def _recommend_k8s_policy(
         policy["notes"].append("apply gradually and observe one cooldown window")
     if _workload_kind(spec) == "daemonset":
         policy["notes"].append("DaemonSet replicas follow node scheduling; only requests/limits are adjustable here")
-    policy["ready_for_execution"] = bool(policy["recommendations"])
+    # Track metrics with scale signals but missing baseline data.
+    # These cannot produce per-replica recommendations, so the policy
+    # is not fully executable even if other metrics have recommendations.
+    needed_data_metrics = {
+        m for m, a in metric_actions.items()
+        if a in {"scale_out_candidate", "scale_in_candidate"}
+        and m not in policy["recommendations"]
+        and not _has_denominator(spec, m)
+    }
+    policy["ready_for_execution"] = bool(policy["recommendations"]) and not needed_data_metrics
     return policy
 
 
@@ -241,8 +255,13 @@ def _risk_profile(
     tier: str,
     blockers: list[str],
 ) -> Dict[str, Any]:
-    high = max((float(st.get("p95", 0.0)) for st in by_metric.values()), default=0.0)
-    low = min((float(st.get("avg", 0.0)) for st in by_metric.values()), default=0.0)
+    # 仅基于有 baseline 的指标计算风险，原始使用量（cores/GB）不应参与利用率阈值比较
+    metrics_with_baseline = {
+        metric: st for metric, st in by_metric.items()
+        if metric not in blockers  # blockers 包含没有 baseline 的指标
+    }
+    high = max((float(st.get("p95", 0.0)) for st in metrics_with_baseline.values()), default=0.0)
+    low = min((float(st.get("avg", 0.0)) for st in metrics_with_baseline.values()), default=0.0)
     idle = 100.0 * max(0.0, 0.3 - low) / 0.3
     saturation = min(100.0, 100.0 * max(0.0, high - 0.75) / 0.25)
     risk_score = 100.0 * high if action == "scale_out_candidate" else idle
@@ -283,6 +302,12 @@ def build_k8s_workload_advice(
             continue
         if not has_base:
             baseline_missing.append(metric)
+            metric_actions[metric] = "hold"
+            metric_reasons[metric] = (
+                f"{label} lacks request/limit baseline; cannot compute utilization for recommendation"
+            )
+            continue
+        # Only check utilization thresholds when baseline exists
         if st["p95"] >= 0.8 or st["peak"] >= 0.9:
             metric_actions[metric] = "scale_out_candidate"
             metric_reasons[metric] = (
@@ -296,8 +321,6 @@ def build_k8s_workload_advice(
         else:
             metric_actions[metric] = "hold"
             metric_reasons[metric] = f"{label} load is within the target range"
-        if not has_base:
-            metric_reasons[metric] += "; lacks request/limit baseline, trend only"
 
     actions = set(metric_actions.values())
     if "scale_out_candidate" in actions:
@@ -356,7 +379,12 @@ def build_k8s_workload_advice(
         "confidence": confidence,
         "confidence_score": round(confidence_score, 2),
         "policy_tier": tier,
-        "risk_profile": _risk_profile(action=action, by_metric=by_metric, tier=tier, blockers=blockers),
+        "risk_profile": _risk_profile(
+            action=action,
+            by_metric=by_metric,
+            tier=tier,
+            blockers=blockers + baseline_missing,
+        ),
         "action_gate": {
             "state": "observe" if action != "hold" and required > 1 else "ready",
             "required_consistent_rounds": int(required),

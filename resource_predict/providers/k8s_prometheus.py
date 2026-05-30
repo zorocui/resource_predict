@@ -355,8 +355,8 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
         if cpu_s is None or mem_s is None:
             continue
         cpu_base, cpu_base_name = _select_denominator(
-            (cpu_request_by_workload.get(key), "cpu_usage/cpu_request"),
             (cpu_limit_by_workload.get(key), "cpu_usage/cpu_limit"),
+            (cpu_request_by_workload.get(key), "cpu_usage/cpu_request"),
         )
         mem_base, mem_base_name = _select_denominator(
             (mem_limit_by_workload.get(key), "memory_working_set/memory_limit"),

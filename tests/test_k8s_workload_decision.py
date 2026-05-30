@@ -32,11 +32,13 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
             resource=resource,
         )
 
-        self.assertEqual(advice["action"], "scale_out_candidate")
-        self.assertEqual(advice["metric_actions"]["cpu"], "scale_out_candidate")
+        # 没有 request/limit baseline 时，不应给出扩缩容建议（无法计算利用率）
+        self.assertEqual(advice["action"], "hold")
+        self.assertEqual(advice["metric_actions"]["cpu"], "hold")
         self.assertEqual(advice["metric_actions"]["memory"], "hold")
-        self.assertNotIn("insufficient_data", advice["metric_actions"].values())
-        self.assertIn("trend only", advice["metric_reasons"]["cpu"])
+        self.assertIn("lacks request/limit baseline", advice["metric_reasons"]["cpu"])
+        self.assertIn("lacks request/limit baseline", advice["metric_reasons"]["memory"])
+        self.assertEqual(advice["target_spec"], {})
         self.assertFalse(advice["target_k8s_policy"]["ready_for_execution"])
 
     def test_poor_quality_remains_insufficient(self):
