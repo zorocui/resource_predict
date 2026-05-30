@@ -130,6 +130,10 @@ class DecisionConfig:
     snap_target_cpu_cores_to_even: bool = True
     # 单次缩容最大降幅比例；0.5 表示最多缩到当前规格的一半。
     scale_in_max_reduction_ratio: float = 0.5
+    # 缩容目标规格下限保护；避免推荐过小的规格导致负载无法运行。
+    scale_in_min_cpu_cores: int = 2
+    scale_in_min_memory_gb: int = 4
+    scale_in_min_disk_gb: int = 50
     # Policy tier controls how early and how confidently recommendations fire.
     default_policy_tier: str = "balanced"
     conservative_namespaces: Tuple[str, ...] = ("prod", "production", "payments", "core", "platform")

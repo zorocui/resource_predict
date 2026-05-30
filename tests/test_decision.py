@@ -15,12 +15,14 @@ from resource_predict.core.decision import (
     _metric_is_cold,
     _metric_is_hot,
     _normalize_spec,
-    _policy_thresholds,
+    _VM_TIER_FIELDS,
+    policy_thresholds,
     _summarize_metric_actions,
     _trend_features,
     build_scaling_advice,
 )
 from resource_predict.settings import settings
+from resource_predict.utils import resolve_policy_tier
 
 
 # ---------------------------------------------------------------------------
@@ -71,17 +73,17 @@ class TestDecision(unittest.TestCase):
         self.assertEqual(result["memory_gb"], 8)
         self.assertEqual(result["disk_gb"], 100)
 
-    # -- _policy_thresholds --------------------------------------------------
+    # -- policy_thresholds ---------------------------------------------------
 
     def test_policy_thresholds_balanced(self):
-        th = _policy_thresholds("balanced")
+        th = policy_thresholds("balanced")
         self.assertAlmostEqual(th["scale_out_threshold"], 0.8)
         self.assertAlmostEqual(th["scale_in_threshold"], 0.2)
         self.assertAlmostEqual(th["scale_in_p95_guard"], 0.35)
         self.assertAlmostEqual(th["peak_guard_threshold"], 0.85)
 
     def test_policy_thresholds_conservative(self):
-        th = _policy_thresholds("conservative")
+        th = policy_thresholds("conservative")
         # Each threshold is shifted -0.05 relative to balanced defaults.
         self.assertAlmostEqual(th["scale_out_threshold"], 0.75)
         self.assertAlmostEqual(th["scale_in_threshold"], 0.15)
@@ -89,7 +91,7 @@ class TestDecision(unittest.TestCase):
         self.assertAlmostEqual(th["peak_guard_threshold"], 0.80)
 
     def test_policy_thresholds_aggressive(self):
-        th = _policy_thresholds("aggressive")
+        th = policy_thresholds("aggressive")
         # Each threshold is shifted +0.05 relative to balanced defaults.
         self.assertAlmostEqual(th["scale_out_threshold"], 0.85)
         self.assertAlmostEqual(th["scale_in_threshold"], 0.25)
@@ -154,6 +156,15 @@ class TestDecision(unittest.TestCase):
         result = _finalize_target_spec_even("scale_in", target)
         # 49 -> 50 (odd snap), then max(50, 50) = 50.
         self.assertEqual(result["disk_gb"], 50)
+
+    def test_finalize_target_spec_min_protection(self):
+        """缩容时应用最小规格保护，避免推荐过小的规格。"""
+        # 极端缩容：1 核 1GB 10GB -> 应被提升到最小规格 2核 4GB 50GB
+        target = {"cpu_cores": 1, "memory_gb": 1, "disk_gb": 10}
+        result = _finalize_target_spec_even("scale_in", target)
+        self.assertEqual(result["cpu_cores"], 2)  # min_cpu_cores=2
+        self.assertEqual(result["memory_gb"], 4)  # min_memory_gb=4
+        self.assertEqual(result["disk_gb"], 50)   # min_disk_gb=50
 
     def test_finalize_target_spec_hold_no_snap(self):
         target = {"cpu_cores": 5, "memory_gb": 7, "disk_gb": 9}
@@ -378,10 +389,10 @@ class TestDecision(unittest.TestCase):
         self.assertLessEqual(advice["target_spec"]["cpu_cores"], VM_SPEC["cpu_cores"])
         self.assertLessEqual(advice["target_spec"]["memory_gb"], VM_SPEC["memory_gb"])
 
-    def test_build_scaling_advice_cold_with_gentle_uptrend_still_scales_in(self):
-        """A cold metric with a gentle uptrend (below hot threshold) still triggers scale_in."""
-        # Gentle linear ramp: slope=0.012 but window delta stays below the hot threshold,
-        # so _metric_is_hot is False and the metric is cold -> scale_in.
+    def test_build_scaling_advice_cold_with_gentle_uptrend_holds(self):
+        """Cold metric with gentle uptrend should hold instead of scale_in."""
+        # Gentle linear ramp: slope > 0, delta > 0 but below hot threshold
+        # With P2 change, gentle uptrend should trigger hold, not scale_in
         cpu_values = list(np.linspace(0.05, 0.05 + 0.012 * 11, 12))
         future = _future({
             "cpu": cpu_values,
@@ -389,8 +400,12 @@ class TestDecision(unittest.TestCase):
             "disk": [0.05] * 24,
         })
         advice = build_scaling_advice(future, current_spec=VM_SPEC)
-        # avg ~0.116, p95 ~0.175 -> cold; slope=0.012 but delta<0.08 -> not hot.
-        self.assertEqual(advice["metric_actions"]["cpu"], "scale_in")
+        # CPU has gentle uptrend (slope > 0, delta > 0) -> hold
+        # memory and disk have no uptrend -> scale_in
+        self.assertEqual(advice["metric_actions"]["cpu"], "hold")
+        self.assertIn("温和回升", advice["metric_reasons"]["cpu"])
+        self.assertEqual(advice["metric_actions"]["memory"], "scale_in")
+        self.assertEqual(advice["metric_actions"]["disk"], "scale_in")
 
     def test_build_scaling_advice_contains_expected_keys(self):
         future = _future({"cpu": [0.5] * 24})
@@ -407,6 +422,7 @@ class TestDecision(unittest.TestCase):
             "suggested_delta",
             "metric_actions",
             "metric_reasons",
+            "rightsize_metrics",
             "target_spec",
             "stats",
             "has_mixed_signals",
@@ -422,6 +438,53 @@ class TestDecision(unittest.TestCase):
             advice = build_scaling_advice(future, current_spec=VM_SPEC)
         # With scale_out_threshold=0.7, p95=0.75 >= 0.7 -> hot -> scale_out.
         self.assertEqual(advice["action"], "scale_out")
+
+    def test_build_scaling_advice_rightsize_detection(self):
+        """中等使用率（20%~55%）应被识别为 rightsize 候选。"""
+        # avg < 0.35, p95 < 0.55 -> 不在 cold/hot 区间，但属于过度配置
+        future = _future({
+            "cpu": [0.30] * 24,
+            "memory": [0.25] * 24,
+            "disk": [0.32] * 24,
+        })
+        advice = build_scaling_advice(future, current_spec=VM_SPEC)
+        # 应该识别为 rightsize 候选
+        self.assertIn("cpu", advice["rightsize_metrics"])
+        self.assertIn("memory", advice["rightsize_metrics"])
+        self.assertIn("disk", advice["rightsize_metrics"])
+        # 但 action 仍然是 hold（不自动缩容）
+        self.assertEqual(advice["action"], "hold")
+
+    def test_disk_uses_lower_threshold_than_cpu(self):
+        """磁盘使用更低的扩容阈值（更早告警）。"""
+        from resource_predict.core.decision import _metric_is_hot
+        th = policy_thresholds("balanced")
+        # disk_scale_out_threshold = 0.75, scale_out_threshold = 0.80
+        self.assertLess(th["disk_scale_out_threshold"], th["scale_out_threshold"])
+        self.assertLess(th["disk_peak_guard_threshold"], th["peak_guard_threshold"])
+        # P95=0.77 对 CPU 不触发热，但对 disk 触发热
+        stats = {"p95": 0.77, "peak": 0.78, "gap": 0.1, "slope": 0.0, "window_mean_delta": 0.0}
+        self.assertFalse(_metric_is_hot(stats, th, metric="cpu"))
+        self.assertTrue(_metric_is_hot(stats, th, metric="disk"))
+
+    def test_vm_tier_fields_no_namespace(self):
+        """VM tier 字段不应包含 namespace（K8S 专属），应包含 project/tenant 等 VM 字段。"""
+        self.assertNotIn("namespace", _VM_TIER_FIELDS)
+        # 应包含 OpenStack VM 常用字段
+        for field in ("project", "tenant", "environment"):
+            self.assertIn(field, _VM_TIER_FIELDS)
+
+    def test_vm_policy_tier_via_project_field(self):
+        """VM 通过 project 字段匹配 conservative 策略分级。"""
+        spec = {"project": "production-infra", "cluster": "cn-east"}
+        tier = resolve_policy_tier(spec, fields=_VM_TIER_FIELDS)
+        self.assertEqual(tier, "conservative")
+
+    def test_vm_policy_tier_via_tenant_field(self):
+        """VM 通过 tenant 字段匹配 aggressive 策略分级。"""
+        spec = {"tenant": "dev-team", "cluster": "test-cluster"}
+        tier = resolve_policy_tier(spec, fields=_VM_TIER_FIELDS)
+        self.assertEqual(tier, "aggressive")
 
 
 if __name__ == "__main__":

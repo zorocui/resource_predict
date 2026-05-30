@@ -110,8 +110,8 @@ def generate_forecasts(
             raw_checkpoint_path=raw_path if (data_provider is not None and save_raw) else None,
         )
         resources_ct = len(prepared_data)
-        if save_raw and data_provider is None:
-            write_raw_dataset(raw_path, prepared_data, freq=freq)
+        # 注：raw 写盘延迟到频率推断完成后（下方统一执行），避免用初始频率写入。
+        # data_provider 路径已在 build_prepared_data 内做 checkpoint 写入作为安全网。
 
     window = resolve_forecast_window(
         cfg=cfg,

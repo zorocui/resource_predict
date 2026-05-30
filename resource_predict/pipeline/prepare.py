@@ -21,6 +21,14 @@ MOCK_MEMORY_OFFSET = 15.0
 MOCK_DISK_SCALE = 2.2
 MOCK_DISK_OFFSET = 10.0
 
+# 中等负载参数：生成 30%-60% 使用率区间的曲线
+MEDIUM_CPU_SCALE = 1.2
+MEDIUM_CPU_OFFSET = 35.0
+MEDIUM_MEMORY_SCALE = 1.0
+MEDIUM_MEMORY_OFFSET = 40.0
+MEDIUM_DISK_SCALE = 0.8
+MEDIUM_DISK_OFFSET = 38.0
+
 
 def format_spec_for_log(spec: Any) -> str:
     if isinstance(spec, dict):
@@ -125,12 +133,21 @@ def build_prepared_data(
 
     out: List[Dict[str, Any]] = []
     for i in range(resources):
+        # 每 3 个 VM 中有 1 个使用中等负载参数（覆盖 30%-60% 使用率区间）
+        is_medium_load = (i % 3 == 2)
+        cpu_scale = MEDIUM_CPU_SCALE if is_medium_load else MOCK_CPU_SCALE
+        cpu_offset = MEDIUM_CPU_OFFSET if is_medium_load else MOCK_CPU_OFFSET
+        mem_scale = MEDIUM_MEMORY_SCALE if is_medium_load else MOCK_MEMORY_SCALE
+        mem_offset = MEDIUM_MEMORY_OFFSET if is_medium_load else MOCK_MEMORY_OFFSET
+        disk_scale = MEDIUM_DISK_SCALE if is_medium_load else MOCK_DISK_SCALE
+        disk_offset = MEDIUM_DISK_OFFSET if is_medium_load else MOCK_DISK_OFFSET
+
         y_cpu = simulate_curve(n=n, seed=base_seed + i * 3 + 0, freq=freq)
         y_mem = simulate_curve(n=n, seed=base_seed + i * 3 + 1, freq=freq)
         y_disk = simulate_curve(n=n, seed=base_seed + i * 3 + 2, freq=freq)
-        y_cpu = np.clip((y_cpu * MOCK_CPU_SCALE + MOCK_CPU_OFFSET) / 100.0, 0.0, 1.0)
-        y_mem = np.clip((y_mem * MOCK_MEMORY_SCALE + MOCK_MEMORY_OFFSET) / 100.0, 0.0, 1.0)
-        y_disk = np.clip((y_disk * MOCK_DISK_SCALE + MOCK_DISK_OFFSET) / 100.0, 0.0, 1.0)
+        y_cpu = np.clip((y_cpu * cpu_scale + cpu_offset) / 100.0, 0.0, 1.0)
+        y_mem = np.clip((y_mem * mem_scale + mem_offset) / 100.0, 0.0, 1.0)
+        y_disk = np.clip((y_disk * disk_scale + disk_offset) / 100.0, 0.0, 1.0)
         out.append(
             {
                 "resource_id": f"resource_{i+1:02d}",

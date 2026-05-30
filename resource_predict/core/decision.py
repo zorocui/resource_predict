@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from resource_predict.settings import settings
 from resource_predict.utils import compute_metric_stats, resolve_policy_tier
 
-_VM_TIER_FIELDS = ("namespace", "cluster", "owner_name", "service", "app", "env")
+_VM_TIER_FIELDS = ("project", "tenant", "environment", "cluster", "owner_name", "service", "app", "env")
 
 
 def _normalize_spec(spec: Dict[str, object]) -> Dict[str, int]:
@@ -32,18 +32,25 @@ _METRIC_TO_DIM = {
 }
 
 
-def _policy_thresholds(tier: str) -> Dict[str, float]:
+def policy_thresholds(tier: str) -> Dict[str, float]:
     cfg = settings.decision
     out = float(cfg.scale_out_threshold)
     in_avg = float(cfg.scale_in_threshold)
     in_p95 = float(cfg.scale_in_p95_guard)
     peak = float(cfg.peak_guard_threshold)
+    # 磁盘专用阈值：比通用阈值低 0.05，因为磁盘使用具有单调性且不可弹性回收
+    disk_out = out - 0.05
+    disk_peak = peak - 0.05
     if tier == "conservative":
         return {
             "scale_out_threshold": max(0.01, out - 0.05),
             "scale_in_threshold": max(0.01, in_avg - 0.05),
             "scale_in_p95_guard": max(0.01, in_p95 - 0.05),
             "peak_guard_threshold": max(0.01, peak - 0.05),
+            "rightsize_avg_threshold": 0.30,
+            "rightsize_p95_threshold": 0.50,
+            "disk_scale_out_threshold": max(0.01, disk_out - 0.05),
+            "disk_peak_guard_threshold": max(0.01, disk_peak - 0.05),
         }
     if tier == "aggressive":
         return {
@@ -51,27 +58,50 @@ def _policy_thresholds(tier: str) -> Dict[str, float]:
             "scale_in_threshold": min(0.95, in_avg + 0.05),
             "scale_in_p95_guard": min(0.95, in_p95 + 0.05),
             "peak_guard_threshold": min(1.5, peak + 0.05),
+            "rightsize_avg_threshold": 0.40,
+            "rightsize_p95_threshold": 0.60,
+            "disk_scale_out_threshold": min(1.5, disk_out + 0.05),
+            "disk_peak_guard_threshold": min(1.5, disk_peak + 0.05),
         }
     return {
         "scale_out_threshold": out,
         "scale_in_threshold": in_avg,
         "scale_in_p95_guard": in_p95,
         "peak_guard_threshold": peak,
+        "rightsize_avg_threshold": 0.35,
+        "rightsize_p95_threshold": 0.55,
+        "disk_scale_out_threshold": max(0.01, disk_out),
+        "disk_peak_guard_threshold": max(0.01, disk_peak),
     }
 
 
-def _metric_is_hot(stats: Dict[str, float], thresholds: Dict[str, float] | None = None) -> bool:
-    """判断该维度是否已经形成扩容信号。"""
+def _metric_is_hot(
+    stats: Dict[str, float],
+    thresholds: Dict[str, float] | None = None,
+    *,
+    metric: str = "",
+) -> bool:
+    """判断该维度是否已经形成扩容信号。
+
+    磁盘维度使用专用阈值（更早告警），因为磁盘使用具有单调性且不可弹性回收。
+    """
     cfg = settings.decision
     p95 = float(stats.get("p95", 0.0))
     peak = float(stats.get("peak", 0.0))
     gap = float(stats.get("gap", 0.0))
     slope = float(stats.get("slope", 0.0))
     delta = float(stats.get("window_mean_delta", 0.0))
-    thresholds = thresholds or _policy_thresholds("balanced")
-    if p95 >= float(thresholds["scale_out_threshold"]):
+    thresholds = thresholds or policy_thresholds("balanced")
+    # 磁盘使用专用阈值（更早告警）
+    if metric == "disk":
+        scale_out_th = float(thresholds.get("disk_scale_out_threshold", thresholds["scale_out_threshold"]))
+        peak_guard_th = float(thresholds.get("disk_peak_guard_threshold", thresholds["peak_guard_threshold"]))
+    else:
+        scale_out_th = float(thresholds["scale_out_threshold"])
+        peak_guard_th = float(thresholds["peak_guard_threshold"])
+    if p95 >= scale_out_th:
         return True
-    if peak >= float(thresholds["peak_guard_threshold"]) and gap >= float(cfg.peak_valley_gap_threshold):
+    if peak >= peak_guard_th and gap >= float(cfg.peak_valley_gap_threshold):
         return True
     if slope >= float(cfg.uptrend_slope_threshold) and delta >= float(cfg.window_mean_delta_threshold):
         return True
@@ -82,8 +112,25 @@ def _metric_is_cold(stats: Dict[str, float], thresholds: Dict[str, float] | None
     """判断该维度是否已经形成缩容信号。"""
     avg = float(stats.get("avg", 0.0))
     p95 = float(stats.get("p95", 0.0))
-    thresholds = thresholds or _policy_thresholds("balanced")
+    thresholds = thresholds or policy_thresholds("balanced")
     return avg < float(thresholds["scale_in_threshold"]) and p95 < float(thresholds["scale_in_p95_guard"])
+
+
+def _metric_is_rightsize(
+    stats: Dict[str, float],
+    thresholds: Dict[str, float] | None = None,
+) -> bool:
+    """判断该维度是否属于过度配置（可优化规格但非极端空闲）。
+
+    命中条件：avg < 0.35 且 P95 < 0.55 且未触发 hot/cold，
+    用于捕获 20%~55% 使用率区间的优化候选。
+    """
+    avg = float(stats.get("avg", 0.0))
+    p95 = float(stats.get("p95", 0.0))
+    thresholds = thresholds or policy_thresholds("balanced")
+    rightsize_avg = float(thresholds.get("rightsize_avg_threshold", 0.35))
+    rightsize_p95 = float(thresholds.get("rightsize_p95_threshold", 0.55))
+    return avg < rightsize_avg and p95 < rightsize_p95
 
 
 def _risk_profile(
@@ -168,39 +215,50 @@ def _action_gate(action: str, confidence_score: float, *, tier: str) -> Dict[str
     return {
         "state": "ready" if ready else "observe",
         "required_consistent_rounds": required,
-        "observed_consistent_rounds": 1 if action != "hold" else 0,
+        "observed_consistent_rounds": 1 if ready and action != "hold" else 0,
         "reason": "needs repeated confirmation before execution" if not ready else "ready for execution review",
     }
 
 
 def _finalize_target_spec_even(action: str, target: Dict[str, int], disk_min_gb: int = 50) -> Dict[str, int]:
     """扩容/缩容建议中的规格对齐为偶数（奇数则 +1），贴近常见可购规格。
-    
-    硬盘缩容时最小规格为 disk_min_gb（默认50GB）。
+
+    缩容时应用最小规格保护，避免推荐过小的规格导致负载无法运行。
     """
     cfg = settings.decision
     if not bool(cfg.snap_target_cpu_cores_to_even):
         return target
     if action not in ("scale_out", "scale_in"):
         return target
-    
+
+    # 缩容最小规格保护
+    min_specs = {
+        "cpu_cores": int(cfg.scale_in_min_cpu_cores),
+        "memory_gb": int(cfg.scale_in_min_memory_gb),
+        "disk_gb": int(cfg.scale_in_min_disk_gb),
+    }
+
     result = {}
     for dim in ("cpu_cores", "memory_gb", "disk_gb"):
         val = int(target.get(dim, 0))
         if val <= 0:
             result[dim] = val
             continue
-        
+
         # 对齐为偶数：奇数则 +1
         if val % 2 == 1:
             val = val + 1
-        
-        # 硬盘缩容时应用最小规格限制
-        if dim == "disk_gb" and action == "scale_in":
-            val = max(val, disk_min_gb)
-        
+
+        # 缩容时应用最小规格限制
+        if action == "scale_in":
+            min_val = min_specs.get(dim, 0)
+            # 对 disk_gb 同时考虑显式传入的 disk_min_gb 参数
+            if dim == "disk_gb":
+                min_val = max(min_val, disk_min_gb)
+            val = max(val, min_val)
+
         result[dim] = val
-    
+
     return result
 
 
@@ -298,9 +356,10 @@ def _reconcile_noop_metric_actions(
             metric_reasons[metric] = f"{metric_label[metric]}目标规格与当前规格一致，建议保持"
 
 
-def _summarize_metric_actions(metric_actions: Dict[str, str]) -> Dict[str, object]:
+def _summarize_metric_actions(metric_actions: Dict[str, str], rightsize_metrics: Optional[List[str]] = None) -> Dict[str, object]:
     out_metrics = [m for m in ("cpu", "memory", "disk") if metric_actions[m] == "scale_out"]
     in_metrics = [m for m in ("cpu", "memory", "disk") if metric_actions[m] == "scale_in"]
+    rightsize = rightsize_metrics or []
     has_mixed = bool(out_metrics) and bool(in_metrics)
     action = "hold"
     if out_metrics:
@@ -316,6 +375,7 @@ def _summarize_metric_actions(metric_actions: Dict[str, str]) -> Dict[str, objec
     return {
         "out_metrics": out_metrics,
         "in_metrics": in_metrics,
+        "rightsize_metrics": rightsize,
         "has_mixed": has_mixed,
         "action": action,
         "suggested_delta": suggested_delta,
@@ -419,12 +479,16 @@ def _metric_confidence_score(metric_action: str, st: Dict[str, float]) -> float:
         trend = _trend_support_score(st, direction="down")
         stability = 1.0 - min(1.0, gap / max(float(cfg.scale_in_p95_guard), 0.001))
         uptrend_penalty = 12.0 * _trend_support_score(st, direction="up")
+        # 持续性奖励：如果全部预测点都低于 scale_in_p95_guard，额外加分
+        low_streak = float(st.get("low_streak", 0))
+        persistence_bonus = min(8.0, 8.0 * min(1.0, low_streak / 12.0)) if low_streak > 0 else 0.0
         score = (
-            34.0 * avg_headroom
-            + 30.0 * p95_headroom
-            + 18.0 * low_ratio
+            28.0 * avg_headroom
+            + 26.0 * p95_headroom
+            + 24.0 * low_ratio
             + 10.0 * trend
-            + 8.0 * max(0.0, stability)
+            + 12.0 * max(0.0, stability)
+            + persistence_bonus
             - uptrend_penalty
         )
         return max(0.0, min(100.0, score))
@@ -488,10 +552,11 @@ def build_scaling_advice(
     """
     cfg = settings.decision
     policy_tier = resolve_policy_tier(current_spec or {}, fields=_VM_TIER_FIELDS)
-    policy_thresholds = _policy_thresholds(policy_tier)
+    tier_thresholds = policy_thresholds(policy_tier)
     by_metric: Dict[str, Dict[str, float]] = {}
     metric_actions: Dict[str, str] = {}
     metric_reasons: Dict[str, str] = {}
+    rightsize_metrics: List[str] = []
     metric_label = {"cpu": "CPU", "memory": "内存", "disk": "硬盘"}
 
     for metric in ("cpu", "memory", "disk"):
@@ -513,8 +578,8 @@ def build_scaling_advice(
 
     for metric in ("cpu", "memory", "disk"):
         st = by_metric[metric]
-        is_hot = _metric_is_hot(st, policy_thresholds)
-        is_cold = _metric_is_cold(st, policy_thresholds)
+        is_hot = _metric_is_hot(st, tier_thresholds, metric=metric)
+        is_cold = _metric_is_cold(st, tier_thresholds)
         has_strong_uptrend = st["slope"] >= cfg.uptrend_slope_threshold and st["window_mean_delta"] >= cfg.window_mean_delta_threshold
         label = metric_label[metric]
 
@@ -522,18 +587,36 @@ def build_scaling_advice(
             metric_actions[metric] = "scale_out"
             metric_reasons[metric] = f"{label}预测偏高(P95={st['p95'] * 100:.1f}%,峰值={st['peak'] * 100:.1f}%)，建议扩容"
         elif is_cold:
+            # 检查是否有回升趋势（强或温和）
+            has_gentle_uptrend = st["slope"] > 0 and st["window_mean_delta"] > 0
             if has_strong_uptrend:
                 metric_actions[metric] = "hold"
                 metric_reasons[metric] = (
                     f"{label}当前偏低(均值{st['avg'] * 100:.1f}%,P95={st['p95'] * 100:.1f}%)，"
                     "但趋势回升，暂缓缩容"
                 )
+            elif has_gentle_uptrend:
+                # 温和回升：不立即缩容，建议观察
+                metric_actions[metric] = "hold"
+                metric_reasons[metric] = (
+                    f"{label}当前偏低(均值{st['avg'] * 100:.1f}%,P95={st['p95'] * 100:.1f}%)，"
+                    "但有温和回升趋势，建议观察一周后再决定"
+                )
             else:
                 metric_actions[metric] = "scale_in"
                 metric_reasons[metric] = f"{label}预测偏低(均值{st['avg'] * 100:.1f}%,P95={st['p95'] * 100:.1f}%)，建议缩容"
         else:
-            metric_actions[metric] = "hold"
-            metric_reasons[metric] = f"{label}负载在合理区间，建议保持"
+            # 检查是否属于过度配置（rightsize 候选）
+            if _metric_is_rightsize(st, tier_thresholds):
+                rightsize_metrics.append(metric)
+                metric_actions[metric] = "hold"
+                metric_reasons[metric] = (
+                    f"{label}使用率偏低(均值{st['avg'] * 100:.1f}%,P95={st['p95'] * 100:.1f}%)，"
+                    "可能过度配置，建议评估降配"
+                )
+            else:
+                metric_actions[metric] = "hold"
+                metric_reasons[metric] = f"{label}负载在合理区间，建议保持"
 
     target_spec = _pick_target_spec_by_metric(current_spec or {}, by_metric, metric_actions)
     _reconcile_noop_metric_actions(
@@ -543,7 +626,7 @@ def build_scaling_advice(
         metric_reasons=metric_reasons,
     )
     target_spec = _pick_target_spec_by_metric(current_spec or {}, by_metric, metric_actions)
-    action_info = _summarize_metric_actions(metric_actions)
+    action_info = _summarize_metric_actions(metric_actions, rightsize_metrics)
     action = str(action_info["action"])
     has_mixed = bool(action_info["has_mixed"])
     suggested_delta = int(action_info["suggested_delta"])
@@ -565,7 +648,7 @@ def build_scaling_advice(
         by_metric,
         metric_actions,
         tier=policy_tier,
-        thresholds=policy_thresholds,
+        thresholds=tier_thresholds,
     )
     action_gate = _action_gate(action, confidence_score, tier=policy_tier)
 
@@ -581,6 +664,7 @@ def build_scaling_advice(
         "suggested_delta": suggested_delta,
         "metric_actions": metric_actions,
         "metric_reasons": metric_reasons,
+        "rightsize_metrics": rightsize_metrics,
         "target_spec": target_spec,
         "stats": by_metric,
         "has_mixed_signals": has_mixed,

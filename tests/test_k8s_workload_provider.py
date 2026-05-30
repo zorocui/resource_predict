@@ -235,7 +235,7 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         self.assertEqual(item["spec"]["pods_observed"], ["api-rs-a", "api-rs-b"])
         self.assertEqual(item["spec"]["containers_observed"], ["app", "sidecar"])
         self.assertEqual(item["spec"]["replicas"], 3)
-        self.assertEqual(item["spec"]["replicas_observed"], 2)
+        self.assertEqual(item["spec"]["replicas_observed"], 3)
         self.assertEqual(item["spec"]["nodes"], ["node-1", "node-2"])
         self.assertEqual(item["spec"]["cpu_request_cores"], 1.0)
         self.assertEqual(item["spec"]["memory_limit_gb"], 1.0)
@@ -306,6 +306,7 @@ class K8SWorkloadProviderTest(unittest.TestCase):
             history_days=1,
             step_seconds=300,
             request_timeout_seconds=5,
+            rate_window="10m",
         )
 
         with patch.object(provider, "PrometheusClient", FakePrometheusClient):

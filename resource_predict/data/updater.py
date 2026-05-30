@@ -597,11 +597,12 @@ def _do_update(
                     res["spec"] = merged_spec
                     spec_changed = True
             incoming_type = str(new_info.get("resource_type") or "")
-            if incoming_type:
+            if incoming_type and str(res.get("resource_type") or "") != incoming_type:
                 res["resource_type"] = incoming_type
                 spec_changed = True
-            if isinstance(new_info.get("data_quality"), dict):
-                res["data_quality"] = new_info["data_quality"]
+            incoming_dq = new_info.get("data_quality")
+            if isinstance(incoming_dq, dict) and res.get("data_quality") != incoming_dq:
+                res["data_quality"] = incoming_dq
                 spec_changed = True
 
             new_metrics = new_info.get("metrics", {})
@@ -639,9 +640,11 @@ def _do_update(
                         before_series, ts_list, val_list,
                     )
                     if use_sw:
-                        net = len(updated_series) - before_len
-                        if net > 0:
-                            updated_series = updated_series.iloc[net:]
+                        # 滑动窗口：始终将序列长度限制在合并前的长度，
+                        # 即使本次未净增新点（net==0）也执行裁切，
+                        # 避免启用滑动窗口后旧数据残留导致长度只增不减。
+                        if len(updated_series) > before_len:
+                            updated_series = updated_series.iloc[len(updated_series) - before_len:]
                     res[metric] = updated_series
                     new_pts = max(0, len(res[metric]) - before_len)
                     metric_changed = not updated_series.equals(before_series)
@@ -802,7 +805,11 @@ def _run_scoped_data_update(
         if not result.get("success"):
             results["success"] = False
             results["error"] = result.get("error")
-            break
+            logger.warning(
+                "[updater] scope %s 更新失败（%s），继续处理其他 scope",
+                scope, result.get("error"),
+            )
+            continue
         results["resources_updated"] += int(result.get("resources_updated") or 0)
         results["resources_created"] += int(result.get("resources_created") or 0)
         results["total_new_points"] += int(result.get("total_new_points") or 0)

@@ -49,15 +49,35 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         if not isinstance(spec, dict) or not isinstance(target, dict):
             return 0.0
         ratios = []
-        for dim in ("cpu_cores", "memory_gb", "disk_gb"):
+        # VM 维度键
+        vm_dims = ("cpu_cores", "memory_gb", "disk_gb")
+        # K8S 维度键（request 优先，回退到通用键）
+        k8s_dims = ("cpu_request_cores", "cpu_cores", "memory_request_gb", "memory_gb")
+        all_dims = vm_dims + k8s_dims
+        checked: set = set()
+        for dim in all_dims:
             cur = parse_float_or_none(spec.get(dim)) or 0.0
             nxt = parse_float_or_none(target.get(dim)) or 0.0
             if cur <= 0 or nxt <= 0:
                 continue
-            if action == "scale_out":
+            # 避免同一物理维度重复计算（如 cpu_cores 与 cpu_request_cores）
+            base_key = dim.split("_")[0]  # "cpu" / "memory" / "disk"
+            if base_key in checked:
+                continue
+            checked.add(base_key)
+            if action in {"scale_out", "scale_out_candidate"}:
                 ratios.append(max(nxt / cur - 1.0, 0.0))
-            elif action == "scale_in":
+            elif action in {"scale_in", "scale_in_candidate"}:
                 ratios.append(max(1.0 - nxt / cur, 0.0))
+        # K8S 副本数变化
+        if "replicas" in target:
+            cur_rep = parse_float_or_none(spec.get("replicas") or spec.get("replicas_observed")) or 0.0
+            nxt_rep = parse_float_or_none(target.get("replicas")) or 0.0
+            if cur_rep > 0 and nxt_rep > 0:
+                if action in {"scale_out", "scale_out_candidate"}:
+                    ratios.append(max(nxt_rep / cur_rep - 1.0, 0.0))
+                elif action in {"scale_in", "scale_in_candidate"}:
+                    ratios.append(max(1.0 - nxt_rep / cur_rep, 0.0))
         return min(18.0, 18.0 * max(ratios, default=0.0))
 
     confidence_bonus = {

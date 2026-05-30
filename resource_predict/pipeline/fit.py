@@ -63,7 +63,7 @@ def fit_one_metric(
             rolling_mae = mean_metric(metrics, "rolling_mae")
             if rolling_mae is not None:
                 metrics["ensemble"]["rolling_mae"] = rolling_mae
-            metrics["ensemble"]["rolling_folds"] = max(
+            metrics["ensemble"]["rolling_folds"] = min(
                 float(v.get("rolling_folds", 0.0))
                 for k, v in metrics.items()
                 if k != "ensemble"
