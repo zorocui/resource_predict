@@ -316,6 +316,26 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         self.assertTrue(cpu_queries)
         self.assertTrue(all("[10m]" in query for query in cpu_queries))
 
+    def test_fetch_target_uses_configured_cpu_rate_window(self):
+        target = PrometheusTarget(
+            cluster="cluster-a",
+            prometheus_url="http://prometheus.example",
+            namespace_regex="",
+            bearer_token="",
+            basic_auth="",
+            history_days=1,
+            step_seconds=300,
+            request_timeout_seconds=5,
+            rate_window="7m",
+        )
+
+        with patch.object(provider, "PrometheusClient", FakePrometheusClient):
+            provider._fetch_target(target, limit=0)
+
+        cpu_queries = [q for q in FakePrometheusClient.queries if "container_cpu_usage_seconds_total" in q]
+        self.assertTrue(cpu_queries)
+        self.assertTrue(all("[7m]" in query for query in cpu_queries))
+
     def test_fetch_target_keeps_asymmetric_container_requests_and_limits_separate(self):
         target = PrometheusTarget(
             cluster="cluster-k8s-1",

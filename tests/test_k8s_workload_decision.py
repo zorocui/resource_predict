@@ -71,10 +71,10 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
                 "workload_kind": "Deployment",
                 "workload_name": "api",
                 "replicas_observed": 2,
-                "cpu_request_cores": 0.5,
-                "cpu_limit_cores": 1.0,
-                "memory_request_gb": 1.0,
-                "memory_limit_gb": 2.0,
+                "cpu_request_cores": 2.0,
+                "cpu_limit_cores": 4.0,
+                "memory_request_gb": 2.0,
+                "memory_limit_gb": 4.0,
             },
             "data_quality": {
                 "cpu": {"level": "good"},
@@ -92,8 +92,8 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         self.assertEqual(advice["action"], "scale_out_candidate")
         self.assertFalse(advice["analysis_only"])
-        self.assertGreater(advice["target_spec"]["cpu_request_cores"], 0.5)
-        self.assertGreater(advice["target_spec"]["memory_request_gb"], 1.0)
+        self.assertGreaterEqual(advice["target_spec"]["cpu_request_cores"], 2.0)
+        self.assertGreaterEqual(advice["target_spec"]["memory_request_gb"], 2.0)
         for key in (
             "cpu_request_cores",
             "cpu_limit_cores",
@@ -107,6 +107,44 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
             advice["target_k8s_policy"]["recommendations"]["replicas"]["target_replicas"],
             advice["target_spec"]["replicas"],
         )
+
+    def test_scale_out_preserves_small_request_limit_granularity(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 2,
+                "cpu_request_cores": 0.5,
+                "cpu_limit_cores": 0.5,
+                "memory_request_gb": 0.5,
+                "memory_limit_gb": 0.5,
+            },
+            "data_quality": {
+                "cpu": {"level": "good"},
+                "memory": {"level": "good"},
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu": np.array([0.92, 0.95, 0.98]),
+                "memory": np.array([0.82, 0.86, 0.9]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_out_candidate")
+        self.assertLess(advice["target_spec"]["cpu_request_cores"], 2.0)
+        self.assertLess(advice["target_spec"]["cpu_limit_cores"], 2.0)
+        self.assertLess(advice["target_spec"]["memory_request_gb"], 2.0)
+        self.assertLess(advice["target_spec"]["memory_limit_gb"], 2.0)
+        self.assertEqual(advice["target_spec"]["cpu_request_cores"], 0.5)
+        self.assertEqual(advice["target_spec"]["memory_request_gb"], 0.5)
+        self.assertGreater(advice["target_spec"]["replicas"], 2)
 
     def test_scale_in_does_not_round_small_specs_up_into_resource_expansion(self):
         resource = {

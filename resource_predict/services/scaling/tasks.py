@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from resource_predict.resource_types import metric_names_for_resource, resource_type_of
 from resource_predict.settings import settings
 from resource_predict.services.scaling.cluster_config import get_cluster_config
 from resource_predict.services.scaling.command_runner import run_ssh_command
@@ -18,6 +19,8 @@ from resource_predict.services.scaling.snapshot import apply_scaling_success_sna
 TASKS_PATH = Path(settings.app.out_dir) / "scaling_tasks.json"
 _LOCK = threading.RLock()
 logger = logging.getLogger(__name__)
+_READY_POLICY_TIERS = {"conservative", "balanced", "aggressive"}
+_MIN_EXECUTION_CONFIDENCE_SCORE = 72.0
 
 
 def create_scaling_task(
@@ -31,6 +34,7 @@ def create_scaling_task(
 ) -> Dict[str, Any]:
     mode = mode if mode in {"dry_run", "execute"} else "dry_run"
     resource_id = str(resource.get("resource_id", "")).strip()
+    resolved_target_source = _target_source(target_spec_override, target_source)
     running = get_active_task_for_resource(resource_id)
     if running is not None:
         logger.warning(
@@ -39,6 +43,20 @@ def create_scaling_task(
             running.get("task_id", "-"),
         )
         raise RuntimeError(f"resource {resource_id} already has a scaling task running")
+    if mode == "execute":
+        gate_failures = _execution_gate_failures(
+            resource,
+            target_source=resolved_target_source,
+        )
+        if gate_failures:
+            logger.warning(
+                "[scaling] task rejected: resource_id=%s reason=execution_gate failures=%s",
+                resource_id,
+                gate_failures,
+            )
+            raise RuntimeError(
+                "execution gate blocked scaling: " + "; ".join(gate_failures)
+            )
 
     task_id = f"scale-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
     now = _now_ms()
@@ -48,7 +66,7 @@ def create_scaling_task(
         "mode": mode,
         "operator": operator,
         "allow_create_flavor": bool(allow_create_flavor),
-        "target_source": _target_source(target_spec_override, target_source),
+        "target_source": resolved_target_source,
         "status": "queued",
         "created_at_ms": now,
         "updated_at_ms": now,
@@ -73,6 +91,125 @@ def create_scaling_task(
     )
     thread.start()
     return task
+
+
+def _execution_gate_failures(
+    resource: Dict[str, Any],
+    *,
+    target_source: str = "suggested",
+    now_ms: Optional[int] = None,
+) -> List[str]:
+    """执行前门控：建议未就绪、置信度低、数据质量差或冷却期内均拒绝执行。"""
+    failures: List[str] = []
+    advice = resource.get("scaling_advice", {}) if isinstance(resource, dict) else {}
+    if not isinstance(advice, dict):
+        return ["missing scaling_advice"]
+    source = str(target_source or "suggested").strip().lower()
+    manual_target = source == "manual" or str(advice.get("target_source") or "").lower() == "manual"
+    action = str(advice.get("action") or "").strip().lower()
+    policy_tier = str(
+        advice.get("policy_tier")
+        or (advice.get("risk_profile", {}) if isinstance(advice.get("risk_profile"), dict) else {}).get("policy_tier")
+        or ""
+    ).strip().lower()
+    if policy_tier not in _READY_POLICY_TIERS:
+        failures.append("policy_tier is missing or invalid")
+
+    if not manual_target:
+        gate = advice.get("action_gate", {})
+        gate_state = str(gate.get("state") if isinstance(gate, dict) else "").strip().lower()
+        if gate_state != "ready":
+            failures.append(f"action_gate is not ready (state={gate_state or 'missing'})")
+        confidence_score = _as_float(advice.get("confidence_score"))
+        confidence = str(advice.get("confidence") or "").strip().lower()
+        if confidence_score is None or confidence_score < _MIN_EXECUTION_CONFIDENCE_SCORE or confidence != "high":
+            failures.append(
+                "confidence is below execution threshold "
+                f"(confidence={confidence or 'missing'}, score={confidence_score})"
+            )
+    failures.extend(_data_quality_failures(resource, advice))
+    cooldown_failure = _cooldown_failure(resource, advice, action=action, now_ms=now_ms)
+    if cooldown_failure:
+        failures.append(cooldown_failure)
+    k8s_policy = advice.get("target_k8s_policy", {})
+    if (
+        resource_type_of(resource) == "k8s_workload"
+        and isinstance(k8s_policy, dict)
+        and not bool(k8s_policy.get("ready_for_execution", True))
+    ):
+        failures.append("target_k8s_policy is not ready_for_execution")
+    return failures
+
+
+def _data_quality_failures(resource: Dict[str, Any], advice: Dict[str, Any]) -> List[str]:
+    quality = resource.get("data_quality", {}) if isinstance(resource, dict) else {}
+    if not isinstance(quality, dict):
+        quality = {}
+    rtype = resource_type_of(resource)
+    if rtype != "k8s_workload" and not quality:
+        return []
+    metric_actions = advice.get("metric_actions", {})
+    if not isinstance(metric_actions, dict):
+        metric_actions = {}
+    failures: List[str] = []
+    for metric in metric_names_for_resource(resource):
+        action = str(metric_actions.get(metric) or "").lower()
+        if rtype == "k8s_workload" and action in {"", "hold"}:
+            continue
+        block = quality.get(metric, {})
+        level = str(block.get("level") if isinstance(block, dict) else "").lower()
+        if rtype == "k8s_workload":
+            if level != "good":
+                failures.append(f"{metric} data_quality is not good (level={level or 'missing'})")
+        elif level and level != "good":
+            failures.append(f"{metric} data_quality is not good (level={level})")
+    return failures
+
+
+def _cooldown_failure(
+    resource: Dict[str, Any],
+    advice: Dict[str, Any],
+    *,
+    action: str,
+    now_ms: Optional[int],
+) -> str:
+    spec = resource.get("spec", {}) if isinstance(resource, dict) else {}
+    if not isinstance(spec, dict):
+        return ""
+    last_scaled = _as_float(spec.get("last_scaled_at_epoch_ms"))
+    if last_scaled is None or last_scaled <= 0:
+        return ""
+    risk_profile = advice.get("risk_profile", {})
+    cooldown_minutes = None
+    if isinstance(risk_profile, dict):
+        cooldown_minutes = _as_float(risk_profile.get("cooldown_minutes"))
+    if cooldown_minutes is None:
+        cooldown_minutes = _default_cooldown_minutes(action)
+    if cooldown_minutes is None or cooldown_minutes <= 0:
+        return ""
+    now = int(now_ms if now_ms is not None else _now_ms())
+    elapsed_ms = max(0.0, float(now) - float(last_scaled))
+    required_ms = float(cooldown_minutes) * 60_000.0
+    if elapsed_ms < required_ms:
+        remaining_minutes = int((required_ms - elapsed_ms + 59_999) // 60_000)
+        return f"cooldown is active ({remaining_minutes} minutes remaining)"
+    return ""
+
+
+def _default_cooldown_minutes(action: str) -> Optional[float]:
+    if action in {"scale_out", "scale_out_candidate"}:
+        return float(settings.decision.scale_out_cooldown_minutes)
+    if action in {"scale_in", "scale_in_candidate"}:
+        return float(settings.decision.scale_in_cooldown_minutes)
+    return None
+
+
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    return parsed if parsed == parsed else None
 
 
 def _target_source(target_spec_override: Any, target_source: str) -> str:

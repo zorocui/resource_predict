@@ -9,6 +9,7 @@ import numpy as np
 from resource_predict.data.io import atomic_write_json, index_prepared_by_id, merge_manifest_resources
 from resource_predict.pipeline.constants import (
     DETAILS_DIRNAME,
+    FORECAST_ERROR_REPORT_FILENAME,
     GENERATION_STATS_FILENAME,
     MANIFEST_FILENAME,
     RAW_DATA_FILENAME,
@@ -119,11 +120,25 @@ def write_prediction_outputs(
         ensure_ascii=False,
         indent=2,
     )
+    error_report = _build_forecast_error_report(
+        resources_items=resources_items,
+        active_methods=active_methods,
+        test_size=test_size,
+        future_steps=future_steps,
+        forecast_window=forecast_window,
+    )
+    atomic_write_json(
+        out_base / FORECAST_ERROR_REPORT_FILENAME,
+        error_report,
+        ensure_ascii=False,
+        indent=2,
+    )
 
     total_bytes = 0
     for p in [
         out_base / SUMMARY_INDEX_FILENAME,
         out_base / MANIFEST_FILENAME,
+        out_base / FORECAST_ERROR_REPORT_FILENAME,
     ]:
         if p.exists():
             total_bytes += int(p.stat().st_size)
@@ -148,6 +163,7 @@ def write_prediction_outputs(
         "detail_chunk_size": detail_chunk_size,
         "total_elapsed_seconds": total_elapsed,
         "total_output_bytes": total_bytes,
+        "forecast_error_report_file": FORECAST_ERROR_REPORT_FILENAME,
     }
     atomic_write_json(
         out_base / GENERATION_STATS_FILENAME,
@@ -156,3 +172,106 @@ def write_prediction_outputs(
         indent=2,
     )
     return manifest_items
+
+
+def _build_forecast_error_report(
+    *,
+    resources_items: List[Dict[str, Any]],
+    active_methods: List[str],
+    test_size: int,
+    future_steps: int,
+    forecast_window: Dict[str, Any],
+) -> Dict[str, Any]:
+    """构建按资源/指标/模型/窗口展开的预测误差报告。"""
+    rows: List[Dict[str, Any]] = []
+    resources: List[Dict[str, Any]] = []
+    window_info = {
+        "test_size": test_size,
+        "future_steps": future_steps,
+        "resource_family": forecast_window.get("resource_family"),
+        "test_duration": forecast_window.get("test_duration"),
+        "future_duration": forecast_window.get("future_duration"),
+        "sample_interval_seconds": forecast_window.get("sample_interval_seconds"),
+        "source": forecast_window.get("source"),
+    }
+    for item in resources_items:
+        rid = str(item.get("resource_id"))
+        rtype = resource_type_of(item)
+        metrics_out: Dict[str, Dict[str, Any]] = {}
+        metrics_by_kind = item.get("metrics", {})
+        if not isinstance(metrics_by_kind, dict):
+            continue
+        for metric in metric_names_for_resource(item):
+            kind_metrics = metrics_by_kind.get(metric, {})
+            if not isinstance(kind_metrics, dict):
+                continue
+            model_metrics: Dict[str, Dict[str, Any]] = {}
+            methods = _ordered_methods(kind_metrics, active_methods)
+            for method in methods:
+                metric_obj = kind_metrics.get(method, {})
+                if not isinstance(metric_obj, dict):
+                    continue
+                errors = {
+                    "rmse": _json_float(metric_obj.get("rmse")),
+                    "mae": _json_float(metric_obj.get("mae")),
+                    "mape": _json_float(metric_obj.get("mape")),
+                    "p95_error": _json_float(metric_obj.get("p95_error")),
+                    "selection_rmse": _json_float(metric_obj.get("selection_rmse")),
+                    "rolling_rmse": _json_float(metric_obj.get("rolling_rmse")),
+                    "rolling_mae": _json_float(metric_obj.get("rolling_mae")),
+                    "rolling_folds": _json_float(metric_obj.get("rolling_folds")),
+                    "window": window_info,
+                }
+                model_metrics[method] = errors
+                rows.append(
+                    {
+                        "resource_id": rid,
+                        "resource_type": rtype,
+                        "metric": metric,
+                        "model": method,
+                        **errors,
+                    }
+                )
+            if model_metrics:
+                metrics_out[metric] = model_metrics
+        if metrics_out:
+            resources.append(
+                {
+                    "resource_id": rid,
+                    "resource_type": rtype,
+                    "metrics": metrics_out,
+                }
+            )
+    return {
+        "meta": {
+            "generated_at_epoch_ms": int(time.time() * 1000),
+            "resources": len(resources),
+            "rows": len(rows),
+            "active_methods": active_methods,
+            "window": window_info,
+        },
+        "resources": resources,
+        "rows": rows,
+    }
+
+
+def _ordered_methods(kind_metrics: Dict[str, Any], active_methods: List[str]) -> List[str]:
+    seen = set()
+    methods: List[str] = []
+    for method in active_methods:
+        if method in kind_metrics and method not in seen:
+            methods.append(method)
+            seen.add(method)
+    for method in kind_metrics:
+        if method not in seen:
+            methods.append(str(method))
+            seen.add(str(method))
+    return methods
+
+
+def _json_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if np.isfinite(out) else None

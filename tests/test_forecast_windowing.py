@@ -10,6 +10,7 @@ import pandas as pd
 
 from resource_predict.data.io import read_raw_dataset
 from resource_predict.data.updater import run_upsert_with_data
+from resource_predict.pipeline.constants import FORECAST_ERROR_REPORT_FILENAME
 from resource_predict.pipeline.run import generate_forecasts
 from resource_predict.pipeline.windowing import infer_series_freq, resolve_forecast_window
 from resource_predict.settings import settings
@@ -190,6 +191,19 @@ class ForecastWindowingTest(unittest.TestCase):
             self.assertEqual(stats["future_steps"], 288)
             self.assertEqual(stats["forecast_window"]["resource_family"], "workload")
             self.assertEqual(stats["forecast_window"]["test_duration"], "24h")
+            self.assertEqual(stats["forecast_error_report_file"], FORECAST_ERROR_REPORT_FILENAME)
+            report = __import__("json").loads((base / FORECAST_ERROR_REPORT_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual(report["meta"]["window"]["test_size"], 288)
+            self.assertEqual(report["meta"]["window"]["future_steps"], 288)
+            self.assertTrue(report["rows"])
+            row = report["rows"][0]
+            self.assertEqual(row["resource_id"], item["resource_id"])
+            self.assertIn(row["metric"], {"cpu", "memory"})
+            self.assertEqual(row["model"], "rolling_mean")
+            for key in ("rmse", "mae", "mape", "p95_error"):
+                self.assertIn(key, row)
+                self.assertIsInstance(row[key], (int, float))
+            self.assertEqual(row["window"]["source"], "workload_test_duration,workload_future_duration")
 
 
 if __name__ == "__main__":

@@ -146,8 +146,17 @@ def _recommend_k8s_policy(
     return policy
 
 
+def _round_small_k8s_target(value: float) -> float:
+    """保留小规格 Workload 的毫核/Mi 粒度，避免被偶数整数规则放大。"""
+    return max(0.001, round(float(value), 3))
+
+
 def _round_k8s_even_target(value: float, *, action: str, base: float) -> int | float | None:
-    """对齐目标规格到偶数整数；小规格（base < 2）缩容场景返回 None 以避免向上膨胀。"""
+    """对齐 K8S 目标规格。
+
+    大规格仍按偶数整数对齐；小于 2C/2Gi 的 Workload 保留小数粒度，
+    避免 0.5C 级别的 request/limit 被直接放大到 2C。
+    """
     if action == "scale_in_candidate":
         if base < 2.0:
             # 小规格 workload 缩容时向上取到 2 会超过原始 base，跳过 per-replica 推荐
@@ -157,6 +166,8 @@ def _round_k8s_even_target(value: float, *, action: str, base: float) -> int | f
         if rounded >= float(base):
             return None
         return rounded
+    if base < 2.0 or float(value) < 2.0:
+        return _round_small_k8s_target(value)
     rounded = int(np.ceil(float(value) / 2.0) * 2)
     return max(2, rounded)
 
@@ -166,8 +177,18 @@ def _round_k8s_even_target_limit(
     *,
     action: str,
     current_limit: float | None,
-    request: int,
-) -> int:
+    request: int | float,
+) -> int | float:
+    largest_small_value = max(
+        float(value),
+        float(request),
+        float(current_limit) if current_limit is not None else 0.0,
+    )
+    if largest_small_value < 2.0:
+        target = max(float(value), float(request))
+        if action == "scale_out_candidate" and current_limit is not None:
+            target = max(target, float(current_limit))
+        return _round_small_k8s_target(target)
     rounded = max(request, int(np.ceil(float(value) / 2.0) * 2), 2)
     if action == "scale_out_candidate" and current_limit is not None:
         rounded = max(rounded, int(np.ceil(float(current_limit) / 2.0) * 2))

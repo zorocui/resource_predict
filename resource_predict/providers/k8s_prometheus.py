@@ -290,7 +290,7 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
 
     cpu_usage = _range_by_key(
         client.query_range(
-            f"rate(container_cpu_usage_seconds_total{{{selector}}}[10m])",
+            f"rate(container_cpu_usage_seconds_total{{{selector}}}[{target.rate_window}])",
             start=start,
             end=end,
             step=step,

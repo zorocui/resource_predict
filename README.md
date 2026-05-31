@@ -15,6 +15,7 @@
 - 策略分级（conservative / balanced / aggressive）
 - Namespace-aware 差异化阈值
 - 增量数据接入（pull 定时 / push HTTP）
+- 预测误差报告（RMSE / MAE / MAPE / P95 error）
 - 紧急度评分与优先级排序
 - 调配执行与结果快照
 
@@ -424,7 +425,7 @@ sequenceDiagram
 - **策略分级**：conservative / balanced / aggressive，阈值和确认轮次差异化
 - **风险画像**：每个资源生成 `risk_profile`，包含 `saturation_risk`（饱和风险分）、`idle_opportunity`（空闲机会分）、`risk_score`（综合风险分）、当前生效阈值和冷却时间
 - **置信度评分**：多指标加权（P95 强度 42 + 峰值强度 20 + 均值强度 14 + 持续性 16 + 趋势 8）
-- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需确认轮次（conservative 缩容 +1 轮，aggressive 缩容 -1 轮）
+- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需确认轮次（conservative 缩容 +1 轮，aggressive 缩容 -1 轮）；进入 `execute` 前还会强制校验 `confidence`、`data_quality`、`cooldown` 和 `policy_tier`
 
 ### 5.3 K8S Workload 决策引擎（`core/k8s_workload_decision.py`）
 
@@ -433,7 +434,7 @@ sequenceDiagram
 - **数据质量**：`_quality_level()` 评估每个指标的数据质量，poor 质量自动跳过执行建议
 - **Baseline 缺失处理**：缺少 request/limit 时降级为 trend-only 分析
 - **目标利用率分级**：`_target_utilization()` 按策略层级返回差异化利用率目标（0.55~0.78）
-- **requests/limits 建议**：按容器粒度，per-replica target 与副本数独立计算避免双重缩放
+- **requests/limits 建议**：按容器粒度，per-replica target 与副本数独立计算避免双重缩放；小于 `2C/2Gi` 的 Workload 保留小数粒度，避免 `0.5C` 级别 request/limit 被放大到 `2C`
 - **副本数建议**：Deployment / StatefulSet / ReplicaSet 支持；DaemonSet 跳过副本缩放并给出警告
 - **Namespace 策略**：自动从 spec 中识别 namespace 并匹配 conservative / aggressive 分组
 - **Workload 类型归一化**：`_workload_kind()` 标准化控制器类型字符串
@@ -452,6 +453,7 @@ sequenceDiagram
 
 - **OpenStack VM**：自动发现可用 flavor -> 选择/生成目标 flavor -> `openstack server resize` -> 可选自动/手动 confirm
 - **K8S Workload**：`kubectl set resources` 按容器粒度 -> `kubectl scale` 调整副本数
+- **执行前置校验**：`execute` 模式仅允许 `action_gate=ready`、高置信度、数据质量良好、未处于冷却期且策略层级有效的建议进入实际执行；手动 `target_spec` 仍需通过数据质量、冷却期和策略层级校验
 - **安全**：所有用户可控值使用 `shlex.quote()` 转义
 - **快照**：调配成功后自动更新 `summary_index.json` / `details/*.json` / `raw_data.json` / `manifest.json` 中的 spec
 
@@ -553,7 +555,8 @@ cp deploy/clusters.example.json deploy/clusters.json
     "prometheus_url": "http://prometheus.example:9090",
     "namespace_regex": "default|prod",
     "bearer_token": "",
-    "basic_auth": ""
+    "basic_auth": "",
+    "rate_window": "5m"
   }
 ]
 ```
@@ -588,6 +591,8 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | `UpdateConfig` | `enabled` / `interval_minutes` / `sliding_window` / `display_window_points` | `False` / `60` / `False` / `0` |
 | `K8SPrometheusConfig` | `history_days` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` | `7` / `300` / `5m` / `False` / `360` |
 
+`rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值。
+
 **预测窗口配置说明：**
 
 | 配置 | 作用 |
@@ -620,6 +625,7 @@ outputs/
 │   ├── raw_data.json          # 原始观测数据
 │   ├── summary_index.json     # 资源列表摘要（含扩缩容建议）
 │   ├── manifest.json          # 完整预测结果（含 charts）
+│   ├── forecast_error_report.json # 预测误差报告
 │   ├── generation_stats.json  # 本次生成统计
 │   ├── backups/               # raw_data.json 历史备份
 │   │   └── raw_data.20260530-120000.json
@@ -630,6 +636,7 @@ outputs/
 │   ├── raw_data.json
 │   ├── summary_index.json
 │   ├── manifest.json
+│   ├── forecast_error_report.json
 │   ├── generation_stats.json
 │   ├── backups/               # raw_data.json 历史备份
 │   └── details/
@@ -677,9 +684,13 @@ outputs/
 
 预测详情分片，每个分片包含若干资源的完整预测数据。通过 `summary_index.json` 中的 `detail_ref` 引用。
 
+#### `forecast_error_report.json`
+
+预测误差报告，按资源、指标、模型和窗口展开，输出 `rmse`、`mae`、`mape`、`p95_error` 等指标。`rows` 提供扁平记录，`resources` 提供按资源聚合的嵌套结构，便于报表、审计和模型效果对比。
+
 #### `generation_stats.json`
 
-本次预测的统计信息：资源数、预测模型、窗口参数、耗时、输出大小等。
+本次预测的统计信息：资源数、预测模型、窗口参数、耗时、输出大小、误差报告文件名等。
 
 #### `backups/`
 
@@ -783,6 +794,8 @@ outputs/
 | `target_spec` | 可选，覆盖预测建议的目标规格 |
 | `confirm_create_flavor` | 可选，允许自动创建 OpenStack flavor |
 | `target_source` | 可选，标记目标规格来源 |
+
+`execute` 模式会在入队前执行门控校验。建议目标必须满足 `action_gate=ready`、`confidence=high` 且置信度分数达标、相关指标 `data_quality=good`、不在冷却期内、`policy_tier` 有效；否则返回错误并拒绝创建执行任务。
 
 **任务状态流转：**
 
