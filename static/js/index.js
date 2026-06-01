@@ -21,6 +21,21 @@
     if (app.state.activeView === "configs") refreshClusterConfigs();
   }
 
+  function setDetailTab(tab) {
+    const nextTab = tab || "summary";
+    app.els.detailTabs.forEach((btn) => {
+      const active = btn.dataset.detailTab === nextTab;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+    app.els.detailTabPanels.forEach((panel) => {
+      panel.classList.toggle("active", panel.dataset.detailPanel === nextTab);
+    });
+    if (nextTab === "metrics") {
+      requestAnimationFrame(() => app.detailChartInstance?.resize());
+    }
+  }
+
   async function loadQueue({ keepSelection = false } = {}) {
     app.els.summaryText.textContent = "正在加载资源...";
     const [payload, forecastPayload] = await Promise.all([
@@ -613,6 +628,9 @@
       app.state.selectedMetricKey = btn.dataset.metricKey || "cpu";
       list.selectResource(app.state.selectedResourceId, app.state.selectedMetricKey);
     });
+    app.els.detailTabs.forEach((tab) => {
+      tab.addEventListener("click", () => setDetailTab(tab.dataset.detailTab || "summary"));
+    });
     app.els.chartGuideBtn.addEventListener("click", charts.toggleChartAuxiliary);
     app.els.chartZoomBtn?.addEventListener("click", () => charts.openChartModal());
     app.els.detailClose.addEventListener("click", () => {
@@ -646,6 +664,7 @@
     }
     bindFilters();
     bindEvents();
+    setDetailTab("summary");
     setView("risk");
     try {
       await loadQueue();

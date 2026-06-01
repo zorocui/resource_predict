@@ -124,6 +124,64 @@ class ScalingTasksTest(unittest.TestCase):
 
         self.assertEqual(_execution_gate_failures(resource, now_ms=now_ms), [])
 
+    def test_execution_gate_rejects_multi_container_suggested_resource_target(self):
+        now_ms = 1_780_000_000_000
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "containers_observed": ["app", "sidecar"],
+            },
+            "data_quality": K8S_QUALITY_GOOD,
+            "scaling_advice": {
+                "action": "scale_out_candidate",
+                "confidence": "high",
+                "confidence_score": 88.0,
+                "policy_tier": "balanced",
+                "action_gate": {"state": "ready"},
+                "metric_actions": {"cpu": "scale_out_candidate", "memory": "hold"},
+                "risk_profile": {"cooldown_minutes": 60},
+                "target_k8s_policy": {"ready_for_execution": True},
+                "target_spec": {"cpu_request_cores": 0.5, "replicas": 3},
+            },
+        }
+
+        failures = _execution_gate_failures(resource, now_ms=now_ms)
+
+        self.assertTrue(any("target_spec.containers" in item for item in failures))
+
+    def test_execution_gate_allows_multi_container_replica_only_target(self):
+        now_ms = 1_780_000_000_000
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "containers_observed": ["app", "sidecar"],
+            },
+            "data_quality": K8S_QUALITY_GOOD,
+            "scaling_advice": {
+                "action": "scale_out_candidate",
+                "confidence": "high",
+                "confidence_score": 88.0,
+                "policy_tier": "balanced",
+                "action_gate": {"state": "ready"},
+                "metric_actions": {"cpu": "hold", "memory": "hold"},
+                "risk_profile": {"cooldown_minutes": 60},
+                "target_k8s_policy": {"ready_for_execution": True},
+                "target_spec": {"replicas": 3},
+            },
+        }
+
+        self.assertEqual(_execution_gate_failures(resource, now_ms=now_ms), [])
+
 
 if __name__ == "__main__":
     unittest.main()

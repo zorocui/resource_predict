@@ -238,10 +238,16 @@
                 <h2 id="detail-title">-</h2>
                 <p id="detail-subtitle">-</p>
               </div>
-              <button id="detail-close" class="mobile-only icon-text-btn" type="button">关闭</button>
+              <button id="detail-close" class="icon-text-btn detail-close-btn" type="button">关闭</button>
             </div>
 
-            <section class="detail-card">
+            <div class="detail-tabs" aria-label="资源详情分区">
+              <button class="active" type="button" data-detail-tab="summary">结论</button>
+              <button type="button" data-detail-tab="metrics">指标</button>
+              <button type="button" data-detail-tab="spec">规格</button>
+            </div>
+
+            <section class="detail-card detail-tab-panel active" data-detail-panel="summary">
               <div class="detail-card-head">
                 <h3>建议结论</h3>
                 <span id="detail-confidence" class="confidence-chip">-</span>
@@ -250,7 +256,7 @@
               <div id="detail-actions" class="detail-actions"></div>
             </section>
 
-            <section class="detail-card">
+            <section class="detail-card detail-tab-panel" data-detail-panel="metrics">
               <div class="detail-card-head">
                 <h3>指标预测</h3>
                 <div class="chart-card-actions">
@@ -262,7 +268,7 @@
               <div id="detail-chart" class="detail-chart"></div>
             </section>
 
-            <section class="detail-card">
+            <section class="detail-card detail-tab-panel" data-detail-panel="spec">
               <h3>资源规格</h3>
               <div id="detail-spec" class="spec-grid"></div>
             </section>

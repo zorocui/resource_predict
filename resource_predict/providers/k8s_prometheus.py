@@ -71,6 +71,7 @@ class PrometheusTarget:
 
 ContainerKey = Tuple[str, str, str]
 WorkloadKey = Tuple[str, str, str]
+BYTES_PER_GIB = 1024 ** 3
 
 
 def k8s_workload_prometheus_provider(
@@ -203,19 +204,19 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
 
         cpu_request = _instant_values(client, [
             f"kube_pod_container_resource_requests_cpu_cores{{{selector}}}",
-            f'kube_pod_container_resource_requests{{{selector},resource="cpu"}}',
+            f'kube_pod_container_resource_requests{{{selector},resource="cpu",unit="core"}}',
         ])
         cpu_limit = _instant_values(client, [
             f"kube_pod_container_resource_limits_cpu_cores{{{selector}}}",
-            f'kube_pod_container_resource_limits{{{selector},resource="cpu"}}',
+            f'kube_pod_container_resource_limits{{{selector},resource="cpu",unit="core"}}',
         ])
         mem_request = _instant_values(client, [
             f"kube_pod_container_resource_requests_memory_bytes{{{selector}}}",
-            f'kube_pod_container_resource_requests{{{selector},resource="memory"}}',
+            f'kube_pod_container_resource_requests{{{selector},resource="memory",unit="byte"}}',
         ])
         mem_limit = _instant_values(client, [
             f"kube_pod_container_resource_limits_memory_bytes{{{selector}}}",
-            f'kube_pod_container_resource_limits{{{selector},resource="memory"}}',
+            f'kube_pod_container_resource_limits{{{selector},resource="memory",unit="byte"}}',
         ])
         query_counts["cpu_request_series"] = len(cpu_request)
         query_counts["cpu_limit_series"] = len(cpu_limit)
@@ -306,19 +307,19 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
     )
     cpu_request = _instant_values(client, [
         f"kube_pod_container_resource_requests_cpu_cores{{{selector}}}",
-        f'kube_pod_container_resource_requests{{{selector},resource="cpu"}}',
+        f'kube_pod_container_resource_requests{{{selector},resource="cpu",unit="core"}}',
     ])
     cpu_limit = _instant_values(client, [
         f"kube_pod_container_resource_limits_cpu_cores{{{selector}}}",
-        f'kube_pod_container_resource_limits{{{selector},resource="cpu"}}',
+        f'kube_pod_container_resource_limits{{{selector},resource="cpu",unit="core"}}',
     ])
     mem_request = _instant_values(client, [
         f"kube_pod_container_resource_requests_memory_bytes{{{selector}}}",
-        f'kube_pod_container_resource_requests{{{selector},resource="memory"}}',
+        f'kube_pod_container_resource_requests{{{selector},resource="memory",unit="byte"}}',
     ])
     mem_limit = _instant_values(client, [
         f"kube_pod_container_resource_limits_memory_bytes{{{selector}}}",
-        f'kube_pod_container_resource_limits{{{selector},resource="memory"}}',
+        f'kube_pod_container_resource_limits{{{selector},resource="memory",unit="byte"}}',
     ])
     pod_owners = _pod_owner_values(client, owner_selector)
     replicaset_owners = _replicaset_owner_values(client, replicaset_owner_selector)
@@ -378,7 +379,7 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
                 _bytes_to_gb(mem_limit_by_workload.get(key)),
                 "memory_working_set/memory_limit",
             ),
-            raw_series=mem_s / (1024 ** 3),
+            raw_series=mem_s / BYTES_PER_GIB,
             raw_name="memory_working_set_gb",
         )
         mem_request_metric, mem_request_norm = _normalize_scoped_series(
@@ -387,7 +388,7 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
                 _bytes_to_gb(mem_request_by_workload.get(key)),
                 "memory_working_set/memory_request",
             ),
-            raw_series=mem_s / (1024 ** 3),
+            raw_series=mem_s / BYTES_PER_GIB,
             raw_name="memory_working_set_gb",
         )
         cpu_limit_quality = _data_quality(cpu_limit_norm, step)
@@ -826,7 +827,7 @@ def _normalize_scoped_series(
 def _series_bytes_to_gb(series: Optional[pd.Series]) -> Optional[pd.Series]:
     if series is None:
         return None
-    return series / (1024 ** 3)
+    return series / BYTES_PER_GIB
 
 
 def _regularize_series(series: pd.Series, step_seconds: int) -> pd.Series:
@@ -843,7 +844,7 @@ def _regularize_series(series: pd.Series, step_seconds: int) -> pd.Series:
 def _bytes_to_gb(value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
-    return float(value) / (1024 ** 3)
+    return float(value) / BYTES_PER_GIB
 
 
 def _series_payload(s: pd.Series) -> Dict[str, List[float]]:

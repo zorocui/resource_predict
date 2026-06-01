@@ -184,6 +184,37 @@ class OutputHealthTest(unittest.TestCase):
 
         self.assertTrue(report["ok"], report)
 
+    def test_check_outputs_rejects_multi_container_workload_level_resource_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            summary, raw, details = valid_artifacts()
+            for item in (summary["resources"][1], details["resources"][1]):
+                item["spec"]["containers_observed"] = ["app", "sidecar"]
+                item["spec"]["containers"]["sidecar"] = {
+                    "cpu_request_cores": 0.1,
+                    "cpu_limit_cores": 0.2,
+                    "memory_request_gb": 0.25,
+                    "memory_limit_gb": 0.5,
+                }
+            advice = {
+                "resource_type": "k8s_workload",
+                "action": "scale_out_candidate",
+                "target_k8s_policy": {"recommendations": {"replicas": {"target_replicas": 3}}},
+                "target_spec": {
+                    "cpu_request_cores": 0.75,
+                    "replicas": 3,
+                },
+                "analysis_only": False,
+            }
+            summary["resources"][1]["scaling_advice"] = advice
+            details["resources"][1]["scaling_advice"] = dict(advice)
+            write_scoped_artifacts(base, summary, raw, details)
+
+            report = check_outputs(base)
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("target_spec.containers" in err for err in report["errors"]))
+
     def test_check_outputs_rejects_executable_k8s_without_target_spec(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

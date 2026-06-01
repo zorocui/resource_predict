@@ -147,6 +147,48 @@
     };
   }
 
+  function metricContainerScope(resource, metricKey, displayUnit) {
+    if (!resource || !list.isK8s(resource)) return "";
+    const spec = resource.spec || {};
+    const containers = spec.containers && typeof spec.containers === "object" && !Array.isArray(spec.containers)
+      ? spec.containers
+      : {};
+    const observed = new Set();
+    Object.keys(containers).forEach((name) => {
+      if (String(name || "").trim()) observed.add(String(name).trim());
+    });
+    if (Array.isArray(spec.containers_observed)) {
+      spec.containers_observed.forEach((name) => {
+        const value = String(name || "").trim();
+        if (value) observed.add(value);
+      });
+    }
+    const allNames = Array.from(observed).sort();
+    const scope = {
+      cpu_limit: ["cpu_limit_cores", "CPU Limit"],
+      cpu_request: ["cpu_request_cores", "CPU Request"],
+      memory_limit: ["memory_limit_gb", "内存 Limit"],
+      memory_request: ["memory_request_gb", "内存 Request"],
+    }[metricKey];
+    if (!scope) return "";
+    if (displayUnit !== "percent") {
+      return allNames.length ? `计算容器：${formatContainerNames(allNames)}（绝对值）` : "计算容器：全部观测容器（绝对值）";
+    }
+    const [field, label] = scope;
+    const scopedNames = allNames.filter((name) => {
+      const item = containers[name];
+      return item && item[field] !== undefined && item[field] !== null && item[field] !== "";
+    });
+    if (!scopedNames.length) return `计算容器：有 ${label} 的容器`;
+    return `计算容器：${formatContainerNames(scopedNames)}（有 ${label}）`;
+  }
+
+  function formatContainerNames(names) {
+    const clean = names.map((name) => String(name || "").trim()).filter(Boolean);
+    if (clean.length <= 3) return clean.join(", ");
+    return `${clean.slice(0, 3).join(", ")} 等 ${clean.length} 个`;
+  }
+
   function buildChartOption(chartData, metricKey, displayUnit = "percent", resource = null) {
     const bestMethod = chartData.best_method;
     const isVm = resource ? !list.isK8s(resource) : false;
@@ -175,7 +217,7 @@
       z: 2,
     }];
 
-    // 只在百分比模式下显示阈值辅助线；绝对值模式（cores/GB）下阈值无意义
+    // 只在百分比模式下显示阈值辅助线；绝对值模式（cores/GiB）下阈值无意义
     if (app.chartAuxiliaryVisible && isPercentMode) {
       const futureStart = xPredFuture.length ? normalizeTsMs(xPredFuture[0]) : null;
       const futureEnd = xPredFuture.length ? normalizeTsMs(xPredFuture[xPredFuture.length - 1]) : null;
@@ -257,14 +299,18 @@
 
     const bestRmse = chartData.metrics?.[bestMethod]?.rmse;
     const timeAxis = buildTimeAxisConfigFromPairs(series.map((item) => item.data), windowInfo);
+    const containerScope = metricContainerScope(resource, metricKey, displayUnit);
     return {
       backgroundColor: "transparent",
       animation: false,
       title: {
         text: `${app.metricTitleMap[metricKey] || metricKey} 预测 · ${modeLabel}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
+        subtext: containerScope,
         left: "center",
         top: 6,
         textStyle: { color: "#0f172a", fontSize: 13, fontWeight: 800 },
+        subtextStyle: { color: "#64748b", fontSize: 11, fontWeight: 700, lineHeight: 16 },
+        itemGap: 4,
       },
       tooltip: {
         trigger: "axis",
@@ -282,8 +328,8 @@
           return html;
         },
       },
-      legend: { top: 34, left: 8, data: legendData, itemWidth: 12, itemHeight: 7, textStyle: { color: "#475569", fontSize: 10 } },
-      grid: { left: 48, right: 18, top: 70, bottom: 58 },
+      legend: { top: containerScope ? 54 : 34, left: 8, data: legendData, itemWidth: 12, itemHeight: 7, textStyle: { color: "#475569", fontSize: 10 } },
+      grid: { left: 48, right: 18, top: containerScope ? 88 : 70, bottom: 58 },
       xAxis: {
         type: "time",
         min: timeAxis.min,
@@ -308,7 +354,7 @@
           formatter: (v) => {
             if (!Number.isFinite(v)) return "-";
             if (displayUnit === "cores") return `${Math.round(v)} C`;
-            if (displayUnit === "gb") return `${Math.round(v)} GB`;
+            if (displayUnit === "gib") return list.formatMemoryGiB(v, 1);
             return `${Math.round(v * 100)}%`;
           },
         },
@@ -437,8 +483,8 @@
             <strong title="${list.escapeHtml(name)}">${list.escapeHtml(name)}</strong>
             <span>${list.escapeHtml(formatMaybe(item.cpu_request_cores, "C") || "-")}</span>
             <span>${list.escapeHtml(formatMaybe(item.cpu_limit_cores, "C") || "-")}</span>
-            <span>${list.escapeHtml(formatMaybe(item.memory_request_gb, "GB") || "-")}</span>
-            <span>${list.escapeHtml(formatMaybe(item.memory_limit_gb, "GB") || "-")}</span>
+            <span>${list.escapeHtml(item.memory_request_gb == null ? "-" : list.formatMemoryGiB(item.memory_request_gb))}</span>
+            <span>${list.escapeHtml(item.memory_limit_gb == null ? "-" : list.formatMemoryGiB(item.memory_limit_gb))}</span>
           </div>`;
       }).join("");
       return `
@@ -448,6 +494,7 @@
             <span>Container</span><span>CPU Request</span><span>CPU Limit</span><span>内存 Request</span><span>内存 Limit</span>
           </div>
           ${rows}
+          <div class="container-spec-note">Request 为 Kubernetes / Prometheus 的生效值；只配置 limit 时，Kubernetes 可能将 request 默认成 limit。</div>
         </div>`;
     };
     const entries = list.isK8s(resource)
@@ -502,6 +549,14 @@
     const confidence = list.confidenceOf(resource);
     const stats = advice.stats || {};
     const actionText = list.actionLabel(action);
+    const analysisReasons = list.analysisOnlyReasons(resource);
+    const analysisReasonMarkup = analysisReasons.length ? `
+        <div class="analysis-only-reasons">
+          <span>仅分析原因</span>
+          <ul>
+            ${analysisReasons.map((reason) => `<li>${list.escapeHtml(reason)}</li>`).join("")}
+          </ul>
+        </div>` : "";
     app.els.detailConfidence.innerHTML = `置信度 ${list.escapeHtml(list.CONFIDENCE_LABELS[confidence] || confidence)}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""} ${list.infoTooltip(list.CONFIDENCE_HELP, "置信度计算说明")}`;
     app.els.detailConfidence.className = `confidence-chip is-${confidence}`;
     app.els.detailAdvice.innerHTML = `
@@ -514,6 +569,7 @@
           <span class="decision-label">目标结果</span>
           <small>${list.escapeHtml(list.targetSpecText(resource))}</small>
         </div>
+        ${analysisReasonMarkup}
       </div>
       <div class="reason-grid">
         ${list.metricKeysFor(resource).map((key) => {

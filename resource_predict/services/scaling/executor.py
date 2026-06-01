@@ -303,6 +303,7 @@ def _build_k8s_commands(
     observed_containers = spec.get("containers_observed")
     if not container and isinstance(observed_containers, list) and len(observed_containers) == 1:
         container = str(observed_containers[0] or "").strip()
+    multiple_containers = _has_multiple_containers(spec)
 
     cpu_request = parse_float_or_none(target.get("cpu_request_cores") or target.get("cpu_cores"))
     cpu_limit = parse_float_or_none(target.get("cpu_limit_cores") or target.get("cpu_cores"))
@@ -324,6 +325,10 @@ def _build_k8s_commands(
             if cmd:
                 commands.append(cmd)
     elif cpu_request is not None or memory_request is not None or cpu_limit is not None or memory_limit is not None:
+        if multiple_containers and not container:
+            raise ScalingPlanError(
+                "multiple-container K8S workloads require target_spec.containers for request/limit changes"
+            )
         container_target = {
             "cpu_request_cores": cpu_request,
             "cpu_limit_cores": cpu_limit,
@@ -354,6 +359,20 @@ def _build_k8s_commands(
             "replicas": replicas if replicas > 0 else None,
         }
     }
+
+
+def _has_multiple_containers(spec: Dict[str, Any]) -> bool:
+    raw = spec.get("containers")
+    if isinstance(raw, dict):
+        names = {str(name or "").strip() for name in raw if str(name or "").strip()}
+        if len(names) > 1:
+            return True
+    observed = spec.get("containers_observed")
+    if isinstance(observed, list):
+        names = {str(name or "").strip() for name in observed if str(name or "").strip()}
+        if len(names) > 1:
+            return True
+    return False
 
 
 def _container_targets(target: Dict[str, Any]) -> List[tuple[str, Dict[str, Any]]]:

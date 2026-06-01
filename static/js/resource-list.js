@@ -80,7 +80,7 @@
    * 根据资源类型和指标 key 判断图表 Y 轴显示单位。
    * K8S Workload 在缺少 request/limit 时，后端使用绝对值模式
    * （cpu_usage_cores / memory_working_set_gb），前端需要对应显示
-   * Cores / GB 而非百分比。
+   * Cores / GiB 而非百分比。
    */
   function resolveDisplayUnit(resource, metricKey) {
     if (!resource) return "percent";
@@ -92,7 +92,7 @@
     }
     if (metricKey === "memory_limit" || metricKey === "memory_request") {
       const mode = String(spec[`${metricKey}_metric_mode`] || "");
-      if (mode.includes("memory_working_set_gb") || mode === "raw") return "gb";
+      if (mode.includes("memory_working_set_gb") || mode === "raw") return "gib";
     }
     return "percent";
   }
@@ -104,8 +104,15 @@
     const n = Number(value);
     if (!Number.isFinite(n)) return "-";
     if (displayUnit === "cores") return `${n.toFixed(2)} C`;
-    if (displayUnit === "gb") return `${n.toFixed(2)} GB`;
+    if (displayUnit === "gib") return formatMemoryGiB(n);
     return `${(n * 100).toFixed(1)}%`;
+  }
+
+  function formatMemoryGiB(value, digits = 2) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "-";
+    if (Math.abs(n) < 1) return `${formatNumber(n * 1024, 0)} MiB`;
+    return `${formatNumber(n, digits)} GiB`;
   }
 
   function formatNumber(value, digits = 1) {
@@ -138,8 +145,8 @@
       // 只在值真正存在时才显示；null/undefined 时该字段留空，不显示占位符
       const cpuReq = target.cpu_request_cores != null ? formatNumber(target.cpu_request_cores, 2) : null;
       const cpuLimit = target.cpu_limit_cores != null ? formatNumber(target.cpu_limit_cores, 2) : null;
-      const memReq = target.memory_request_gb != null ? formatNumber(target.memory_request_gb, 2) : null;
-      const memLimit = target.memory_limit_gb != null ? formatNumber(target.memory_limit_gb, 2) : null;
+      const memReq = target.memory_request_gb != null ? formatMemoryGiB(target.memory_request_gb, 2) : null;
+      const memLimit = target.memory_limit_gb != null ? formatMemoryGiB(target.memory_limit_gb, 2) : null;
       const replicas = target.replicas != null ? formatNumber(target.replicas, 0) : null;
       const parts = [];
       // CPU 行：有 request 或 limit 才显示，缺失的一方留空
@@ -152,8 +159,8 @@
       // 内存行：同理
       if (memReq || memLimit) {
         let memText = "";
-        if (memReq) memText += `内存 request ${memReq}GB`;
-        if (memLimit) memText += `${memText ? " / " : "内存 "}limit ${memLimit}GB`;
+        if (memReq) memText += `内存 request ${memReq}`;
+        if (memLimit) memText += `${memText ? " / " : "内存 "}limit ${memLimit}`;
         parts.push(memText);
       }
       if (replicas) parts.push(`副本 ${replicas}`);
@@ -170,6 +177,92 @@
     if (hasMem) parts.push(`${formatNumber(target.memory_gb, 0)}GB`);
     if (hasDisk) parts.push(`${formatNumber(target.disk_gb, 0)}GB`);
     return `目标规格 ${parts.join(" / ")}`;
+  }
+
+  function positiveNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  function sumContainerSpec(spec, field) {
+    const containers = spec?.containers || {};
+    if (!containers || typeof containers !== "object") return null;
+    let total = 0;
+    let found = false;
+    Object.values(containers).forEach((values) => {
+      if (!values || typeof values !== "object") return;
+      const n = positiveNumber(values[field]);
+      if (n === null) return;
+      total += n;
+      found = true;
+    });
+    return found ? total : null;
+  }
+
+  function supportsReplicaScaling(spec) {
+    const kind = String(spec?.workload_kind || spec?.owner_kind || "").trim().toLowerCase().replaceAll("-", "");
+    return ["deployment", "statefulset", "replicaset"].includes(kind);
+  }
+
+  function translatedPolicyNote(note) {
+    const raw = String(note || "").trim();
+    if (!raw) return "";
+    if (raw.includes("lacks request/limit baseline")) return raw.replace(
+      /^(.+) lacks request\/limit baseline; recommendation is trend-only$/,
+      "$1 缺少 request/limit 基线，当前建议仅作为趋势分析"
+    ).replace("CPU", "CPU").replace("memory", "内存");
+    if (raw.includes("DaemonSet replicas follow node scheduling")) {
+      return "DaemonSet 副本跟随节点调度，不能直接生成副本缩放目标。";
+    }
+    if (raw.includes("consider HPA")) return "CPU 触发扩容时更适合结合 HPA 策略评估。";
+    if (raw.includes("Total")) return raw;
+    return "";
+  }
+
+  function analysisOnlyReasons(item) {
+    const advice = item?.scaling_advice || {};
+    if (!isK8s(item) || !advice.analysis_only) return [];
+    const spec = item?.spec || {};
+    const action = actionOf(item);
+    const metricActions = advice.metric_actions || {};
+    const reasons = [];
+    const notes = advice.target_k8s_policy?.notes;
+    if (Array.isArray(notes)) {
+      notes.map(translatedPolicyNote).filter(Boolean).forEach((note) => reasons.push(note));
+    }
+    if (action === "scale_in_candidate") {
+      const replicas = currentReplicas(spec);
+      if (supportsReplicaScaling(spec) && replicas !== null && replicas <= 1) {
+        reasons.push(`当前副本数为 ${formatNumber(replicas, 0)}，副本缩容不能低于 1。`);
+      }
+      if (metricActions.cpu === "scale_in_candidate") {
+        const cpuReq = sumContainerSpec(spec, "cpu_request_cores");
+        if (cpuReq === null) {
+          reasons.push("CPU 缺少 request 基线，无法计算 CPU 缩容目标。");
+        } else if (cpuReq < 2) {
+          reasons.push(`CPU request 基线为 ${formatNumber(cpuReq, 2)}C，低于 2C；小规格 Workload 不继续下调 request。`);
+        }
+      }
+      if (metricActions.memory === "scale_in_candidate") {
+        const memReq = sumContainerSpec(spec, "memory_request_gb");
+        if (memReq === null) {
+          reasons.push("内存缺少 request 基线，无法计算内存缩容目标。");
+        } else if (memReq < 2) {
+          reasons.push(`内存 request 基线为 ${formatMemoryGiB(memReq, 2)}，低于 2Gi；小规格 Workload 不继续下调 request。`);
+        }
+      }
+    } else if (action === "scale_out_candidate") {
+      if (metricActions.cpu === "scale_out_candidate" && sumContainerSpec(spec, "cpu_limit_cores") === null) {
+        reasons.push("CPU 缺少 limit 基线，无法计算 CPU 扩容目标。");
+      }
+      if (metricActions.memory === "scale_out_candidate" && sumContainerSpec(spec, "memory_limit_gb") === null) {
+        reasons.push("内存缺少 limit 基线，无法计算内存扩容目标。");
+      }
+    }
+    if (!reasons.length && advice.target_k8s_policy?.ready_for_execution === false) {
+      reasons.push("后端未生成可执行 target_spec，当前建议仅作为风险分析参考。");
+    }
+    return Array.from(new Set(reasons));
   }
 
   function currentReplicas(spec) {
@@ -421,8 +514,10 @@
     escapeHtml,
     formatNumber,
     formatStatValue,
+    formatMemoryGiB,
     infoTooltip,
     isK8s,
+    analysisOnlyReasons,
     metricKeysFor,
     renderRows,
     resolveDisplayUnit,

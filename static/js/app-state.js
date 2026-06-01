@@ -73,6 +73,8 @@
       detailEmpty: document.getElementById("detail-empty"),
       detailContent: document.getElementById("detail-content"),
       detailClose: document.getElementById("detail-close"),
+      detailTabs: Array.from(document.querySelectorAll("[data-detail-tab]")),
+      detailTabPanels: Array.from(document.querySelectorAll("[data-detail-panel]")),
       detailType: document.getElementById("detail-type"),
       detailTitle: document.getElementById("detail-title"),
       detailSubtitle: document.getElementById("detail-subtitle"),

@@ -297,10 +297,11 @@
     const currentReplicas = spec.replicas ?? spec.current_replicas ?? spec.replicas_observed ?? "";
     const rows = containers.map((name) => `
       <div class="manual-container-row" data-manual-container="${escapeHtml(name)}">
+        <div class="manual-container-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
         ${manualInput("CPU req", "cpu_request_cores", "C")}
         ${manualInput("CPU limit", "cpu_limit_cores", "C")}
-        ${manualInput("Mem req", "memory_request_gb", "GB")}
-        ${manualInput("Mem limit", "memory_limit_gb", "GB")}
+        ${manualInput("Mem req", "memory_request_gb", "GiB")}
+        ${manualInput("Mem limit", "memory_limit_gb", "GiB")}
       </div>`).join("");
     const replicas = isDaemonSet
       ? `<div class="manual-note">DaemonSet 副本数由节点调度决定，这里只调整容器资源。</div>`
@@ -319,11 +320,14 @@
   }
 
   function containersFor(spec) {
+    const bySpec = spec.containers && typeof spec.containers === "object" && !Array.isArray(spec.containers)
+      ? Object.keys(spec.containers).map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
     const observed = Array.isArray(spec.containers_observed) ? spec.containers_observed : [];
-    const out = observed.map((x) => String(x || "").trim()).filter(Boolean);
+    const out = bySpec.length ? bySpec : observed.map((x) => String(x || "").trim()).filter(Boolean);
     const single = String(spec.container || "").trim();
     if (single && !out.includes(single)) out.push(single);
-    return out;
+    return [...new Set(out)].sort();
   }
 
   function manualInput(label, field, unit) {
@@ -332,10 +336,12 @@
 
   function buildControls(resourceId, action, confidence, hasMixed, options = {}) {
     const analysisOnly = Boolean(options.analysisOnly);
-    const disabled = analysisOnly || action === "hold" || action === "insufficient_data" || action === "mixed";
+    const suggestedBlocker = suggestedTargetBlocker(options.resource || {});
+    const disabled = Boolean(suggestedBlocker) || analysisOnly || action === "hold" || action === "insufficient_data" || action === "mixed";
     const risky = confidence === "low" || hasMixed;
     const disabledAttr = disabled ? " disabled" : "";
-    const disabledText = analysisOnly ? "当前建议缺少可执行目标，不能按建议调配" : "当前建议无需执行调配";
+    const disabledText = suggestedBlocker
+      || (analysisOnly ? "当前建议缺少可执行目标，不能按建议调配" : "当前建议无需执行调配");
     const manualControls = options.resourceType === "k8s_workload"
       ? buildManualK8sControls(options.resource || {}, resourceId, options.resourceType)
       : "";
@@ -355,6 +361,47 @@
           ${manualControls ? `<div class="scaling-choice-section">${manualControls}</div>` : ""}
         </div>
       </div>`;
+  }
+
+  function suggestedTargetBlocker(resource) {
+    if (!resource || String(resource.resource_type || "") !== "k8s_workload") return "";
+    const spec = resource.spec || {};
+    const advice = resource.scaling_advice || {};
+    const target = advice.target_spec || {};
+    if (!hasMultipleContainers(spec)) return "";
+    if (target.containers && typeof target.containers === "object" && !Array.isArray(target.containers) && Object.keys(target.containers).length) {
+      return "";
+    }
+    const resourceFields = [
+      "cpu_request_cores",
+      "cpu_limit_cores",
+      "cpu_cores",
+      "memory_request_gb",
+      "memory_limit_gb",
+      "memory_gb",
+    ];
+    return resourceFields.some((field) => target[field] !== undefined && target[field] !== null)
+      ? "多容器 Workload 的 request/limit 建议需要指定 container；请使用手动目标规格"
+      : "";
+  }
+
+  function hasMultipleContainers(spec) {
+    const names = new Set();
+    if (spec?.containers && typeof spec.containers === "object" && !Array.isArray(spec.containers)) {
+      Object.keys(spec.containers).forEach((name) => {
+        const value = String(name || "").trim();
+        if (value) names.add(value);
+      });
+    }
+    if (Array.isArray(spec?.containers_observed)) {
+      spec.containers_observed.forEach((name) => {
+        const value = String(name || "").trim();
+        if (value) names.add(value);
+      });
+    }
+    const single = String(spec?.container || "").trim();
+    if (single) names.add(single);
+    return names.size > 1;
   }
 
   window.ScalingUI = { buildControls, closeModal, start };

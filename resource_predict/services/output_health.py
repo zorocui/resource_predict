@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from resource_predict.pipeline.constants import DETAILS_DIRNAME, RAW_DATA_FILENAME, SUMMARY_INDEX_FILENAME
 from resource_predict.pipeline.output_paths import all_scoped_out_dirs
@@ -322,7 +322,7 @@ def _check_k8s_workload_summary(
         errors.append(f"{rid}: scaling_advice.resource_type 必须是 k8s_workload")
     if not isinstance(advice.get("target_k8s_policy"), dict):
         errors.append(f"{rid}: target_k8s_policy 缺失")
-    _check_k8s_target_contract(rid, advice, errors)
+    _check_k8s_target_contract(rid, advice, errors, spec=spec)
     if str(advice.get("action") or "") not in {
         "scale_out_candidate",
         "scale_in_candidate",
@@ -354,7 +354,8 @@ def _validate_detail_contracts(detail_items: List[Dict[str, Any]], errors: List[
             continue
         if not isinstance(advice.get("target_k8s_policy"), dict):
             errors.append(f"{rid}: details.target_k8s_policy 缺失")
-        _check_k8s_target_contract(rid, advice, errors, prefix="details.")
+        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+        _check_k8s_target_contract(rid, advice, errors, prefix="details.", spec=spec)
 
 
 def _check_k8s_target_contract(
@@ -363,6 +364,7 @@ def _check_k8s_target_contract(
     errors: List[str],
     *,
     prefix: str = "",
+    spec: Optional[Dict[str, Any]] = None,
 ) -> None:
     if advice.get("analysis_only") is True:
         return
@@ -387,6 +389,20 @@ def _check_k8s_target_contract(
     has_replica_target = target.get("replicas") is not None
     if not has_resource_target and not has_replica_target:
         errors.append(f"{rid}: {prefix}K8S target_spec must include resources or replicas")
+    has_container_targets = isinstance(target.get("containers"), dict) and bool(target.get("containers"))
+    if has_resource_target and not has_container_targets and _has_multiple_k8s_containers(spec or {}):
+        errors.append(f"{rid}: {prefix}multi-container K8S resource targets must use target_spec.containers")
+
+
+def _has_multiple_k8s_containers(spec: Dict[str, Any]) -> bool:
+    names: set[str] = set()
+    raw = spec.get("containers")
+    if isinstance(raw, dict):
+        names.update(str(name or "").strip() for name in raw if str(name or "").strip())
+    observed = spec.get("containers_observed")
+    if isinstance(observed, list):
+        names.update(str(name or "").strip() for name in observed if str(name or "").strip())
+    return len(names) > 1
 
 
 def _check_metrics(

@@ -138,6 +138,8 @@ def _execution_gate_failures(
         and not bool(k8s_policy.get("ready_for_execution", True))
     ):
         failures.append("target_k8s_policy is not ready_for_execution")
+    if resource_type_of(resource) == "k8s_workload" and not manual_target:
+        failures.extend(_k8s_suggested_target_failures(resource, advice))
     return failures
 
 
@@ -181,6 +183,41 @@ def _data_quality_failures(resource: Dict[str, Any], advice: Dict[str, Any]) -> 
         if level and level != "good":
             failures.append(f"{metric} data_quality is not good (level={level})")
     return failures
+
+
+def _k8s_suggested_target_failures(resource: Dict[str, Any], advice: Dict[str, Any]) -> List[str]:
+    target = advice.get("target_spec", {})
+    if not isinstance(target, dict) or not _k8s_has_multiple_containers(resource.get("spec", {})):
+        return []
+    if isinstance(target.get("containers"), dict) and target.get("containers"):
+        return []
+    resource_fields = {
+        "cpu_request_cores",
+        "cpu_limit_cores",
+        "cpu_cores",
+        "memory_request_gb",
+        "memory_limit_gb",
+        "memory_gb",
+    }
+    if any(target.get(field) is not None for field in resource_fields):
+        return ["multiple-container K8S advice requires target_spec.containers for request/limit changes"]
+    return []
+
+
+def _k8s_has_multiple_containers(spec: Any) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    raw = spec.get("containers")
+    if isinstance(raw, dict):
+        names = {str(name or "").strip() for name in raw if str(name or "").strip()}
+        if len(names) > 1:
+            return True
+    observed = spec.get("containers_observed")
+    if isinstance(observed, list):
+        names = {str(name or "").strip() for name in observed if str(name or "").strip()}
+        if len(names) > 1:
+            return True
+    return False
 
 
 def _cooldown_failure(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from resource_predict.services.scaling.executor import build_scaling_plan
+from resource_predict.services.scaling.executor import ScalingPlanError, build_scaling_plan
 
 
 class ScalingExecutorTest(unittest.TestCase):
@@ -143,6 +143,73 @@ class ScalingExecutorTest(unittest.TestCase):
                 "--containers=config-reloader --requests=cpu=50m --limits=cpu=100m,memory=26Mi",
                 "kubectl --kubeconfig /root/.kube/config -n monitoring scale statefulset/alertmanager-main --replicas=3",
             ],
+        )
+
+    def test_k8s_multi_container_rejects_workload_level_resource_target(self):
+        resource = {
+            "resource_id": "k8s:cluster-k8s-1:monitoring:statefulset:alertmanager-main",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster-k8s-1",
+                "namespace": "monitoring",
+                "workload_kind": "StatefulSet",
+                "workload_name": "alertmanager-main",
+                "containers_observed": ["alertmanager", "config-reloader"],
+                "replicas": 2,
+            },
+            "scaling_advice": {
+                "action": "scale_in_candidate",
+                "target_spec": {
+                    "memory_request_gb": 0.25,
+                    "replicas": 1,
+                },
+            },
+        }
+
+        with self.assertRaisesRegex(ScalingPlanError, "target_spec.containers"):
+            build_scaling_plan(
+                resource,
+                {
+                    "cloud_type": "k8s",
+                    "control_host": "10.0.0.10",
+                    "ssh_user": "root",
+                    "kubeconfig": "/root/.kube/config",
+                },
+            )
+
+    def test_k8s_multi_container_allows_replica_only_target(self):
+        resource = {
+            "resource_id": "k8s:cluster-k8s-1:monitoring:statefulset:alertmanager-main",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster-k8s-1",
+                "namespace": "monitoring",
+                "workload_kind": "StatefulSet",
+                "workload_name": "alertmanager-main",
+                "containers_observed": ["alertmanager", "config-reloader"],
+                "replicas": 3,
+            },
+            "scaling_advice": {
+                "action": "scale_in_candidate",
+                "target_spec": {
+                    "replicas": 1,
+                },
+            },
+        }
+
+        plan = build_scaling_plan(
+            resource,
+            {
+                "cloud_type": "k8s",
+                "control_host": "10.0.0.10",
+                "ssh_user": "root",
+                "kubeconfig": "/root/.kube/config",
+            },
+        )
+
+        self.assertEqual(
+            plan.commands,
+            ["kubectl --kubeconfig /root/.kube/config -n monitoring scale statefulset/alertmanager-main --replicas=1"],
         )
 
 
