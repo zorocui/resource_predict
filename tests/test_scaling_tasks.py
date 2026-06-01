@@ -9,6 +9,14 @@ from resource_predict.services.scaling.tasks import (
 )
 
 
+K8S_QUALITY_GOOD = {
+    "cpu_limit": {"level": "good"},
+    "cpu_request": {"level": "good"},
+    "memory_limit": {"level": "good"},
+    "memory_request": {"level": "good"},
+}
+
+
 class ScalingTasksTest(unittest.TestCase):
     def test_manual_target_override_preserves_resource_and_replaces_task_advice_target(self):
         resource = {
@@ -67,8 +75,8 @@ class ScalingTasksTest(unittest.TestCase):
                 "last_scaled_at_epoch_ms": now_ms - 10 * 60_000,
             },
             "data_quality": {
-                "cpu": {"level": "fair"},
-                "memory": {"level": "good"},
+                **K8S_QUALITY_GOOD,
+                "cpu_limit": {"level": "fair"},
             },
             "scaling_advice": {
                 "action": "scale_out_candidate",
@@ -100,10 +108,7 @@ class ScalingTasksTest(unittest.TestCase):
                 "workload_name": "api",
                 "last_scaled_at_epoch_ms": now_ms - 2 * 60 * 60_000,
             },
-            "data_quality": {
-                "cpu": {"level": "good"},
-                "memory": {"level": "good"},
-            },
+            "data_quality": K8S_QUALITY_GOOD,
             "scaling_advice": {
                 "action": "scale_out_candidate",
                 "confidence": "high",

@@ -99,4 +99,16 @@
     resourcePayloadCache: new Map(),
     pendingDetailRequests: new Map(),
   };
+  Object.assign(window.ResourcePredictApp.metricTitleMap, {
+    cpu_limit: "CPU Limit",
+    cpu_request: "CPU Request",
+    memory_limit: "内存 Limit",
+    memory_request: "内存 Request",
+  });
+  window.ResourcePredictApp.viewMetricMap.k8s_workload = [
+    "cpu_limit",
+    "cpu_request",
+    "memory_limit",
+    "memory_request",
+  ];
 })();

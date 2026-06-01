@@ -152,16 +152,33 @@ def _data_quality_failures(resource: Dict[str, Any], advice: Dict[str, Any]) -> 
     if not isinstance(metric_actions, dict):
         metric_actions = {}
     failures: List[str] = []
-    for metric in metric_names_for_resource(resource):
-        action = str(metric_actions.get(metric) or "").lower()
-        if rtype == "k8s_workload" and action in {"", "hold"}:
-            continue
-        block = quality.get(metric, {})
-        level = str(block.get("level") if isinstance(block, dict) else "").lower()
-        if rtype == "k8s_workload":
+    if rtype == "k8s_workload":
+        metrics_to_check: List[str] = []
+        for metric, raw_action in metric_actions.items():
+            action = str(raw_action or "").lower()
+            if action in {"", "hold"}:
+                continue
+            if metric in {"cpu", "memory"}:
+                if action == "scale_out_candidate":
+                    metrics_to_check.append(f"{metric}_limit")
+                elif action == "scale_in_candidate":
+                    metrics_to_check.append(f"{metric}_request")
+                else:
+                    metrics_to_check.extend([f"{metric}_limit", f"{metric}_request"])
+            else:
+                metrics_to_check.append(str(metric))
+        for metric in dict.fromkeys(metrics_to_check):
+            block = quality.get(metric, {})
+            level = str(block.get("level") if isinstance(block, dict) else "").lower()
             if level != "good":
                 failures.append(f"{metric} data_quality is not good (level={level or 'missing'})")
-        elif level and level != "good":
+        return failures
+
+    for metric in metric_names_for_resource(resource):
+        action = str(metric_actions.get(metric) or "").lower()
+        block = quality.get(metric, {})
+        level = str(block.get("level") if isinstance(block, dict) else "").lower()
+        if level and level != "good":
             failures.append(f"{metric} data_quality is not good (level={level})")
     return failures
 

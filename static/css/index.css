@@ -759,6 +759,73 @@ h1 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.container-spec-grid {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(15, 23, 42, .08);
+  border-radius: 8px;
+  padding: 8px;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+.container-spec-title {
+  color: #334155;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.container-spec-head,
+.container-spec-row {
+  display: grid;
+  grid-template-columns: minmax(58px, 1.05fr) repeat(4, minmax(0, .95fr));
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+
+.container-spec-head {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.container-spec-head span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.container-spec-row {
+  min-height: 28px;
+  border-top: 1px solid rgba(15, 23, 42, .07);
+  padding-top: 6px;
+  color: #334155;
+  font-size: 11px;
+}
+
+.container-spec-row strong,
+.container-spec-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.container-spec-row strong {
+  color: var(--text);
+  font-weight: 900;
+}
+
+.container-spec-row span {
+  text-align: right;
+}
+
 .status-board {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

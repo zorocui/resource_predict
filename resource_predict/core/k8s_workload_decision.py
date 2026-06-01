@@ -27,12 +27,53 @@ def _quality_level(resource: Dict[str, Any], metric: str) -> str:
     return str(block.get("level") or "unknown").lower()
 
 
-def _has_denominator(spec: Dict[str, Any], metric: str) -> bool:
+def _sum_container_spec(spec: Dict[str, Any], field: str) -> float | None:
+    raw = spec.get("containers")
+    if not isinstance(raw, dict):
+        return None
+    total = 0.0
+    found = False
+    for values in raw.values():
+        if not isinstance(values, dict):
+            continue
+        value = parse_positive_finite(values.get(field))
+        if value is None:
+            continue
+        total += float(value)
+        found = True
+    return total if found else None
+
+
+def _metric_base(spec: Dict[str, Any], metric: str) -> float | None:
     if metric == "cpu":
-        return bool(spec.get("cpu_limit_cores") or spec.get("cpu_request_cores"))
+        return _sum_container_spec(spec, "cpu_limit_cores") or _sum_container_spec(spec, "cpu_request_cores")
     if metric == "memory":
-        return bool(spec.get("memory_limit_gb") or spec.get("memory_request_gb"))
-    return False
+        return _sum_container_spec(spec, "memory_limit_gb") or _sum_container_spec(spec, "memory_request_gb")
+    return None
+
+
+def _metric_request_base(spec: Dict[str, Any], metric: str) -> float | None:
+    if metric == "cpu":
+        return _sum_container_spec(spec, "cpu_request_cores")
+    if metric == "memory":
+        return _sum_container_spec(spec, "memory_request_gb")
+    return None
+
+
+def _metric_limit_base(spec: Dict[str, Any], metric: str) -> float | None:
+    if metric == "cpu":
+        return _sum_container_spec(spec, "cpu_limit_cores")
+    if metric == "memory":
+        return _sum_container_spec(spec, "memory_limit_gb")
+    return None
+
+
+def _metric_base_for_action(spec: Dict[str, Any], metric: str, action: str) -> float | None:
+    if action == "scale_out_candidate":
+        return _metric_limit_base(spec, metric)
+    if action == "scale_in_candidate":
+        return _metric_request_base(spec, metric)
+    return _metric_base(spec, metric)
 
 
 def _target_utilization(tier: str, action: str) -> float:
@@ -66,12 +107,9 @@ def _recommend_k8s_policy(
     tier: str,
 ) -> Dict[str, Any]:
     policy: Dict[str, Any] = {"policy_tier": tier, "recommendations": {}, "notes": []}
-    bases = {
-        "cpu": parse_positive_finite(spec.get("cpu_limit_cores")) or parse_positive_finite(spec.get("cpu_request_cores")),
-        "memory": parse_positive_finite(spec.get("memory_limit_gb")) or parse_positive_finite(spec.get("memory_request_gb")),
-    }
-    for metric, base in bases.items():
+    for metric in ("cpu", "memory"):
         action = metric_actions.get(metric, "hold")
+        base = _metric_base_for_action(spec, metric, action)
         if base is None or action not in {"scale_out_candidate", "scale_in_candidate"}:
             continue
         st = by_metric.get(metric, {})
@@ -92,13 +130,15 @@ def _recommend_k8s_policy(
             request = _round_k8s_even_target(target, action=action, base=base)
             if request is None:
                 continue
-            limit_base = parse_positive_finite(spec.get("cpu_limit_cores"))
-            limit = _round_k8s_even_target_limit(
-                request * 1.25,
-                action=action,
-                current_limit=limit_base,
-                request=request,
-            )
+            limit_base = _metric_limit_base(spec, "cpu")
+            limit = None
+            if limit_base is not None or action == "scale_out_candidate":
+                limit = _round_k8s_even_target_limit(
+                    request * 1.25,
+                    action=action,
+                    current_limit=limit_base,
+                    request=request,
+                )
             policy["recommendations"]["cpu"] = {
                 "request_cores": request,
                 "limit_cores": limit,
@@ -110,13 +150,15 @@ def _recommend_k8s_policy(
             request = _round_k8s_even_target(target, action=action, base=base)
             if request is None:
                 continue
-            limit_base = parse_positive_finite(spec.get("memory_limit_gb"))
-            limit = _round_k8s_even_target_limit(
-                request * 1.2,
-                action=action,
-                current_limit=limit_base,
-                request=request,
-            )
+            limit_base = _metric_limit_base(spec, "memory")
+            limit = None
+            if limit_base is not None or action == "scale_out_candidate":
+                limit = _round_k8s_even_target_limit(
+                    request * 1.2,
+                    action=action,
+                    current_limit=limit_base,
+                    request=request,
+                )
             policy["recommendations"]["memory"] = {
                 "request_gb": request,
                 "limit_gb": limit,
@@ -140,7 +182,7 @@ def _recommend_k8s_policy(
         m for m, a in metric_actions.items()
         if a in {"scale_out_candidate", "scale_in_candidate"}
         and m not in policy["recommendations"]
-        and not _has_denominator(spec, m)
+        and _metric_base_for_action(spec, m, a) is None
     }
     policy["ready_for_execution"] = bool(policy["recommendations"]) and not needed_data_metrics
     return policy
@@ -442,10 +484,12 @@ def build_k8s_workload_advice(
     th = policy_thresholds(tier)
     cfg = settings.decision
 
-    # Compute extended stats + trend + streak for each metric
+    # Compute extended stats + trend + streak for each signal.
     by_metric: Dict[str, Dict[str, float]] = {}
-    for m in ("cpu", "memory"):
-        vals = np.asarray(metric_future_values.get(m, np.array([])), dtype=float)
+    signal_keys = ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
+    for m in signal_keys:
+        legacy_key = "cpu" if m.startswith("cpu_") else "memory"
+        vals = np.asarray(metric_future_values.get(m, metric_future_values.get(legacy_key, np.array([]))), dtype=float)
         st = compute_metric_stats(vals, extended=True)
         tr = _trend_features(vals, cfg.trend_window_points)
         st.update(tr)
@@ -465,23 +509,30 @@ def build_k8s_workload_advice(
     metric_reasons: Dict[str, str] = {}
     blockers: list[str] = []
     baseline_missing: list[str] = []
+    decision_stats: Dict[str, Dict[str, float]] = {}
 
     for metric in ("cpu", "memory"):
-        st = by_metric[metric]
+        limit_key = f"{metric}_limit"
+        request_key = f"{metric}_request"
+        st_limit = by_metric[limit_key]
+        st_request = by_metric[request_key]
         label = "CPU" if metric == "cpu" else "memory"
-        quality = _quality_level(resource, metric)
-        has_base = _has_denominator(spec, metric)
-        if quality == "poor":
+        limit_quality = _quality_level(resource, limit_key)
+        request_quality = _quality_level(resource, request_key)
+        has_limit = _metric_limit_base(spec, metric) is not None
+        has_request = _metric_request_base(spec, metric) is not None
+        if limit_quality == "poor" and request_quality == "poor":
             metric_actions[metric] = "insufficient_data"
             metric_reasons[metric] = f"{label} data quality is poor; skip execution recommendation"
             blockers.append(metric)
+            decision_stats[metric] = st_limit
             continue
-        if not has_base:
+        if not has_limit and not has_request:
             baseline_missing.append(metric)
             metric_actions[metric] = "hold"
             # 即使缺少基线，也提供趋势信息辅助运维判断
-            slope = float(st.get("slope", 0.0))
-            delta = float(st.get("window_mean_delta", 0.0))
+            slope = float(st_limit.get("slope", 0.0))
+            delta = float(st_limit.get("window_mean_delta", 0.0))
             if abs(slope) >= float(cfg.uptrend_slope_threshold) or abs(delta) >= float(cfg.window_mean_delta_threshold):
                 direction = "rising" if (slope > 0 or delta > 0) else "falling"
                 trend_info = f"; trend is {direction}(slope={slope:.4f}, delta={delta:.4f})"
@@ -491,33 +542,53 @@ def build_k8s_workload_advice(
                 f"{label} lacks request/limit baseline; cannot compute utilization for recommendation"
                 f"{trend_info}"
             )
+            decision_stats[metric] = st_limit
             continue
         # Tier-aware utilization thresholds (shared with VM decision module)
-        if st["p95"] >= th["scale_out_threshold"] or st["peak"] >= th["peak_guard_threshold"]:
+        if has_limit and limit_quality != "poor" and (
+            st_limit["p95"] >= th["scale_out_threshold"] or st_limit["peak"] >= th["peak_guard_threshold"]
+        ):
             metric_actions[metric] = "scale_out_candidate"
             metric_reasons[metric] = (
-                f"{label} forecast is high(P95={st['p95'] * 100:.1f}%, peak={st['peak'] * 100:.1f}%)"
+                f"{label} limit utilization forecast is high(P95={st_limit['p95'] * 100:.1f}%, "
+                f"peak={st_limit['peak'] * 100:.1f}%)"
             )
-        elif st["avg"] < th["scale_in_threshold"] and st["p95"] < th["scale_in_p95_guard"]:
+            decision_stats[metric] = st_limit
+        elif has_request and request_quality != "poor" and (
+            st_request["avg"] < th["scale_in_threshold"] and st_request["p95"] < th["scale_in_p95_guard"]
+        ):
             # 趋势保护：当前偏低但趋势回升时，暂缓缩容
             has_strong_uptrend = (
-                float(st.get("slope", 0.0)) >= float(cfg.uptrend_slope_threshold)
-                and float(st.get("window_mean_delta", 0.0)) >= float(cfg.window_mean_delta_threshold)
+                float(st_request.get("slope", 0.0)) >= float(cfg.uptrend_slope_threshold)
+                and float(st_request.get("window_mean_delta", 0.0)) >= float(cfg.window_mean_delta_threshold)
             )
             if has_strong_uptrend:
                 metric_actions[metric] = "hold"
                 metric_reasons[metric] = (
-                    f"{label} forecast is low(avg={st['avg'] * 100:.1f}%, P95={st['p95'] * 100:.1f}%), "
+                    f"{label} request utilization forecast is low(avg={st_request['avg'] * 100:.1f}%, "
+                    f"P95={st_request['p95'] * 100:.1f}%), "
                     "but trend is rising; deferring scale-in"
                 )
             else:
                 metric_actions[metric] = "scale_in_candidate"
                 metric_reasons[metric] = (
-                    f"{label} forecast is low(avg={st['avg'] * 100:.1f}%, P95={st['p95'] * 100:.1f}%)"
+                    f"{label} request utilization forecast is low(avg={st_request['avg'] * 100:.1f}%, "
+                    f"P95={st_request['p95'] * 100:.1f}%)"
                 )
+            decision_stats[metric] = st_request
         else:
             metric_actions[metric] = "hold"
-            metric_reasons[metric] = f"{label} load is within the target range"
+            reasons = []
+            if not has_limit:
+                reasons.append("no limit baseline for scale-out")
+            if not has_request:
+                reasons.append("no request baseline for scale-in")
+            metric_reasons[metric] = (
+                f"{label} load is within the target range"
+                if not reasons
+                else f"{label} {'; '.join(reasons)}"
+            )
+            decision_stats[metric] = st_limit if has_limit else st_request
 
     actions = set(metric_actions.values())
     if "scale_out_candidate" in actions:
@@ -534,7 +605,8 @@ def build_k8s_workload_advice(
     for m in ("cpu", "memory"):
         m_action = metric_actions.get(m, "hold")
         if m_action in {"scale_out_candidate", "scale_in_candidate"}:
-            metric_confidence_scores[m] = _metric_confidence_k8s(m_action, by_metric[m], th)
+            score_key = f"{m}_limit" if m_action == "scale_out_candidate" else f"{m}_request"
+            metric_confidence_scores[m] = _metric_confidence_k8s(m_action, by_metric[score_key], th)
 
     if metric_confidence_scores:
         scores = list(metric_confidence_scores.values())
@@ -545,7 +617,7 @@ def build_k8s_workload_advice(
         confidence_score = 50.0
 
     # Quality adjustments
-    quality_levels = [_quality_level(resource, m) for m in ("cpu", "memory")]
+    quality_levels = [_quality_level(resource, m) for m in signal_keys]
     if any(x == "poor" for x in quality_levels):
         confidence_score -= 18.0
     if any(x == "fair" for x in quality_levels):
@@ -555,14 +627,14 @@ def build_k8s_workload_advice(
 
     target_policy = _recommend_k8s_policy(
         spec=spec,
-        by_metric=by_metric,
+        by_metric=decision_stats,
         metric_actions=metric_actions,
         tier=tier,
     )
     target_spec = _target_spec_from_policy(target_policy)
 
     # Total capacity coordination: 校验 per_replica * replicas 的总量合理性
-    _coordinate_total_capacity(target_policy, target_spec, spec, by_metric, metric_actions)
+    _coordinate_total_capacity(target_policy, target_spec, spec, decision_stats, metric_actions)
 
     if target_policy.get("ready_for_execution"):
         confidence_score += 4.0
@@ -596,7 +668,7 @@ def build_k8s_workload_advice(
         "policy_tier": tier,
         "risk_profile": _risk_profile(
             action=action,
-            by_metric=by_metric,
+            by_metric=decision_stats,
             tier=tier,
             blockers=blockers + baseline_missing,
             th=th,
@@ -611,7 +683,8 @@ def build_k8s_workload_advice(
         },
         "metric_actions": metric_actions,
         "metric_reasons": metric_reasons,
-        "stats": by_metric,
+        "stats": decision_stats,
+        "signal_stats": by_metric,
         "data_quality": resource.get("data_quality", {}),
         "target_spec": target_spec,
         "target_k8s_policy": target_policy,

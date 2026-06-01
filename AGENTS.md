@@ -9,6 +9,7 @@ These notes capture project-specific mistakes already encountered in this repo. 
 - Current naming: `generate_forecasts.py`, `ingest_k8s_workloads.py`, `resource_predict/core/k8s_workload_decision.py`, `generate_forecasts`, and `build_k8s_workload_advice`.
 - Avoid reintroducing old names: `generate_images.py`, `generate_k8s_pods.py`, `k8s_pod_decision.py`, `generate_all_images`, and `build_k8s_pod_advice`.
 - K8S terminology should use Workload for project concepts. Use Pod only for Prometheus/Kubernetes labels or explicit legacy artifact validation.
+- K8S current resource specs must be stored and displayed at container granularity in `spec.containers`; do not keep or reintroduce Workload-level summed request/limit current-spec fields.
 - Keep K8S small-spec recommendations from being inflated: request/limit targets below `2C/2Gi` should preserve fractional granularity instead of being rounded up to even integers.
 - For real scaling execution, preserve the pre-execute gates: `action_gate`, `confidence`, `data_quality`, `cooldown`, and `policy_tier` must be checked before queuing an `execute` task.
 - Keep K8S Prometheus CPU usage queries aligned with the configured `rate_window`; do not reintroduce hardcoded CPU `rate(...[10m])` windows in fetch or diagnose paths.

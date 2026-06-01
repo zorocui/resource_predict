@@ -336,10 +336,18 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
     )
     cpu_usage_by_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners)
     mem_usage_by_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners)
-    cpu_request_by_workload, cpu_request_pod_counts = _sum_values_by_workload(cpu_request, target.cluster, pod_owners)
-    cpu_limit_by_workload, cpu_limit_pod_counts = _sum_values_by_workload(cpu_limit, target.cluster, pod_owners)
-    mem_request_by_workload, mem_request_pod_counts = _sum_values_by_workload(mem_request, target.cluster, pod_owners)
-    mem_limit_by_workload, mem_limit_pod_counts = _sum_values_by_workload(mem_limit, target.cluster, pod_owners)
+    cpu_request_by_workload, _ = _sum_values_by_workload(cpu_request, target.cluster, pod_owners)
+    cpu_limit_by_workload, _ = _sum_values_by_workload(cpu_limit, target.cluster, pod_owners)
+    mem_request_by_workload, _ = _sum_values_by_workload(mem_request, target.cluster, pod_owners)
+    mem_limit_by_workload, _ = _sum_values_by_workload(mem_limit, target.cluster, pod_owners)
+    cpu_request_by_container = _values_by_workload_container(cpu_request, pod_owners)
+    cpu_limit_by_container = _values_by_workload_container(cpu_limit, pod_owners)
+    mem_request_by_container = _values_by_workload_container(mem_request, pod_owners)
+    mem_limit_by_container = _values_by_workload_container(mem_limit, pod_owners)
+    cpu_usage_by_limit_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners, include_keys=set(cpu_limit))
+    cpu_usage_by_request_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners, include_keys=set(cpu_request))
+    mem_usage_by_limit_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners, include_keys=set(mem_limit))
+    mem_usage_by_request_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners, include_keys=set(mem_request))
     metadata_by_workload = _workload_metadata(
         target.cluster,
         set(cpu_usage) | set(mem_usage),
@@ -354,25 +362,42 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
         mem_s = mem_usage_by_workload.get(key)
         if cpu_s is None or mem_s is None:
             continue
-        cpu_base, cpu_base_name = _select_denominator(
-            (cpu_limit_by_workload.get(key), "cpu_usage/cpu_limit"),
-            (cpu_request_by_workload.get(key), "cpu_usage/cpu_request"),
+        cpu_limit_metric, cpu_limit_norm = _normalize_scoped_series(
+            (cpu_usage_by_limit_workload.get(key), cpu_limit_by_workload.get(key), "cpu_usage/cpu_limit"),
+            raw_series=cpu_s,
+            raw_name="cpu_usage_cores",
         )
-        mem_base, mem_base_name = _select_denominator(
-            (mem_limit_by_workload.get(key), "memory_working_set/memory_limit"),
-            (mem_request_by_workload.get(key), "memory_working_set/memory_request"),
+        cpu_request_metric, cpu_request_norm = _normalize_scoped_series(
+            (cpu_usage_by_request_workload.get(key), cpu_request_by_workload.get(key), "cpu_usage/cpu_request"),
+            raw_series=cpu_s,
+            raw_name="cpu_usage_cores",
         )
-        cpu_metric, cpu_norm = _normalize_series(cpu_s, cpu_base, cpu_base_name, "cpu_usage_cores")
-        mem_metric, mem_norm = _normalize_series(
-            mem_s / (1024 ** 3),
-            (mem_base / (1024 ** 3)) if mem_base else None,
-            mem_base_name,
-            "memory_working_set_gb",
+        mem_limit_metric, mem_limit_norm = _normalize_scoped_series(
+            (
+                _series_bytes_to_gb(mem_usage_by_limit_workload.get(key)),
+                _bytes_to_gb(mem_limit_by_workload.get(key)),
+                "memory_working_set/memory_limit",
+            ),
+            raw_series=mem_s / (1024 ** 3),
+            raw_name="memory_working_set_gb",
         )
-        cpu_quality = _data_quality(cpu_norm, step)
-        mem_quality = _data_quality(mem_norm, step)
-        cpu_norm = _regularize_series(cpu_norm, step)
-        mem_norm = _regularize_series(mem_norm, step)
+        mem_request_metric, mem_request_norm = _normalize_scoped_series(
+            (
+                _series_bytes_to_gb(mem_usage_by_request_workload.get(key)),
+                _bytes_to_gb(mem_request_by_workload.get(key)),
+                "memory_working_set/memory_request",
+            ),
+            raw_series=mem_s / (1024 ** 3),
+            raw_name="memory_working_set_gb",
+        )
+        cpu_limit_quality = _data_quality(cpu_limit_norm, step)
+        cpu_request_quality = _data_quality(cpu_request_norm, step)
+        mem_limit_quality = _data_quality(mem_limit_norm, step)
+        mem_request_quality = _data_quality(mem_request_norm, step)
+        cpu_limit_norm = _regularize_series(cpu_limit_norm, step)
+        cpu_request_norm = _regularize_series(cpu_request_norm, step)
+        mem_limit_norm = _regularize_series(mem_limit_norm, step)
+        mem_request_norm = _regularize_series(mem_request_norm, step)
         namespace, owner_kind, owner_name = key
         meta = metadata_by_workload.get(key, {})
         # 优先使用 kube-state-metrics 上报的控制器副本数（spec/status replicas），
@@ -383,15 +408,6 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
             replicas_observed = kube_replicas
         else:
             replicas_observed = len(meta.get("pods", []))
-        cpu_request_total = cpu_request_by_workload.get(key)
-        cpu_limit_total = cpu_limit_by_workload.get(key)
-        mem_request_total = mem_request_by_workload.get(key)
-        mem_limit_total = mem_limit_by_workload.get(key)
-        # 用实际有该指标的 pod 数做除数，避免未上报指标的 pod 拉低单 pod 均值
-        cpu_request_pod_ct = cpu_request_pod_counts.get(key, replicas_observed)
-        cpu_limit_pod_ct = cpu_limit_pod_counts.get(key, replicas_observed)
-        mem_request_pod_ct = mem_request_pod_counts.get(key, replicas_observed)
-        mem_limit_pod_ct = mem_limit_pod_counts.get(key, replicas_observed)
         spec = {
             "cluster": target.cluster,
             "namespace": namespace,
@@ -403,16 +419,17 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
             "containers_observed": sorted(meta.get("containers", [])),
             "replicas": replica_values.get(key),
             "replicas_observed": replicas_observed,
-            "cpu_request_cores": _per_pod_value(cpu_request_total, cpu_request_pod_ct),
-            "cpu_limit_cores": _per_pod_value(cpu_limit_total, cpu_limit_pod_ct),
-            "memory_request_gb": _bytes_to_gb(_per_pod_value(mem_request_total, mem_request_pod_ct)),
-            "memory_limit_gb": _bytes_to_gb(_per_pod_value(mem_limit_total, mem_limit_pod_ct)),
-            "cpu_request_cores_total": cpu_request_total,
-            "cpu_limit_cores_total": cpu_limit_total,
-            "memory_request_gb_total": _bytes_to_gb(mem_request_total),
-            "memory_limit_gb_total": _bytes_to_gb(mem_limit_total),
-            "cpu_metric_mode": cpu_metric,
-            "memory_metric_mode": mem_metric,
+            "containers": _container_specs(
+                sorted(meta.get("containers", [])),
+                cpu_request_by_container.get(key, {}),
+                cpu_limit_by_container.get(key, {}),
+                mem_request_by_container.get(key, {}),
+                mem_limit_by_container.get(key, {}),
+            ),
+            "cpu_limit_metric_mode": cpu_limit_metric,
+            "cpu_request_metric_mode": cpu_request_metric,
+            "memory_limit_metric_mode": mem_limit_metric,
+            "memory_request_metric_mode": mem_request_metric,
         }
         nodes = sorted(meta.get("nodes", []))
         if nodes:
@@ -422,12 +439,16 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
             "resource_type": "k8s_workload",
             "spec": spec,
             "metrics": {
-                "cpu": _series_payload(cpu_norm),
-                "memory": _series_payload(mem_norm),
+                "cpu_limit": _series_payload(cpu_limit_norm),
+                "cpu_request": _series_payload(cpu_request_norm),
+                "memory_limit": _series_payload(mem_limit_norm),
+                "memory_request": _series_payload(mem_request_norm),
             },
             "data_quality": {
-                "cpu": cpu_quality,
-                "memory": mem_quality,
+                "cpu_limit": cpu_limit_quality,
+                "cpu_request": cpu_request_quality,
+                "memory_limit": mem_limit_quality,
+                "memory_request": mem_request_quality,
             },
         }
         out.append(item)
@@ -680,9 +701,13 @@ def _sum_series_by_workload(
     series_by_container: Dict[ContainerKey, pd.Series],
     cluster: str,
     pod_owners: Dict[Tuple[str, str], Tuple[str, str]],
+    *,
+    include_keys: Optional[Set[ContainerKey]] = None,
 ) -> Dict[WorkloadKey, pd.Series]:
     grouped: Dict[WorkloadKey, List[pd.Series]] = {}
     for key, series in series_by_container.items():
+        if include_keys is not None and key not in include_keys:
+            continue
         wk = _workload_key(key, pod_owners)
         if wk is None:
             continue
@@ -716,6 +741,53 @@ def _sum_values_by_workload(
     return out, pod_counts_int
 
 
+def _values_by_workload_container(
+    values_by_container: Dict[ContainerKey, float],
+    pod_owners: Dict[Tuple[str, str], Tuple[str, str]],
+) -> Dict[WorkloadKey, Dict[str, Dict[str, Any]]]:
+    grouped: Dict[WorkloadKey, Dict[str, Dict[str, Any]]] = {}
+    for key, value in values_by_container.items():
+        wk = _workload_key(key, pod_owners)
+        if wk is None:
+            continue
+        namespace, pod, container = key
+        if not container:
+            continue
+        container_values = grouped.setdefault(wk, {}).setdefault(container, {"total": 0.0, "pods": set()})
+        container_values["total"] = float(container_values["total"]) + float(value)
+        container_values["pods"].add((namespace, pod))
+    return grouped
+
+
+def _container_value(container_values: Dict[str, Dict[str, Any]], container: str) -> Optional[float]:
+    item = container_values.get(container)
+    if not isinstance(item, dict):
+        return None
+    total = item.get("total")
+    pods = item.get("pods")
+    if total is None or not isinstance(pods, set) or not pods:
+        return None
+    return float(total) / max(1, len(pods))
+
+
+def _container_specs(
+    containers: List[str],
+    cpu_requests: Dict[str, Dict[str, Any]],
+    cpu_limits: Dict[str, Dict[str, Any]],
+    mem_requests: Dict[str, Dict[str, Any]],
+    mem_limits: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Optional[float]]]:
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    for container in containers:
+        out[container] = {
+            "cpu_request_cores": _container_value(cpu_requests, container),
+            "cpu_limit_cores": _container_value(cpu_limits, container),
+            "memory_request_gb": _bytes_to_gb(_container_value(mem_requests, container)),
+            "memory_limit_gb": _bytes_to_gb(_container_value(mem_limits, container)),
+        }
+    return out
+
+
 def _workload_metadata(
     cluster: str,
     keys: Set[ContainerKey],
@@ -740,29 +812,21 @@ def _workload_metadata(
     return out
 
 
-def _select_denominator(*candidates: Tuple[Optional[float], str]) -> Tuple[Optional[float], str]:
-    for value, name in candidates:
-        if value and value > 0:
-            return float(value), name
-    return None, ""
-
-
-def _per_pod_value(value: Optional[float], replicas: int) -> Optional[float]:
-    if value is None:
-        return None
-    divisor = max(1, int(replicas or 0))
-    return float(value) / divisor
-
-
-def _normalize_series(
-    series: pd.Series,
-    denominator: Optional[float],
-    ratio_name: str,
+def _normalize_scoped_series(
+    *candidates: Tuple[Optional[pd.Series], Optional[float], str],
+    raw_series: pd.Series,
     raw_name: str,
 ) -> Tuple[str, pd.Series]:
-    if denominator and denominator > 0:
-        return ratio_name, series.astype(float) / float(denominator)
-    return raw_name, series.astype(float)
+    for series, denominator, ratio_name in candidates:
+        if series is not None and denominator and denominator > 0:
+            return ratio_name, series.astype(float) / float(denominator)
+    return raw_name, raw_series.astype(float)
+
+
+def _series_bytes_to_gb(series: Optional[pd.Series]) -> Optional[pd.Series]:
+    if series is None:
+        return None
+    return series / (1024 ** 3)
 
 
 def _regularize_series(series: pd.Series, step_seconds: int) -> pd.Series:

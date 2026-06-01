@@ -255,6 +255,15 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
         cpu_limit = cpu_limits[i % len(cpu_limits)]
         memory_request = memory_requests[i % len(memory_requests)]
         memory_limit = memory_limits[i % len(memory_limits)]
+        container_specs = {
+            name: {
+                "cpu_request_cores": cpu_request,
+                "cpu_limit_cores": cpu_limit,
+                "memory_request_gb": memory_request,
+                "memory_limit_gb": memory_limit,
+            }
+            for name in containers
+        }
         out.append(
             {
                 "resource_id": f"k8s:{clusters[i % len(clusters)]}:{namespace}:{owner_kind.lower()}:{workload_name}",
@@ -270,20 +279,23 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
                     "containers_observed": containers,
                     "replicas_observed": len(pods),
                     "node": node_names[i % len(node_names)],
-                    "cpu_request_cores": cpu_request,
-                    "cpu_limit_cores": cpu_limit,
-                    "memory_request_gb": memory_request,
-                    "memory_limit_gb": memory_limit,
-                    "cpu_metric_mode": "cpu_usage/cpu_request" if cpu_request else "cpu_usage/cpu_limit" if cpu_limit else "cpu_usage_cores",
-                    "memory_metric_mode": "memory_working_set/memory_limit" if memory_limit else "memory_working_set/memory_request" if memory_request else "memory_working_set_gb",
+                    "containers": container_specs,
+                    "cpu_limit_metric_mode": "cpu_usage/cpu_limit" if cpu_limit else "cpu_usage_cores",
+                    "cpu_request_metric_mode": "cpu_usage/cpu_request" if cpu_request else "cpu_usage_cores",
+                    "memory_limit_metric_mode": "memory_working_set/memory_limit" if memory_limit else "memory_working_set_gb",
+                    "memory_request_metric_mode": "memory_working_set/memory_request" if memory_request else "memory_working_set_gb",
                 },
                 "metrics": {
-                    "cpu": {"timestamps": idx_list, "values": cpu.astype(float).tolist()},
-                    "memory": {"timestamps": idx_list, "values": memory.astype(float).tolist()},
+                    "cpu_limit": {"timestamps": idx_list, "values": cpu.astype(float).tolist()},
+                    "cpu_request": {"timestamps": idx_list, "values": cpu.astype(float).tolist()},
+                    "memory_limit": {"timestamps": idx_list, "values": memory.astype(float).tolist()},
+                    "memory_request": {"timestamps": idx_list, "values": memory.astype(float).tolist()},
                 },
                 "data_quality": {
-                    "cpu": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
-                    "memory": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                    "cpu_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                    "cpu_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                    "memory_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                    "memory_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
                 },
             }
         )

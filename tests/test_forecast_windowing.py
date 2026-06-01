@@ -16,6 +16,9 @@ from resource_predict.pipeline.windowing import infer_series_freq, resolve_forec
 from resource_predict.settings import settings
 
 
+K8S_METRICS = ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
+
+
 def series(points: int, freq: str) -> pd.Series:
     return pd.Series(
         [0.2] * points,
@@ -129,10 +132,7 @@ class ForecastWindowingTest(unittest.TestCase):
             k8s_item = {
                 "resource_id": "k8s:cluster-a:ns:deployment:api",
                 "resource_type": "k8s_workload",
-                "metrics": {
-                    "cpu": {"timestamps": timestamps, "values": [0.2] * len(timestamps)},
-                    "memory": {"timestamps": timestamps, "values": [0.3] * len(timestamps)},
-                },
+                "metrics": {metric: {"timestamps": timestamps, "values": [0.2] * len(timestamps)} for metric in K8S_METRICS},
                 "spec": {
                     "cluster": "cluster-a",
                     "namespace": "ns",
@@ -140,6 +140,14 @@ class ForecastWindowingTest(unittest.TestCase):
                     "workload_name": "api",
                     "pods_observed": ["api-a"],
                     "containers_observed": ["app"],
+                    "containers": {
+                        "app": {
+                            "cpu_request_cores": 0.5,
+                            "cpu_limit_cores": 1.0,
+                            "memory_request_gb": 0.5,
+                            "memory_limit_gb": 1.0,
+                        }
+                    },
                     "replicas_observed": 1,
                 },
             }
@@ -159,10 +167,7 @@ class ForecastWindowingTest(unittest.TestCase):
             item = {
                 "resource_id": "k8s:cluster-a:ns:deployment:api",
                 "resource_type": "k8s_workload",
-                "metrics": {
-                    "cpu": {"timestamps": timestamps, "values": [0.2] * len(timestamps)},
-                    "memory": {"timestamps": timestamps, "values": [0.3] * len(timestamps)},
-                },
+                "metrics": {metric: {"timestamps": timestamps, "values": [0.2] * len(timestamps)} for metric in K8S_METRICS},
                 "spec": {
                     "cluster": "cluster-a",
                     "namespace": "ns",
@@ -170,6 +175,14 @@ class ForecastWindowingTest(unittest.TestCase):
                     "workload_name": "api",
                     "pods_observed": ["api-a"],
                     "containers_observed": ["app"],
+                    "containers": {
+                        "app": {
+                            "cpu_request_cores": 0.5,
+                            "cpu_limit_cores": 1.0,
+                            "memory_request_gb": 0.5,
+                            "memory_limit_gb": 1.0,
+                        }
+                    },
                     "replicas_observed": 1,
                 },
             }
@@ -198,7 +211,7 @@ class ForecastWindowingTest(unittest.TestCase):
             self.assertTrue(report["rows"])
             row = report["rows"][0]
             self.assertEqual(row["resource_id"], item["resource_id"])
-            self.assertIn(row["metric"], {"cpu", "memory"})
+            self.assertIn(row["metric"], set(K8S_METRICS))
             self.assertEqual(row["model"], "rolling_mean")
             for key in ("rmse", "mae", "mape", "p95_error"):
                 self.assertIn(key, row)

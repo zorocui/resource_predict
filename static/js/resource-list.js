@@ -86,12 +86,12 @@
     if (!resource) return "percent";
     if (!isK8s(resource)) return "percent";
     const spec = resource.spec || {};
-    if (metricKey === "cpu") {
-      const mode = String(spec.cpu_metric_mode || "");
+    if (metricKey === "cpu_limit" || metricKey === "cpu_request") {
+      const mode = String(spec[`${metricKey}_metric_mode`] || "");
       if (mode.includes("cpu_usage_cores") || mode === "raw") return "cores";
     }
-    if (metricKey === "memory") {
-      const mode = String(spec.memory_metric_mode || "");
+    if (metricKey === "memory_limit" || metricKey === "memory_request") {
+      const mode = String(spec[`${metricKey}_metric_mode`] || "");
       if (mode.includes("memory_working_set_gb") || mode === "raw") return "gb";
     }
     return "percent";

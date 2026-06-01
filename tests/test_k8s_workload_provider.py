@@ -237,19 +237,41 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         self.assertEqual(item["spec"]["replicas"], 3)
         self.assertEqual(item["spec"]["replicas_observed"], 3)
         self.assertEqual(item["spec"]["nodes"], ["node-1", "node-2"])
-        self.assertEqual(item["spec"]["cpu_request_cores"], 1.0)
-        self.assertEqual(item["spec"]["memory_limit_gb"], 1.0)
-        self.assertEqual(item["spec"]["cpu_request_cores_total"], 2.0)
-        self.assertEqual(item["spec"]["memory_limit_gb_total"], 2.0)
-        self.assertEqual(item["spec"]["cpu_metric_mode"], "cpu_usage/cpu_request")
-        self.assertEqual(item["spec"]["memory_metric_mode"], "memory_working_set/memory_limit")
+        self.assertNotIn("cpu_request_cores", item["spec"])
+        self.assertNotIn("memory_limit_gb", item["spec"])
+        self.assertNotIn("cpu_request_cores_total", item["spec"])
+        self.assertNotIn("memory_limit_gb_total", item["spec"])
+        self.assertEqual(item["spec"]["cpu_limit_metric_mode"], "cpu_usage_cores")
+        self.assertEqual(item["spec"]["cpu_request_metric_mode"], "cpu_usage/cpu_request")
+        self.assertEqual(item["spec"]["memory_limit_metric_mode"], "memory_working_set/memory_limit")
+        self.assertEqual(item["spec"]["memory_request_metric_mode"], "memory_working_set_gb")
+        self.assertEqual(
+            item["spec"]["containers"],
+            {
+                "app": {
+                    "cpu_request_cores": 1.0,
+                    "cpu_limit_cores": None,
+                    "memory_request_gb": None,
+                    "memory_limit_gb": 1.0,
+                },
+                "sidecar": {
+                    "cpu_request_cores": 1.0,
+                    "cpu_limit_cores": None,
+                    "memory_request_gb": None,
+                    "memory_limit_gb": 1.0,
+                },
+            },
+        )
         self.assertTrue(any('container!="POD"' in query for query in FakePrometheusClient.queries))
-        self.assertEqual(len(item["metrics"]["cpu"]["values"]), 2)
-        self.assertAlmostEqual(item["metrics"]["cpu"]["values"][0], 0.15)
-        self.assertAlmostEqual(item["metrics"]["cpu"]["values"][1], 0.3)
-        self.assertEqual(len(item["metrics"]["memory"]["values"]), 2)
-        self.assertAlmostEqual(item["metrics"]["memory"]["values"][0], 0.5)
-        self.assertAlmostEqual(item["metrics"]["memory"]["values"][1], 0.7)
+        self.assertEqual(set(item["metrics"]), {"cpu_limit", "cpu_request", "memory_limit", "memory_request"})
+        self.assertAlmostEqual(item["metrics"]["cpu_limit"]["values"][0], 0.3)
+        self.assertAlmostEqual(item["metrics"]["cpu_limit"]["values"][1], 0.6)
+        self.assertAlmostEqual(item["metrics"]["cpu_request"]["values"][0], 0.15)
+        self.assertAlmostEqual(item["metrics"]["cpu_request"]["values"][1], 0.3)
+        self.assertAlmostEqual(item["metrics"]["memory_limit"]["values"][0], 0.5)
+        self.assertAlmostEqual(item["metrics"]["memory_limit"]["values"][1], 0.7)
+        self.assertAlmostEqual(item["metrics"]["memory_request"]["values"][0], 1.0)
+        self.assertAlmostEqual(item["metrics"]["memory_request"]["values"][1], 1.4)
 
     def test_diagnose_target_reports_workload_readiness(self):
         target = PrometheusTarget(
@@ -353,10 +375,28 @@ class K8SWorkloadProviderTest(unittest.TestCase):
 
         self.assertEqual(len(items), 1)
         spec = items[0]["spec"]
-        self.assertIsNone(spec["cpu_request_cores"])
-        self.assertAlmostEqual(spec["cpu_limit_cores"], 0.1)
-        self.assertAlmostEqual(spec["memory_request_gb"], 200 / 1024)
-        self.assertAlmostEqual(spec["memory_limit_gb"], 25 / 1024)
+        self.assertNotIn("cpu_request_cores", spec)
+        self.assertNotIn("cpu_limit_cores", spec)
+        self.assertNotIn("memory_request_gb", spec)
+        self.assertNotIn("memory_limit_gb", spec)
+        self.assertEqual(spec["cpu_limit_metric_mode"], "cpu_usage/cpu_limit")
+        self.assertEqual(spec["cpu_request_metric_mode"], "cpu_usage_cores")
+        self.assertEqual(spec["memory_limit_metric_mode"], "memory_working_set/memory_limit")
+        self.assertEqual(spec["memory_request_metric_mode"], "memory_working_set/memory_request")
+        self.assertAlmostEqual(spec["containers"]["alertmanager"]["memory_request_gb"], 200 / 1024)
+        self.assertIsNone(spec["containers"]["alertmanager"]["cpu_limit_cores"])
+        self.assertAlmostEqual(spec["containers"]["config-reloader"]["cpu_limit_cores"], 0.1)
+        self.assertAlmostEqual(spec["containers"]["config-reloader"]["memory_limit_gb"], 25 / 1024)
+
+        metrics = items[0]["metrics"]
+        self.assertAlmostEqual(metrics["cpu_limit"]["values"][0], 0.1)
+        self.assertAlmostEqual(metrics["cpu_limit"]["values"][1], 0.2)
+        self.assertAlmostEqual(metrics["cpu_request"]["values"][0], 0.04)
+        self.assertAlmostEqual(metrics["cpu_request"]["values"][1], 0.08)
+        self.assertAlmostEqual(metrics["memory_limit"]["values"][0], 0.04)
+        self.assertAlmostEqual(metrics["memory_limit"]["values"][1], 0.08)
+        self.assertAlmostEqual(metrics["memory_request"]["values"][0], 0.05)
+        self.assertAlmostEqual(metrics["memory_request"]["values"][1], 0.1)
 
     def test_data_quality_uses_seconds_for_gap_threshold(self):
         idx = pd.date_range("2026-01-01", periods=24, freq="300s")

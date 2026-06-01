@@ -10,7 +10,7 @@ from resource_predict.pipeline.output_paths import all_scoped_out_dirs
 
 
 VM_METRICS = ("cpu", "memory", "disk")
-K8S_WORKLOAD_METRICS = ("cpu", "memory")
+K8S_WORKLOAD_METRICS = ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
 
 
 def check_outputs(out_dir: Path | str, *, require_both_types: bool = True) -> Dict[str, Any]:
@@ -308,6 +308,7 @@ def _check_k8s_workload_summary(
             errors.append(f"{rid}: Workload spec 缺少 {key}")
     _check_non_empty_list(spec, "pods_observed", rid, errors)
     _check_non_empty_list(spec, "containers_observed", rid, errors)
+    _check_container_specs(spec, rid, errors)
 
     replicas = spec.get("replicas_observed")
     if not isinstance(replicas, int) or replicas <= 0:
@@ -415,6 +416,18 @@ def _check_non_empty_list(spec: Dict[str, Any], key: str, rid: str, errors: List
     value = spec.get(key)
     if not isinstance(value, list) or not value:
         errors.append(f"{rid}: Workload spec 缺少非空 {key}")
+
+
+def _check_container_specs(spec: Dict[str, Any], rid: str, errors: List[str]) -> None:
+    containers = spec.get("containers")
+    observed = spec.get("containers_observed")
+    if not isinstance(containers, dict) or not containers:
+        errors.append(f"{rid}: Workload spec 缺少非空 containers")
+        return
+    if isinstance(observed, list):
+        missing = [str(name) for name in observed if str(name or "") not in containers]
+        if missing:
+            errors.append(f"{rid}: Workload spec.containers 缺少 {','.join(missing)}")
 
 
 def _format_counts(counts: Dict[str, int]) -> str:

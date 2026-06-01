@@ -122,7 +122,9 @@ def generate_forecasts(
     test_size = window.test_size
     future_steps = window.future_steps
     try:
-        freq = infer_series_freq(prepared_data[0]["cpu"].index)
+        first_series = _first_metric_series(prepared_data)
+        if first_series is not None:
+            freq = infer_series_freq(first_series.index)
     except Exception:
         pass
     if not predict_only and save_raw:
@@ -315,6 +317,15 @@ def generate_predictions_only(**kwargs: Any) -> List[Dict[str, Any]]:
     return generate_forecasts(**kwargs)
 
 
+def _first_metric_series(prepared_data: List[Dict[str, Any]]) -> Any:
+    for item in prepared_data:
+        for metric in metric_names_for_resource(item):
+            series = item.get(metric)
+            if series is not None:
+                return series
+    return None
+
+
 def _log_input_stats(
     prepared_data: List[Dict[str, Any]],
     resources_ct: int,
@@ -326,12 +337,17 @@ def _log_input_stats(
     window_source: str,
     sample_interval_seconds: Optional[float],
 ) -> None:
-    cpu_lens = [len(p["cpu"]) for p in prepared_data]
-    n_min, n_max = min(cpu_lens), max(cpu_lens)
-    n_avg = sum(cpu_lens) / max(1, len(cpu_lens))
+    input_series = []
+    for item in prepared_data:
+        series = _first_metric_series([item])
+        if series is not None:
+            input_series.append(series)
+    input_lens = [len(series) for series in input_series]
+    n_min, n_max = min(input_lens), max(input_lens)
+    n_avg = sum(input_lens) / max(1, len(input_lens))
     freq_infer = None
     try:
-        freq_infer = pd.infer_freq(prepared_data[0]["cpu"].index)
+        freq_infer = pd.infer_freq(input_series[0].index)
     except Exception:
         freq_infer = None
     freq_display = freq_infer or freq

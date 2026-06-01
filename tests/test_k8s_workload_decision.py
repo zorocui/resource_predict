@@ -7,6 +7,34 @@ import numpy as np
 from resource_predict.core.k8s_workload_decision import build_k8s_workload_advice
 
 
+def _containers(
+    *,
+    cpu_request=None,
+    cpu_limit=None,
+    memory_request=None,
+    memory_limit=None,
+) -> dict:
+    return {
+        "containers": {
+            "app": {
+                "cpu_request_cores": cpu_request,
+                "cpu_limit_cores": cpu_limit,
+                "memory_request_gb": memory_request,
+                "memory_limit_gb": memory_limit,
+            }
+        }
+    }
+
+
+def _quality(level: str = "good") -> dict:
+    return {
+        "cpu_limit": {"level": level},
+        "cpu_request": {"level": level},
+        "memory_limit": {"level": level},
+        "memory_request": {"level": level},
+    }
+
+
 class K8SWorkloadDecisionTest(unittest.TestCase):
     def test_missing_request_limit_is_trend_only_not_insufficient(self):
         resource = {
@@ -45,11 +73,8 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         resource = {
             "resource_id": "k8s:cluster:ns:deployment:api",
             "resource_type": "k8s_workload",
-            "spec": {"cpu_request_cores": 1.0, "memory_request_gb": 1.0},
-            "data_quality": {
-                "cpu": {"level": "poor"},
-                "memory": {"level": "poor"},
-            },
+            "spec": _containers(cpu_request=1.0, memory_request=1.0),
+            "data_quality": _quality("poor"),
         }
 
         advice = build_k8s_workload_advice(
@@ -71,10 +96,7 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
                 "workload_kind": "Deployment",
                 "workload_name": "api",
                 "replicas_observed": 2,
-                "cpu_request_cores": 2.0,
-                "cpu_limit_cores": 4.0,
-                "memory_request_gb": 2.0,
-                "memory_limit_gb": 4.0,
+                **_containers(cpu_request=2.0, cpu_limit=4.0, memory_request=2.0, memory_limit=4.0),
             },
             "data_quality": {
                 "cpu": {"level": "good"},
@@ -118,10 +140,7 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
                 "workload_kind": "Deployment",
                 "workload_name": "api",
                 "replicas_observed": 2,
-                "cpu_request_cores": 0.5,
-                "cpu_limit_cores": 0.5,
-                "memory_request_gb": 0.5,
-                "memory_limit_gb": 0.5,
+                **_containers(cpu_request=0.5, cpu_limit=0.5, memory_request=0.5, memory_limit=0.5),
             },
             "data_quality": {
                 "cpu": {"level": "good"},
@@ -156,10 +175,7 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
                 "workload_kind": "Deployment",
                 "workload_name": "api",
                 "replicas_observed": 3,
-                "cpu_request_cores": 1.0,
-                "cpu_limit_cores": 2.0,
-                "memory_request_gb": 1.0,
-                "memory_limit_gb": 2.0,
+                **_containers(cpu_request=1.0, cpu_limit=2.0, memory_request=1.0, memory_limit=2.0),
             },
             "data_quality": {
                 "cpu": {"level": "good"},
@@ -188,8 +204,7 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
                 "workload_kind": "StatefulSet",
                 "replicas": 3,
                 "replicas_observed": 2,
-                "cpu_request_cores": 1.0,
-                "memory_request_gb": 1.0,
+                **_containers(cpu_request=1.0, cpu_limit=1.0, memory_request=1.0, memory_limit=1.0),
             },
             "data_quality": {
                 "cpu": {"level": "good"},
@@ -210,6 +225,72 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
             3,
         )
 
+    def test_request_based_high_usage_does_not_recommend_scale_out(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 2,
+                **_containers(cpu_request=0.1, memory_request=0.1),
+                "cpu_metric_mode": "cpu_usage/cpu_request",
+                "memory_metric_mode": "memory_working_set/memory_request",
+            },
+            "data_quality": {
+                "cpu": {"level": "good"},
+                "memory": {"level": "good"},
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu": np.array([8.0, 10.0, 12.0]),
+                "memory": np.array([9.0, 11.0, 13.0]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "hold")
+        self.assertEqual(advice["metric_actions"]["cpu"], "hold")
+        self.assertEqual(advice["metric_actions"]["memory"], "hold")
+        self.assertIn("no limit baseline for scale-out", advice["metric_reasons"]["cpu"])
+        self.assertEqual(advice["target_spec"], {})
+
+    def test_request_based_low_usage_can_recommend_scale_in(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 3,
+                **_containers(cpu_request=4.0, memory_request=4.0),
+                "cpu_metric_mode": "cpu_usage/cpu_request",
+                "memory_metric_mode": "memory_working_set/memory_request",
+            },
+            "data_quality": {
+                "cpu": {"level": "good"},
+                "memory": {"level": "good"},
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu": np.array([0.02, 0.03, 0.04]),
+                "memory": np.array([0.03, 0.04, 0.05]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_in_candidate")
+        self.assertLess(advice["target_spec"]["cpu_request_cores"], 4.0)
+        self.assertLess(advice["target_spec"]["memory_request_gb"], 4.0)
+
     def test_daemonset_policy_does_not_recommend_replica_scaling(self):
         resource = {
             "resource_id": "k8s:cluster:cattle-system:daemonset:cattle-node-agent",
@@ -221,10 +302,7 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
                 "workload_name": "cattle-node-agent",
                 "replicas": 6,
                 "replicas_observed": 6,
-                "cpu_request_cores": 8.0,
-                "cpu_limit_cores": 10.0,
-                "memory_request_gb": 8.0,
-                "memory_limit_gb": 10.0,
+                **_containers(cpu_request=8.0, cpu_limit=10.0, memory_request=8.0, memory_limit=10.0),
             },
             "data_quality": {
                 "cpu": {"level": "good"},

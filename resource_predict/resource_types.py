@@ -2,14 +2,14 @@
 
 项目仅使用两种资源类型：
 - openstack_vm: VM 资源，预测 cpu / memory / disk
-- k8s_workload: K8S Workload 资源，预测 cpu / memory
+- k8s_workload: K8S Workload 资源，预测 cpu_limit / cpu_request / memory_limit / memory_request
 
 所有遗留别名（pod、k8s_pod、k8s、kubernetes、container 等）统一归一到 k8s_workload。
 """
 from __future__ import annotations
 
 METRIC_NAMES = ("cpu", "memory", "disk")
-K8S_METRIC_NAMES = ("cpu", "memory")
+K8S_METRIC_NAMES = ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
 
 
 def resource_type_of(item: dict) -> str:
@@ -41,7 +41,7 @@ def metric_names_for_resource(item: dict) -> tuple[str, ...]:
         item: 包含 resource_type 字段的字典
 
     Returns:
-        K8S_METRIC_NAMES (cpu, memory) 或 METRIC_NAMES (cpu, memory, disk)
+        K8S_METRIC_NAMES (cpu_limit, cpu_request, memory_limit, memory_request) 或 METRIC_NAMES (cpu, memory, disk)
     """
     if resource_type_of(item) == "k8s_workload":
         return K8S_METRIC_NAMES

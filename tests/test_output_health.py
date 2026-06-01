@@ -17,6 +17,9 @@ def metric_block() -> dict:
     return {"timestamps": [1_700_000_000_000, 1_700_003_600_000], "values": [0.3, 0.4]}
 
 
+K8S_METRICS = ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
+
+
 def valid_artifacts() -> tuple[dict, dict, dict]:
     vm_summary = {
         "resource_id": "vm-001",
@@ -35,6 +38,14 @@ def valid_artifacts() -> tuple[dict, dict, dict]:
             "workload_name": "api",
             "pods_observed": ["api-rs-a", "api-rs-b"],
             "containers_observed": ["app"],
+            "containers": {
+                "app": {
+                    "cpu_request_cores": 0.5,
+                    "cpu_limit_cores": 1.0,
+                    "memory_request_gb": 1.0,
+                    "memory_limit_gb": 2.0,
+                }
+            },
             "replicas_observed": 2,
         },
         "scaling_advice": {
@@ -44,7 +55,7 @@ def valid_artifacts() -> tuple[dict, dict, dict]:
             "analysis_only": True,
         },
         "detail_ref": {"file": "part-00000.json", "offset": 1},
-        "charts_forecast": {"cpu": {}, "memory": {}},
+        "charts_forecast": {metric: {} for metric in K8S_METRICS},
     }
     summary = {
         "meta": {"details_files": ["part-00000.json"], "details_dir": "details"},
@@ -61,7 +72,7 @@ def valid_artifacts() -> tuple[dict, dict, dict]:
             {
                 "resource_id": "k8s:cluster-a:ns:deployment:api",
                 "resource_type": "k8s_workload",
-                "metrics": {"cpu": metric_block(), "memory": metric_block()},
+                "metrics": {metric: metric_block() for metric in K8S_METRICS},
             },
         ],
     }

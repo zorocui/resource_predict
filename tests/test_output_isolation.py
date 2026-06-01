@@ -17,6 +17,9 @@ def metric_block() -> dict:
     return {"timestamps": [1_700_000_000_000, 1_700_003_600_000], "values": [0.3, 0.4]}
 
 
+K8S_METRICS = ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
+
+
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -47,6 +50,14 @@ def write_artifacts(base: Path, resource_id: str, resource_type: str, metrics: t
             "workload_name": "api",
             "pods_observed": ["api-a"],
             "containers_observed": ["app"],
+            "containers": {
+                "app": {
+                    "cpu_request_cores": 0.5,
+                    "cpu_limit_cores": 1.0,
+                    "memory_request_gb": 1.0,
+                    "memory_limit_gb": 2.0,
+                }
+            },
             "replicas_observed": 1,
         }
         summary_item["spec"] = spec
@@ -83,7 +94,7 @@ class OutputIsolationTest(unittest.TestCase):
             k8s_item = {
                 "resource_id": "k8s:cluster-a:ns:deployment:api",
                 "resource_type": "k8s_workload",
-                "metrics": {"cpu": metric_block(), "memory": metric_block()},
+                "metrics": {metric: metric_block() for metric in K8S_METRICS},
                 "spec": {
                     "cluster": "cluster-a",
                     "namespace": "ns",
@@ -91,6 +102,14 @@ class OutputIsolationTest(unittest.TestCase):
                     "workload_name": "api",
                     "pods_observed": ["api-a"],
                     "containers_observed": ["app"],
+                    "containers": {
+                        "app": {
+                            "cpu_request_cores": 0.5,
+                            "cpu_limit_cores": 1.0,
+                            "memory_request_gb": 1.0,
+                            "memory_limit_gb": 2.0,
+                        }
+                    },
                     "replicas_observed": 1,
                 },
             }
@@ -108,7 +127,7 @@ class OutputIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_artifacts(root / "vm", "vm-001", "openstack_vm", ("cpu", "memory", "disk"))
-            write_artifacts(root / "k8s", "k8s:cluster-a:ns:deployment:api", "k8s_workload", ("cpu", "memory"))
+            write_artifacts(root / "k8s", "k8s:cluster-a:ns:deployment:api", "k8s_workload", K8S_METRICS)
 
             store = ForecastStore(app_cfg=AppConfig(out_dir=str(root)))
             summary = store.get_summary()

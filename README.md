@@ -5,7 +5,7 @@
 **支持资源类型：**
 
 - **VM（OpenStack）**：预测 `cpu / memory / disk` 三项指标，生成 `openstack server resize` 命令
-- **K8S Workload**：从 Prometheus 聚合 Pod/Container 到 Deployment/StatefulSet/DaemonSet 控制器粒度，预测 `cpu / memory`，生成 `kubectl set resources` 和 `kubectl scale` 命令
+- **K8S Workload**：从 Prometheus 聚合 Pod/Container 到 Deployment/StatefulSet/DaemonSet 控制器粒度，预测 `cpu_limit / cpu_request / memory_limit / memory_request`，生成 `kubectl set resources` 和 `kubectl scale` 命令
 
 **核心能力：**
 
@@ -429,8 +429,9 @@ sequenceDiagram
 
 ### 5.3 K8S Workload 决策引擎（`core/k8s_workload_decision.py`）
 
-- **扩容判断**：P95 >= 0.8 或峰值 >= 0.9
-- **缩容判断**：均值 < 0.2 且 P95 < 0.35
+- **当前资源规格**：K8S 当前 request/limit 只保存在 `spec.containers.<container>`，不保留 Workload 级累加 request/limit 字段；前端也按 container 粒度展示。
+- **扩容判断**：基于 `cpu_limit` / `memory_limit`，P95 >= 0.8 或峰值 >= 0.9；没有 limit 时不提出扩容建议
+- **缩容判断**：基于 `cpu_request` / `memory_request`，均值 < 0.2 且 P95 < 0.35
 - **数据质量**：`_quality_level()` 评估每个指标的数据质量，poor 质量自动跳过执行建议
 - **Baseline 缺失处理**：缺少 request/limit 时降级为 trend-only 分析
 - **目标利用率分级**：`_target_utilization()` 按策略层级返回差异化利用率目标（0.55~0.78）
@@ -1091,7 +1092,7 @@ python -m pytest -q
 | 规范名 | 来源字符串 | 指标集 |
 | --- | --- | --- |
 | `openstack_vm` | `openstack`, `vm`, `openstack_vm` | `cpu`, `memory`, `disk` |
-| `k8s_workload` | `k8s_workload`, `workload`, `controller`, `k8s_controller`, `pod`, `k8s_pod`, `k8s`, `kubernetes`, `container`, `k8s_container` | `cpu`, `memory` |
+| `k8s_workload` | `k8s_workload`, `workload`, `controller`, `k8s_controller`, `pod`, `k8s_pod`, `k8s`, `kubernetes`, `container`, `k8s_container` | `cpu_limit`, `cpu_request`, `memory_limit`, `memory_request` |
 
 使用 `resource_type_of(item)` 归一化类型，使用 `metric_names_for_resource(item)` 获取指标名列表。所有 K8S 相关字符串统一归一到 `k8s_workload`。
 

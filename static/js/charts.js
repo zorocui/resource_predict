@@ -416,6 +416,40 @@
       const text = list.formatNumber(value, digits);
       return text === "-" ? null : `${text} ${unit}`;
     };
+    const metricModeLabel = (mode, resourceLabel) => {
+      const value = String(mode || "").toLowerCase();
+      if (value.includes(`/${resourceLabel}_limit`)) return "Limit 使用率";
+      if (value.includes(`/${resourceLabel}_request`)) return "Request 使用率（无上限，仅评估低使用）";
+      if (value.includes("_cores")) return "CPU 绝对值";
+      if (value.includes("_gb")) return "内存绝对值";
+      return mode;
+    };
+    const containerSpecMarkup = () => {
+      const containers = spec.containers && typeof spec.containers === "object" && !Array.isArray(spec.containers)
+        ? spec.containers
+        : {};
+      const names = Object.keys(containers).sort();
+      if (!names.length) return "";
+      const rows = names.map((name) => {
+        const item = containers[name] && typeof containers[name] === "object" ? containers[name] : {};
+        return `
+          <div class="container-spec-row">
+            <strong title="${list.escapeHtml(name)}">${list.escapeHtml(name)}</strong>
+            <span>${list.escapeHtml(formatMaybe(item.cpu_request_cores, "C") || "-")}</span>
+            <span>${list.escapeHtml(formatMaybe(item.cpu_limit_cores, "C") || "-")}</span>
+            <span>${list.escapeHtml(formatMaybe(item.memory_request_gb, "GB") || "-")}</span>
+            <span>${list.escapeHtml(formatMaybe(item.memory_limit_gb, "GB") || "-")}</span>
+          </div>`;
+      }).join("");
+      return `
+        <div class="container-spec-grid">
+          <div class="container-spec-title">容器规格</div>
+          <div class="container-spec-head">
+            <span>Container</span><span>CPU Request</span><span>CPU Limit</span><span>内存 Request</span><span>内存 Limit</span>
+          </div>
+          ${rows}
+        </div>`;
+    };
     const entries = list.isK8s(resource)
       ? [
           ["集群", spec.cluster],
@@ -425,12 +459,10 @@
           ["观测 Pod 数", spec.replicas_observed],
           ["容器", Array.isArray(spec.containers_observed) ? spec.containers_observed.join(", ") : spec.container],
           ["节点", Array.isArray(spec.nodes) ? spec.nodes.join(", ") : spec.node],
-          ["CPU Request / Pod", formatMaybe(spec.cpu_request_cores, "C")],
-          ["CPU Limit / Pod", formatMaybe(spec.cpu_limit_cores, "C")],
-          ["内存 Request / Pod", formatMaybe(spec.memory_request_gb, "GB")],
-          ["内存 Limit / Pod", formatMaybe(spec.memory_limit_gb, "GB")],
-          ["CPU 基准", spec.cpu_metric_mode],
-          ["内存基准", spec.memory_metric_mode],
+          ["CPU 扩容基准", metricModeLabel(spec.cpu_limit_metric_mode, "cpu")],
+          ["CPU 缩容基准", metricModeLabel(spec.cpu_request_metric_mode, "cpu")],
+          ["内存扩容基准", metricModeLabel(spec.memory_limit_metric_mode, "memory")],
+          ["内存缩容基准", metricModeLabel(spec.memory_request_metric_mode, "memory")],
         ]
       : [
           ["集群", spec.cluster],
@@ -439,12 +471,13 @@
           ["内存", formatMaybe(spec.memory_gb, "GB", 0)],
           ["磁盘", formatMaybe(spec.disk_gb, "GB", 0)],
         ];
-    app.els.detailSpec.innerHTML = entries
+    const summaryMarkup = entries
       .filter(([, value]) =>
         value !== undefined && value !== null && String(value).trim() !== "" && String(value) !== "-"
       )
       .map(([label, value]) => `<div class="spec-item"><span>${list.escapeHtml(label)}</span><strong title="${list.escapeHtml(value)}">${list.escapeHtml(value)}</strong></div>`)
       .join("");
+    app.els.detailSpec.innerHTML = summaryMarkup + (list.isK8s(resource) ? containerSpecMarkup() : "");
   }
 
   function displayResourceId(resource, fallbackResourceId = "") {
