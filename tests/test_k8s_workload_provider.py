@@ -18,12 +18,14 @@ GIB = 1024 ** 3
 
 class FakePrometheusClient:
     queries: list[str] = []
+    range_calls: list[dict] = []
 
     def __init__(self, *args, **kwargs):
         pass
 
     def query_range(self, query: str, *, start: float, end: float, step: int):
         self.queries.append(query)
+        self.range_calls.append({"query": query, "start": start, "end": end, "step": step})
         if "container_cpu_usage_seconds_total" in query:
             rows = [
                 self._range_row("ns", "api-rs-a", "app", "node-1", [0.2, 0.4]),
@@ -195,6 +197,7 @@ class AsymmetricResourcePrometheusClient:
 class K8SWorkloadProviderTest(unittest.TestCase):
     def setUp(self):
         FakePrometheusClient.queries = []
+        FakePrometheusClient.range_calls = []
 
     def test_resolve_targets_prefers_file_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,6 +360,26 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         cpu_queries = [q for q in FakePrometheusClient.queries if "container_cpu_usage_seconds_total" in q]
         self.assertTrue(cpu_queries)
         self.assertTrue(all("[7m]" in query for query in cpu_queries))
+
+    def test_fetch_target_can_use_incremental_history_hours(self):
+        target = PrometheusTarget(
+            cluster="cluster-a",
+            prometheus_url="http://prometheus.example",
+            namespace_regex="",
+            bearer_token="",
+            basic_auth="",
+            history_days=7,
+            step_seconds=300,
+            request_timeout_seconds=5,
+            rate_window="5m",
+        )
+
+        with patch.object(provider, "PrometheusClient", FakePrometheusClient):
+            provider._fetch_target(target, limit=0, history_hours=7)
+
+        self.assertTrue(FakePrometheusClient.range_calls)
+        windows = [call["end"] - call["start"] for call in FakePrometheusClient.range_calls]
+        self.assertTrue(all(abs(window - 7 * 3600) < 5 for window in windows))
 
     def test_fetch_target_keeps_asymmetric_container_requests_and_limits_separate(self):
         target = PrometheusTarget(

@@ -229,8 +229,8 @@
     control_host: "",
     ssh_user: "root",
     ssh_port: 22,
-    ssh_key: "",
-    openstack_rc: "/root/admin-openrc",
+    ssh_key: "/root/.ssh/id_rsa",
+    openstack_rc: "/root/admin-openstack.sh",
     auto_confirm_resize: false,
     command_timeout_seconds: 300,
   };
@@ -241,7 +241,7 @@
     control_host: "",
     ssh_user: "root",
     ssh_port: 22,
-    ssh_key: "",
+    ssh_key: "/root/.ssh/id_rsa",
     kubeconfig: "/root/.kube/config",
     command_timeout_seconds: 300,
   };
@@ -344,6 +344,9 @@
     const supported = Array.isArray(payload?.supported_methods) ? payload.supported_methods : [];
     const enabled = new Set(payload?.enabled_methods || []);
     const ensembleEnabled = Boolean(payload?.enable_ensemble);
+    const reuseEnabled = payload?.reuse_backtest_model_for_future !== false;
+    const prophetRoutingEnabled = payload?.prophet_routing_enabled !== false;
+    const prophetRoutingMode = payload?.prophet_routing_mode || "auto";
     app.els.forecastModelList.innerHTML = `
       <div class="config-row" data-config-kind="forecast">
         <div class="config-row-title">
@@ -357,6 +360,9 @@
             { type: "checkbox" }
           )).join("")}
           ${configInput("Ensemble", "enable_ensemble", ensembleEnabled, { type: "checkbox" })}
+          ${configInput("多段预测复用", "reuse_backtest_model_for_future", reuseEnabled, { type: "checkbox" })}
+          ${configInput("Prophet 智能路由", "prophet_routing_enabled", prophetRoutingEnabled, { type: "checkbox" })}
+          ${configInput("Prophet 路由模式", "prophet_routing_mode", prophetRoutingMode, { placeholder: "auto" })}
         </div>
       </div>
     `;
@@ -458,9 +464,15 @@
       if (input.checked) enabledMethods.push(input.dataset.configName.replace("method:", ""));
     });
     const ensembleInput = app.els.forecastModelList?.querySelector('[data-config-name="enable_ensemble"]');
+    const reuseInput = app.els.forecastModelList?.querySelector('[data-config-name="reuse_backtest_model_for_future"]');
+    const prophetRoutingInput = app.els.forecastModelList?.querySelector('[data-config-name="prophet_routing_enabled"]');
+    const prophetRoutingModeInput = app.els.forecastModelList?.querySelector('[data-config-name="prophet_routing_mode"]');
     return {
       enabled_methods: enabledMethods,
       enable_ensemble: Boolean(ensembleInput?.checked),
+      reuse_backtest_model_for_future: reuseInput ? Boolean(reuseInput.checked) : true,
+      prophet_routing_enabled: prophetRoutingInput ? Boolean(prophetRoutingInput.checked) : true,
+      prophet_routing_mode: prophetRoutingModeInput?.value?.trim() || "auto",
     };
   }
 

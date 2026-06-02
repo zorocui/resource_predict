@@ -80,6 +80,7 @@ def k8s_workload_prometheus_provider(
     n: int,
     freq: str,
     clusters: Optional[Iterable[str]] = None,
+    history_hours: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Fetch K8S controller-level workload resources from Prometheus.
 
@@ -109,7 +110,7 @@ def k8s_workload_prometheus_provider(
             remaining = 0 if limit <= 0 else max(0, limit - len(out))
             if limit > 0 and remaining <= 0:
                 break
-            out.extend(_fetch_target(target, remaining))
+            out.extend(_fetch_target(target, remaining, history_hours=history_hours))
         except Exception as exc:
             msg = f"{target.cluster}({target.prometheus_url}): {exc}"
             errors.append(msg)
@@ -270,7 +271,12 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
         }
 
 
-def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
+def _fetch_target(
+    target: PrometheusTarget,
+    limit: int,
+    *,
+    history_hours: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     client = PrometheusClient(
         base_url=target.prometheus_url,
         bearer_token=target.bearer_token,
@@ -278,7 +284,10 @@ def _fetch_target(target: PrometheusTarget, limit: int) -> List[Dict[str, Any]]:
         timeout_seconds=int(target.request_timeout_seconds),
     )
     end = time.time()
-    start = end - int(target.history_days) * 86400
+    if history_hours is not None and float(history_hours) > 0:
+        start = end - float(history_hours) * 3600.0
+    else:
+        start = end - int(target.history_days) * 86400
     step = int(target.step_seconds)
     selector = 'container!="",container!="POD",pod!=""'
     if target.namespace_regex:

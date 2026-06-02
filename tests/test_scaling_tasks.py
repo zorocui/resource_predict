@@ -62,6 +62,50 @@ class ScalingTasksTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "action_gate"):
             create_scaling_task(resource, mode="execute")
 
+    def test_confirmed_suggested_execute_allows_observe_action_gate(self):
+        now_ms = 1_780_000_000_000
+        resource = {
+            "resource_id": "vm-gate-confirmed-test",
+            "resource_type": "openstack_vm",
+            "spec": {"cluster": "cluster-a", "cpu_cores": 4, "memory_gb": 8, "disk_gb": 100},
+            "scaling_advice": {
+                "action": "scale_out",
+                "confidence": "high",
+                "confidence_score": 90.0,
+                "policy_tier": "balanced",
+                "action_gate": {"state": "observe"},
+                "risk_profile": {"cooldown_minutes": 60},
+                "target_spec": {"cpu_cores": 8, "memory_gb": 8, "disk_gb": 100},
+            },
+        }
+
+        self.assertEqual(
+            _execution_gate_failures(resource, target_source="confirmed", now_ms=now_ms),
+            [],
+        )
+
+    def test_confirmed_suggested_execute_still_checks_confidence(self):
+        now_ms = 1_780_000_000_000
+        resource = {
+            "resource_id": "vm-gate-confirmed-low-confidence-test",
+            "resource_type": "openstack_vm",
+            "spec": {"cluster": "cluster-a", "cpu_cores": 4, "memory_gb": 8, "disk_gb": 100},
+            "scaling_advice": {
+                "action": "scale_out",
+                "confidence": "medium",
+                "confidence_score": 70.0,
+                "policy_tier": "balanced",
+                "action_gate": {"state": "observe"},
+                "risk_profile": {"cooldown_minutes": 60},
+                "target_spec": {"cpu_cores": 8, "memory_gb": 8, "disk_gb": 100},
+            },
+        }
+
+        failures = _execution_gate_failures(resource, target_source="confirmed", now_ms=now_ms)
+
+        self.assertTrue(any("confidence" in item for item in failures))
+        self.assertFalse(any("action_gate" in item for item in failures))
+
     def test_execution_gate_checks_data_quality_and_cooldown(self):
         now_ms = 1_780_000_000_000
         resource = {

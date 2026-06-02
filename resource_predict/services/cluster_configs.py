@@ -9,6 +9,8 @@ from resource_predict.utils import parse_positive_int
 
 VM_SCALING_CONFIG_PATH = Path("deploy") / "clusters.json"
 K8S_PROMETHEUS_CONFIG_PATH = Path("deploy") / "k8s_prometheus_clusters.json"
+DEFAULT_SSH_KEY = "/root/.ssh/id_rsa"
+DEFAULT_OPENSTACK_RC = "/root/admin-openstack.sh"
 
 
 class ClusterConfigValidationError(ValueError):
@@ -42,6 +44,9 @@ def normalize_vm_scaling_clusters(clusters: Any) -> Dict[str, Dict[str, Any]]:
         cfg["cloud_type"] = str(cfg.get("cloud_type") or "openstack").strip() or "openstack"
         _require(cfg, ("control_host", "ssh_user"), f"VM 调配集群 {cluster}")
         cfg["ssh_port"] = parse_positive_int(cfg.get("ssh_port"), default=22)
+        cfg["ssh_key"] = str(cfg.get("ssh_key") or DEFAULT_SSH_KEY).strip() or DEFAULT_SSH_KEY
+        if cfg["cloud_type"].lower() == "openstack":
+            cfg["openstack_rc"] = str(cfg.get("openstack_rc") or DEFAULT_OPENSTACK_RC).strip() or DEFAULT_OPENSTACK_RC
         normalized[cluster] = cfg
     return normalized
 

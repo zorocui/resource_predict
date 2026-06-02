@@ -229,6 +229,8 @@ K8S Pull:   _k8s_scheduler_loop -> run_k8s_prometheus_upsert -> run_upsert_with_
 K8S Fetch:  POST /api/cluster-configs/k8s-fetch -> run_k8s_prometheus_upsert（异步）
 ```
 
+K8S Prometheus 拉取窗口由 `run_k8s_prometheus_upsert()` 决定：如果 `outputs/k8s/raw_data.json` 缺失、指定集群没有本地基线，或请求传入 `full_refresh=true`，则按 `history_days` 拉取全量历史窗口（默认 7 天）；否则按 `scheduled_update_interval_minutes + incremental_overlap_minutes` 拉取增量窗口（默认 6 小时周期 + 1 小时 overlap = 最近 7 小时）。
+
 关键线程原语（`data/updater.py`）：
 
 - `_update_exclusive`（Lock）：序列化 HTTP 和调度线程之间的完整更新序列
@@ -293,7 +295,7 @@ sequenceDiagram
 - **策略分级**：conservative / balanced / aggressive，阈值和确认轮次差异化
 - **风险画像**：每个资源生成 `risk_profile`，包含 `saturation_risk`（饱和风险分）、`idle_opportunity`（空闲机会分）、`risk_score`（综合风险分）、当前生效阈值和冷却时间
 - **置信度评分**：多指标加权（P95 强度 42 + 峰值强度 20 + 均值强度 14 + 持续性 16 + 趋势 8）
-- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需确认轮次（conservative 缩容 +1 轮，aggressive 缩容 -1 轮）；进入 `execute` 前还会强制校验 `confidence`、`data_quality`、`cooldown` 和 `policy_tier`
+- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需确认轮次。扩容默认需要 `scale_out_confirmations=2` 轮，缩容默认需要 `scale_in_confirmations=3` 轮；conservative 缩容 +1 轮、aggressive 缩容 -1 轮，conservative 扩容可少 1 轮。当前实现未持久化跨预测轮次计数，因此需要多轮确认的建议会保持 `observe`，除非通过人工复核路径执行；进入 `execute` 前还会强制校验 `confidence`、`data_quality`、`cooldown` 和 `policy_tier`
 
 ### K8S Workload 决策引擎（`core/k8s_workload_decision.py`）
 
@@ -322,7 +324,7 @@ sequenceDiagram
 
 - **OpenStack VM**：自动发现可用 flavor -> 选择/生成目标 flavor -> `openstack server resize` -> 可选自动/手动 confirm
 - **K8S Workload**：`kubectl set resources` 按容器粒度 -> `kubectl scale` 调整副本数
-- **执行前置校验**：`execute` 模式仅允许 `action_gate=ready`、高置信度、数据质量良好、未处于冷却期且策略层级有效的建议进入实际执行；手动 `target_spec` 仍需通过数据质量、冷却期和策略层级校验
+- **执行前置校验**：`execute` 模式在任务入队前调用 `_execution_gate_failures()`。默认建议执行必须满足 `action_gate=ready`、`confidence=high` 且分数达标、数据质量良好、未处于冷却期、策略层级有效；人工复核建议（`target_source=confirmed`）只跳过 `action_gate`，仍保留其他门控；手动 `target_spec` 不要求建议 `action_gate` / `confidence`，但仍需通过策略层级、数据质量、冷却期和 K8S 目标策略校验
 - **安全**：所有用户可控值使用 `shlex.quote()` 转义
 - **快照**：调配成功后自动更新 `summary_index.json` / `details/*.json` / `raw_data.json` / `manifest.json` 中的 spec
 

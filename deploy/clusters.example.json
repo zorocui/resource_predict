@@ -4,8 +4,8 @@
     "control_host": "192.168.1.10",
     "ssh_user": "root",
     "ssh_port": 22,
-    "ssh_key": "C:/path/to/id_rsa",
-    "openstack_rc": "/root/admin-openrc",
+    "ssh_key": "/root/.ssh/id_rsa",
+    "openstack_rc": "/root/admin-openstack.sh",
     "auto_confirm_resize": false,
     "resize_confirm_poll_interval_seconds": 15,
     "resize_confirm_wait_seconds": 240,
@@ -21,7 +21,7 @@
     "control_host": "192.168.1.20",
     "ssh_user": "root",
     "ssh_port": 22,
-    "ssh_key": "C:/path/to/id_rsa",
+    "ssh_key": "/root/.ssh/id_rsa",
     "kubeconfig": "/root/.kube/config",
     "command_timeout_seconds": 300
   }

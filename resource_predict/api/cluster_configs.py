@@ -64,6 +64,7 @@ def register_cluster_config_routes(app: Flask) -> None:
         body: Any = request.get_json(silent=True) or {}
         clusters = body.get("clusters") if isinstance(body, dict) else None
         cluster_names = clusters if isinstance(clusters, list) else None
+        full_refresh = bool(body.get("full_refresh")) if isinstance(body, dict) else False
         current_status = get_update_status()
         if current_status.get("running"):
             return (
@@ -74,6 +75,7 @@ def register_cluster_config_routes(app: Flask) -> None:
             run_k8s_prometheus_upsert,
             clusters=cluster_names,
             fail_if_busy=True,
+            full_refresh=full_refresh,
             busy_error_cls=UpdateBusyError,
             logger=logger,
             thread_name="api-k8s-prometheus-fetch",
@@ -84,6 +86,7 @@ def register_cluster_config_routes(app: Flask) -> None:
                     "accepted": True,
                     "message": "K8S Prometheus fetch accepted; merge and prediction task started",
                     "clusters": cluster_names or [],
+                    "full_refresh": full_refresh,
                     "status_url": "/api/update-status",
                     "status": get_update_status(),
                 }

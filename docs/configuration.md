@@ -29,8 +29,8 @@ cp deploy/clusters.example.json deploy/clusters.json
     "control_host": "192.168.1.10",
     "ssh_user": "root",
     "ssh_port": 22,
-    "ssh_key": "/path/to/id_rsa",
-    "openstack_rc": "/root/admin-openrc",
+    "ssh_key": "/root/.ssh/id_rsa",
+    "openstack_rc": "/root/admin-openstack.sh",
     "auto_confirm_resize": false,
     "resize_confirm_poll_interval_seconds": 15,
     "resize_confirm_wait_seconds": 240,
@@ -47,8 +47,8 @@ cp deploy/clusters.example.json deploy/clusters.json
 | --- | --- |
 | `cloud_type` | 必须为 `openstack` |
 | `control_host` | 可执行 `openstack` CLI 的控制节点地址 |
-| `ssh_user` / `ssh_port` / `ssh_key` | SSH 登录信息 |
-| `openstack_rc` | 控制节点上的 OpenStack RC 文件路径 |
+| `ssh_user` / `ssh_port` / `ssh_key` | SSH 登录信息，`ssh_key` 默认 `/root/.ssh/id_rsa` |
+| `openstack_rc` | 控制节点上的 OpenStack RC 文件路径，默认 `/root/admin-openstack.sh` |
 | `auto_confirm_resize` | 是否自动执行 `resize --confirm` |
 | `allowed_flavors` | 可选，限制自动选择的 flavor 名称列表 |
 
@@ -61,7 +61,7 @@ cp deploy/clusters.example.json deploy/clusters.json
     "control_host": "192.168.1.20",
     "ssh_user": "root",
     "ssh_port": 22,
-    "ssh_key": "/path/to/id_rsa",
+    "ssh_key": "/root/.ssh/id_rsa",
     "kubeconfig": "/root/.kube/config",
     "command_timeout_seconds": 300
   }
@@ -100,9 +100,20 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 ```json
 {
   "enabled_methods": ["seasonal_naive", "prophet"],
-  "enable_ensemble": false
+  "enable_ensemble": false,
+  "reuse_backtest_model_for_future": true,
+  "prophet_routing_enabled": true,
+  "prophet_routing_mode": "auto"
 }
 ```
+
+速度优化开关：
+
+| 字段 | 作用 |
+| --- | --- |
+| `reuse_backtest_model_for_future` | `true` 表示每个模型只在训练窗口拟合一次，并预测 `test_size + future_steps`；前半段用于 holdout 评分，后半段用于未来预测。`false` 保持旧逻辑：用 `y_full` 重新训练未来预测。 |
+| `prophet_routing_enabled` | `true` 表示仅在轻量统计特征显示存在明显趋势或季节性时运行 Prophet。若 Prophet 是唯一启用模型，则仍会运行。 |
+| `prophet_routing_mode` | `auto` 使用自动路由规则，`always` 表示启用 Prophet 时总是运行，`never` 表示存在其他兜底模型时跳过 Prophet。 |
 
 可在 Web 页面的"预测模型"中启用或关闭模型，保存后写入此文件。
 
@@ -114,12 +125,14 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | --- | --- | --- |
 | `AppConfig` | `host` / `port` / `out_dir` / `log_file` / `debug` | `0.0.0.0` / `5000` / `outputs` / `resource_predict.log` / `False` |
 | `GenerationConfig` | `default_test_size` / `default_future_steps` / `freq` | `72` / `24` / `h` |
-| `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `3` / `3.5` |
+| `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `True` / `True` / `auto` / `3.5` |
 | `DecisionConfig` | `scale_out_threshold` / `scale_in_threshold` / `scale_in_max_reduction_ratio` / `scale_out_confirmations` / `scale_in_confirmations` | `0.8` / `0.2` / `0.5` / `2` / `3` |
 | `UpdateConfig` | `enabled` / `interval_minutes` / `sliding_window` / `display_window_points` | `False` / `60` / `False` / `0` |
-| `K8SPrometheusConfig` | `history_days` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` | `7` / `300` / `5m` / `False` / `360` |
+| `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` | `7` / `60` / `300` / `5m` / `False` / `360` |
 
 `rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值。
+
+K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_refresh=true` 时，会按 `history_days` 拉取全量历史窗口（默认最近 7 天）。已有本地基线后的定时/普通拉取会使用增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认 `360 + 60 = 420` 分钟，即最近 7 小时。
 
 ### 预测窗口配置说明
 

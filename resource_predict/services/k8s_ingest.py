@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from resource_predict.data.updater import (
@@ -24,8 +26,18 @@ _k8s_stop_event = threading.Event()
 _k8s_scheduler_thread: Optional[threading.Thread] = None
 
 
-def fetch_k8s_prometheus_items(clusters: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
-    items = k8s_workload_prometheus_provider(resources=0, n=0, freq="5min", clusters=clusters)
+def fetch_k8s_prometheus_items(
+    clusters: Optional[Iterable[str]] = None,
+    *,
+    history_hours: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    items = k8s_workload_prometheus_provider(
+        resources=0,
+        n=0,
+        freq="5min",
+        clusters=clusters,
+        history_hours=history_hours,
+    )
     if not isinstance(items, list) or not items:
         raise RuntimeError("Prometheus provider returned no K8S workload resources")
     return items
@@ -35,12 +47,18 @@ def run_k8s_prometheus_upsert(
     *,
     clusters: Optional[Iterable[str]] = None,
     fail_if_busy: bool = False,
+    full_refresh: bool = False,
 ) -> Dict[str, Any]:
     """Fetch K8S Workload metrics from Prometheus and merge them into outputs."""
     mark_external_update_started("fetching_k8s_prometheus", "正在从 K8S Prometheus 拉取 Workload 指标")
     try:
-        items = fetch_k8s_prometheus_items(clusters)
         out_dir = scoped_out_dir("k8s", settings.app.out_dir)
+        history_hours = _history_hours_for_fetch(
+            out_dir=out_dir,
+            clusters=clusters,
+            full_refresh=full_refresh,
+        )
+        items = fetch_k8s_prometheus_items(clusters, history_hours=history_hours)
 
         result = run_upsert_with_data(items, fail_if_busy=fail_if_busy, out_dir=out_dir)
         if not result.get("success"):
@@ -51,6 +69,44 @@ def run_k8s_prometheus_upsert(
     except Exception as exc:
         mark_external_update_failed(str(exc))
         raise
+
+
+def _history_hours_for_fetch(
+    *,
+    out_dir: Path,
+    clusters: Optional[Iterable[str]],
+    full_refresh: bool,
+) -> Optional[float]:
+    if full_refresh or not _has_existing_k8s_raw_data(out_dir, clusters):
+        return None
+    cfg = settings.k8s_prometheus
+    minutes = int(getattr(cfg, "scheduled_update_interval_minutes", 360)) + int(
+        getattr(cfg, "incremental_overlap_minutes", 60)
+    )
+    return max(1.0, minutes / 60.0)
+
+
+def _has_existing_k8s_raw_data(out_dir: Path, clusters: Optional[Iterable[str]]) -> bool:
+    raw_path = out_dir / "raw_data.json"
+    if not raw_path.exists():
+        return False
+    try:
+        payload = json.loads(raw_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    resources = payload.get("resources", []) if isinstance(payload, dict) else []
+    if not isinstance(resources, list) or not resources:
+        return False
+    wanted = {str(x).strip() for x in clusters or [] if str(x).strip()}
+    if not wanted:
+        return True
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        spec = item.get("spec", {}) if isinstance(item.get("spec"), dict) else {}
+        if str(spec.get("cluster") or "").strip() in wanted:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

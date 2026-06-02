@@ -52,7 +52,7 @@ class GenerationConfig:
     base_seed: int = 1000
     # 时间序列频率，传给 pandas/预测流程；"h" 表示小时级数据。
     freq: str = "h"
-    # 预测并行 worker 数；None 表示由程序按机器资源自动决定。
+    # 预测并行工作线程数；None 表示由程序按机器资源自动决定。
     max_workers: Optional[int] = None
     # details/ 详情分片大小；资源很多时避免单个详情 JSON 过大。
     detail_chunk_size: int = 200
@@ -88,11 +88,17 @@ class ForecastConfig:
     prophet_changepoint_prior_scale: float = 0.05
     # Prophet 季节性强度先验；越大季节性曲线越灵活。
     prophet_seasonality_prior_scale: float = 10.0
-    # Rolling backtest folds used for model selection stability. 1 keeps the old single holdout behavior.
-    rolling_backtest_folds: int = 3
-    # Whether to add an inverse-error weighted ensemble candidate to model selection.
+    # 滚动回测折数，用于提升模型选择稳定性；1 表示只保留单次留出窗口回测行为。
+    rolling_backtest_folds: int = 1
+    # 是否加入按误差倒数加权的集成候选模型。
     enable_ensemble: bool = False
-    # Recent robust z-score threshold that routes anomalous series to robust candidates.
+    # 是否复用回测模型，一次性预测留出窗口和未来窗口。
+    reuse_backtest_model_for_future: bool = True
+    # 是否仅在值得承担训练成本的序列上运行 Prophet。
+    prophet_routing_enabled: bool = True
+    # Prophet 路由模式；auto 在速度和质量之间自动取舍。
+    prophet_routing_mode: str = "auto"
+    # 近期鲁棒 z-score 阈值；超过后将异常序列路由到鲁棒候选模型。
     anomaly_route_zscore_threshold: float = 3.5
 
 
@@ -134,31 +140,31 @@ class DecisionConfig:
     scale_in_min_cpu_cores: int = 2
     scale_in_min_memory_gb: int = 4
     scale_in_min_disk_gb: int = 50
-    # Policy tier controls how early and how confidently recommendations fire.
+    # 策略层级控制建议触发的提前程度和置信要求。
     default_policy_tier: str = "balanced"
     conservative_namespaces: Tuple[str, ...] = ("prod", "production", "payments", "core", "platform")
     aggressive_namespaces: Tuple[str, ...] = ("dev", "test", "staging", "batch")
-    # How many consistent rounds should be observed before executing a non-hold action.
+    # 执行非保持动作前需要连续观察到多少轮一致建议。
     scale_out_confirmations: int = 2
     scale_in_confirmations: int = 3
-    # Minimum cooldown guidance for operators or future executors.
+    # 给运维人员或未来执行器使用的最小冷却时间建议。
     scale_out_cooldown_minutes: int = 60
     scale_in_cooldown_minutes: int = 360
 
 
 @dataclass(frozen=True)
 class UpdateConfig:
-    # 是否启用后台定时 Pull 增量更新；关闭时仍可手动调用更新 API。
+    # 是否启用后台定时拉取增量更新；关闭时仍可手动调用更新 API。
     enabled: bool = False
-    # 定时 Pull 更新间隔，单位分钟。
+    # 定时拉取更新间隔，单位分钟。
     interval_minutes: int = 60
-    # 每次调用增量 provider 期望追加的时间点数量。
+    # 每次调用增量数据提供器期望追加的时间点数量。
     points_per_update: int = 1
     # 是否在增量更新后保持滑动窗口长度，避免历史序列无限增长。
     sliding_window: bool = False
     # 前端详情展示窗口点数；0 表示展示全部，不裁剪训练数据。
     display_window_points: int = 0
-    # 自定义增量 provider 路径，格式为 "module:function"；为空时使用默认 mock provider。
+    # 自定义增量数据提供器路径，格式为 "module:function"；为空时使用默认模拟数据提供器。
     incremental_provider_path: str = ""
 
 
@@ -182,6 +188,8 @@ class K8SPrometheusConfig:
     clusters: Tuple[K8SPrometheusTarget, ...] = ()
     # 从 Prometheus 拉取最近多少天的历史数据。
     history_days: int = 7
+    # 增量拉取时在调度周期外额外回看多久，单位分钟；默认 60 表示多拉 1 小时以覆盖延迟/边界。
+    incremental_overlap_minutes: int = 60
     # Prometheus range query 步长，单位秒；300 表示 5 分钟一个点。
     step_seconds: int = 300
     # rate() 计算窗口，例如 "5m"、"10m"；建议为 step_seconds 的 2~4 倍。

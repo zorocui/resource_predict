@@ -105,7 +105,9 @@ def _execution_gate_failures(
     if not isinstance(advice, dict):
         return ["missing scaling_advice"]
     source = str(target_source or "suggested").strip().lower()
-    manual_target = source == "manual" or str(advice.get("target_source") or "").lower() == "manual"
+    advice_target_source = str(advice.get("target_source") or "").lower()
+    manual_target = source == "manual" or advice_target_source == "manual"
+    operator_confirmed = source == "confirmed" or advice_target_source == "confirmed"
     action = str(advice.get("action") or "").strip().lower()
     policy_tier = str(
         advice.get("policy_tier")
@@ -118,7 +120,7 @@ def _execution_gate_failures(
     if not manual_target:
         gate = advice.get("action_gate", {})
         gate_state = str(gate.get("state") if isinstance(gate, dict) else "").strip().lower()
-        if gate_state != "ready":
+        if not operator_confirmed and gate_state != "ready":
             failures.append(f"action_gate is not ready (state={gate_state or 'missing'})")
         confidence_score = _as_float(advice.get("confidence_score"))
         confidence = str(advice.get("confidence") or "").strip().lower()
@@ -268,7 +270,7 @@ def _as_float(value: Any) -> Optional[float]:
 
 def _target_source(target_spec_override: Any, target_source: str) -> str:
     explicit = str(target_source or "").strip().lower()
-    if explicit in {"manual", "suggested"}:
+    if explicit in {"manual", "suggested", "confirmed"}:
         return explicit
     return "manual" if isinstance(target_spec_override, dict) else "suggested"
 

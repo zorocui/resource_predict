@@ -10,6 +10,7 @@ from resource_predict.pipeline.anomaly import anomaly_profile
 from resource_predict.pipeline.forecasting import ensemble_series, forecast_by_method
 from resource_predict.pipeline.metrics import mean_metric, rolling_backtest_metrics
 from resource_predict.pipeline.model_selection import choose_best_method
+from resource_predict.pipeline.prophet_routing import prophet_routing_decision
 from resource_predict.pipeline.series_utils import compute_metrics
 from resource_predict.settings import settings
 
@@ -35,10 +36,31 @@ def fit_one_metric(
 
     backtest_folds = max(1, int(getattr(settings.forecast, "rolling_backtest_folds", 1)))
     enable_ensemble = bool(ctx.forecast_config.get("enable_ensemble", False))
+    reuse_backtest_model = bool(ctx.forecast_config.get("reuse_backtest_model_for_future", False))
+    prophet_routing = prophet_routing_decision(
+        y_full,
+        active_methods=active_methods,
+        anomaly=anom,
+        enabled=bool(ctx.forecast_config.get("prophet_routing_enabled", False)),
+        mode=str(ctx.forecast_config.get("prophet_routing_mode", "auto")),
+    )
+    effective_methods = [
+        m for m in active_methods
+        if not (m == "prophet" and prophet_routing.get("decision") == "skipped")
+    ]
+    if not effective_methods:
+        effective_methods = list(active_methods)
 
-    for m in active_methods:
-        res = forecast_by_method(m, y_train, ctx.test_size)
-        pred = res.yhat.copy()
+    preds_future: Dict[str, pd.Series] = {}
+    for m in effective_methods:
+        if reuse_backtest_model:
+            res = forecast_by_method(m, y_train, ctx.test_size + ctx.future_steps)
+            pred = res.yhat.iloc[:ctx.test_size].copy()
+            future_pred = res.yhat.iloc[ctx.test_size:].copy()
+        else:
+            res = forecast_by_method(m, y_train, ctx.test_size)
+            pred = res.yhat.copy()
+            future_pred = pd.Series(dtype=float)
         pred.index = y_test.index
         preds[m] = pred
         metrics[m] = compute_metrics(y_test, pred)
@@ -52,6 +74,8 @@ def fit_one_metric(
         else:
             metrics[m]["selection_rmse"] = float(metrics[m]["rmse"])
         timing[m] += float(res.seconds)
+        if reuse_backtest_model:
+            preds_future[m] = future_pred
 
     ensemble_pred = ensemble_series(preds, metrics, enable_ensemble=enable_ensemble)
     if ensemble_pred is not None:
@@ -77,11 +101,11 @@ def fit_one_metric(
 
     best = choose_best_method(metrics_by_method=metrics, anomaly=anom)
 
-    preds_future: Dict[str, pd.Series] = {}
-    for m in active_methods:
-        res = forecast_by_method(m, y_full, ctx.future_steps)
-        preds_future[m] = res.yhat.copy()
-        timing[m] += float(res.seconds)
+    if not reuse_backtest_model:
+        for m in effective_methods:
+            res = forecast_by_method(m, y_full, ctx.future_steps)
+            preds_future[m] = res.yhat.copy()
+            timing[m] += float(res.seconds)
     ensemble_future = ensemble_series(preds_future, metrics, enable_ensemble=enable_ensemble)
     if ensemble_future is not None:
         preds_future["ensemble"] = ensemble_future
@@ -95,5 +119,7 @@ def fit_one_metric(
             if anom.get("is_anomalous")
             else "normal model selection",
         },
+        "prophet_routing": prophet_routing,
+        "reuse_backtest_model_for_future": reuse_backtest_model,
     }
     return preds, metrics, best, preds_future, timing, diagnostics

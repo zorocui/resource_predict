@@ -95,9 +95,24 @@
 | `operator` | 操作人标识 |
 | `target_spec` | 可选，覆盖预测建议的目标规格 |
 | `confirm_create_flavor` | 可选，允许自动创建 OpenStack flavor |
-| `target_source` | 可选，标记目标规格来源 |
+| `target_source` | 可选，标记目标规格来源：`suggested`（默认建议）、`confirmed`（人工复核后的建议）、`manual`（手动目标规格） |
 
-`execute` 模式会在入队前执行门控校验。建议目标必须满足 `action_gate=ready`、`confidence=high` 且置信度分数达标、相关指标 `data_quality=good`、不在冷却期内、`policy_tier` 有效；否则返回错误并拒绝创建执行任务。
+`execute` 模式会在入队前执行门控校验；`dry_run` 只生成计划，不执行命令，也不要求 `action_gate=ready`。
+
+自动建议执行（`target_source=suggested` 或未传）必须同时满足：
+
+- `action_gate.state=ready`，即建议已达到当前策略层级要求的确认轮次。
+- `confidence=high` 且 `confidence_score >= 72`。
+- `policy_tier` 为 `conservative` / `balanced` / `aggressive` 之一。
+- 相关指标的数据质量满足执行要求：K8S Workload 的相关 request/limit 指标必须为 `data_quality=good`；VM 若记录了非 good 的指标质量，也会阻断。
+- 当前资源不在冷却期内：扩容默认 60 分钟，缩容默认 360 分钟，可由 `risk_profile.cooldown_minutes` 覆盖。
+- K8S Workload 的 `target_k8s_policy.ready_for_execution` 不为 `false`；多容器 Workload 的建议 request/limit 目标必须写入 `target_spec.containers`。
+
+人工复核建议执行（`target_source=confirmed`）用于“混合信号”或 `action_gate=observe` 但操作人已复核目标规格的场景。该模式只跳过 `action_gate.state=ready` 检查，仍然要求高置信度、有效策略层级、数据质量、冷却期和 K8S 目标策略通过。
+
+手动目标规格执行（传入 `target_spec`，或 `target_source=manual`）使用操作人提供的目标规格。该模式不要求建议自身的 `action_gate` 和置信度达标，但仍需通过有效策略层级、数据质量、冷却期和 K8S 目标策略校验。
+
+任一门控失败都会返回 `execution gate blocked scaling: ...` 并拒绝创建执行任务。
 
 ### 任务状态流转
 
@@ -138,7 +153,13 @@ queued -> running -> plan_built -> executing_command -> command_finished
 {"clusters": ["cluster-k8s-a"]}
 ```
 
-该接口为异步（HTTP 202），拉取和预测在后台线程执行。
+可传入 `full_refresh=true` 强制拉取全量历史窗口：
+
+```json
+{"clusters": ["cluster-k8s-a"], "full_refresh": true}
+```
+
+该接口为异步（HTTP 202），拉取和预测在后台线程执行。默认情况下，已有本地 K8S raw 基线时只拉取增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认最近 7 小时；本地 raw 数据缺失或 `full_refresh=true` 时拉取 `history_days`，默认最近 7 天。
 
 ---
 

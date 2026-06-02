@@ -130,6 +130,21 @@
     modalEl.hidden = true;
   }
 
+  function setControlsBusy(container) {
+    container?.querySelectorAll("[data-scaling-mode]").forEach((btn) => {
+      btn.dataset.scalingWasDisabled = btn.disabled ? "true" : "false";
+      btn.disabled = true;
+    });
+  }
+
+  function restoreControls(container) {
+    container?.querySelectorAll("[data-scaling-mode]").forEach((btn) => {
+      if (btn.dataset.scalingWasDisabled === undefined) return;
+      btn.disabled = btn.dataset.scalingWasDisabled === "true";
+      delete btn.dataset.scalingWasDisabled;
+    });
+  }
+
   async function pollTask(taskId, container, deps) {
     const statusEl = container?.querySelector('[data-role="scaling-status"], [data-role="manual-scaling-status"]');
     for (let i = 0; i < 90; i++) {
@@ -144,9 +159,8 @@
           statusEl.classList.toggle("is-failed", status === "failed");
         }
         if (status !== "queued" && status !== "running" && status !== "confirming") {
-          container?.querySelectorAll("[data-scaling-mode]").forEach((btn) => {
-            btn.disabled = status === "waiting_confirm";
-          });
+          if (status === "waiting_confirm") setControlsBusy(container);
+          else restoreControls(container);
           if (status === "success") {
             window.dispatchEvent(new CustomEvent("resource-scaled", { detail: { resourceId: task.resource_id || "", task } }));
           }
@@ -158,10 +172,12 @@
           statusEl.textContent = `查询失败：${String(e.message || e).slice(0, 80)}`;
           statusEl.classList.add("is-failed");
         }
+        restoreControls(container);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
+    restoreControls(container);
   }
 
   async function start(btn, deps) {
@@ -178,14 +194,17 @@
     if (source === "manual" && !targetSpec) return;
     let confirmCreateFlavor = mode === "dry_run";
     if (mode === "execute") {
-      const ok = window.confirm("确认执行调配命令？后端会登录资源所在集群的控制节点并修改资源规格。");
+      const confirmText = source === "confirmed"
+        ? "确认按当前建议执行调配？该建议未达到自动执行门控，提交表示已人工复核混合信号、目标规格和风险。"
+        : "确认执行调配命令？后端会登录资源所在集群的控制节点并修改资源规格。";
+      const ok = window.confirm(confirmText);
       if (!ok) return;
       confirmCreateFlavor = resourceType === "k8s_workload"
         ? false
         : window.confirm("如果 OpenStack 中没有匹配目标规格的 flavor，是否允许后端创建新 flavor 后再调配？");
     }
     const statusEl = container.querySelector('[data-role="scaling-status"], [data-role="manual-scaling-status"]');
-    container.querySelectorAll("[data-scaling-mode]").forEach((x) => { x.disabled = true; });
+    setControlsBusy(container);
     if (statusEl) statusEl.textContent = mode === "dry_run" ? "正在提交预检..." : "正在提交调配...";
     renderModal({ resource_id: resourceId, mode, status: "submitting" }, "submitting");
     try {
@@ -206,7 +225,7 @@
         statusEl.textContent = `失败：${String(e.message || e).slice(0, 80)}`;
         statusEl.classList.add("is-failed");
       }
-      container.querySelectorAll("[data-scaling-mode]").forEach((x) => { x.disabled = false; });
+      restoreControls(container);
     }
   }
 
@@ -336,16 +355,26 @@
 
   function buildControls(resourceId, action, confidence, hasMixed, options = {}) {
     const analysisOnly = Boolean(options.analysisOnly);
+    const resource = options.resource || {};
     const suggestedBlocker = suggestedTargetBlocker(options.resource || {});
-    const disabled = Boolean(suggestedBlocker) || analysisOnly || action === "hold" || action === "insufficient_data" || action === "mixed";
+    const gateState = String(resource?.scaling_advice?.action_gate?.state || "").toLowerCase();
+    const baseDisabled = Boolean(suggestedBlocker) || analysisOnly || action === "hold" || action === "insufficient_data";
+    const suggestedExecuteDisabled = baseDisabled || action === "mixed" || gateState === "observe";
+    const confirmedEnabled = !baseDisabled && (action === "mixed" || gateState === "observe");
     const risky = confidence === "low" || hasMixed;
-    const disabledAttr = disabled ? " disabled" : "";
+    const dryRunDisabledAttr = baseDisabled ? " disabled" : "";
+    const suggestedExecuteDisabledAttr = suggestedExecuteDisabled ? " disabled" : "";
     const disabledText = suggestedBlocker
-      || (analysisOnly ? "当前建议缺少可执行目标，不能按建议调配" : "当前建议无需执行调配");
+      || suggestedDisabledText(action, analysisOnly, gateState);
     const manualControls = options.resourceType === "k8s_workload"
       ? buildManualK8sControls(options.resource || {}, resourceId, options.resourceType)
       : "";
-    const suggestedStatus = disabled ? `<span class="scaling-status" data-role="scaling-status">${disabledText}</span>` : `<span class="scaling-status" data-role="scaling-status"></span>`;
+    const confirmedButton = confirmedEnabled
+      ? `<button type="button" class="scale-btn scale-execute is-risky" data-scaling-mode="execute" data-scaling-source="confirmed">人工确认后调配</button>`
+      : "";
+    const suggestedStatus = (baseDisabled || suggestedExecuteDisabled)
+      ? `<span class="scaling-status" data-role="scaling-status">${disabledText}</span>`
+      : `<span class="scaling-status" data-role="scaling-status"></span>`;
     return `
       <div class="scaling-choice" data-scaling-choice-root>
         <button type="button" class="scale-btn scale-primary" data-scaling-choice-toggle aria-expanded="false">调配</button>
@@ -353,14 +382,23 @@
           <div class="scaling-choice-section">
             <div class="scaling-choice-head"><strong>按建议调配</strong><span>使用当前预测生成的目标规格</span></div>
             <div class="scaling-controls" data-scaling-resource="${escapeHtml(resourceId)}" data-scaling-resource-type="${escapeHtml(options.resourceType || "")}">
-              <button type="button" class="scale-btn" data-scaling-mode="dry_run" data-scaling-source="suggested"${disabledAttr}>建议预检</button>
-              <button type="button" class="scale-btn scale-execute${risky ? " is-risky" : ""}" data-scaling-mode="execute" data-scaling-source="suggested"${disabledAttr}>按建议调配</button>
+              <button type="button" class="scale-btn" data-scaling-mode="dry_run" data-scaling-source="suggested"${dryRunDisabledAttr}>建议预检</button>
+              <button type="button" class="scale-btn scale-execute${risky ? " is-risky" : ""}" data-scaling-mode="execute" data-scaling-source="suggested"${suggestedExecuteDisabledAttr}>按建议调配</button>
+              ${confirmedButton}
               ${suggestedStatus}
             </div>
           </div>
           ${manualControls ? `<div class="scaling-choice-section">${manualControls}</div>` : ""}
         </div>
       </div>`;
+  }
+
+  function suggestedDisabledText(action, analysisOnly, gateState) {
+    if (analysisOnly) return "当前建议缺少可执行目标，不能按建议调配";
+    if (action === "mixed") return "当前建议存在混合信号，需人工确认后再调配";
+    if (gateState === "observe") return "当前建议需要人工确认或后续轮次复核后再调配";
+    if (action === "insufficient_data") return "当前数据不足，不能按建议调配";
+    return "当前建议无需执行调配";
   }
 
   function suggestedTargetBlocker(resource) {
