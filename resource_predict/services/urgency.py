@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List
 
+from resource_predict.resource_types import resource_type_of
 from resource_predict.utils import parse_float_or_none
 
 
@@ -128,7 +129,7 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     if not metric_scores:
         return confidence_bonus
 
-    return round(
+    score = (
         (35.0 if action in {"scale_out", "scale_out_candidate"} else 18.0)
         + confidence_bonus
         + min(20.0, 0.2 * (parse_float_or_none(risk_profile.get("risk_score")) or 0.0))
@@ -136,6 +137,20 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         + 0.25 * sum(sorted(metric_scores, reverse=True)[1:])
         + 4.0 * max(0, len(metric_scores) - 1)
         + (4.0 if bool(advice.get("has_mixed_signals")) else 0.0)
-        + _target_change_score(),
-        3,
+        + _target_change_score()
     )
+    if _is_k8s_analysis_only(advice, item):
+        cap = 35.0 if action in {"scale_out", "scale_out_candidate"} else 25.0
+        score = min(cap, score * 0.35)
+    return round(score, 3)
+
+
+def _is_k8s_analysis_only(advice: Dict[str, Any], item: Dict[str, Any]) -> bool:
+    if resource_type_of(item) != "k8s_workload":
+        return False
+    if not bool(advice.get("analysis_only")):
+        return False
+    policy = advice.get("target_k8s_policy", {})
+    if not isinstance(policy, dict):
+        return True
+    return not bool(policy.get("ready_for_execution"))

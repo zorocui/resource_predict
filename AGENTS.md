@@ -5,6 +5,7 @@ These notes capture project-specific mistakes already encountered in this repo. 
 - Treat `README.md` as a CentOS/Linux-facing document. Use `bash` command blocks, `source .venv/bin/activate`, `export ...`, and `python ...`; do not introduce PowerShell commands.
 - Edit text files as UTF-8. Do not use PowerShell `Set-Content` for Chinese Markdown or source text unless encoding is explicitly verified. Prefer `apply_patch` for manual edits.
 - README.md is a quick-start guide (~270 lines). Detailed docs live in `docs/`. Keep README concise with architecture diagrams, commands, API summary, and links to docs/.
+- To reduce token and output waste, exclude generated/vendor-heavy paths from normal searches unless explicitly needed: `outputs/`, `static/vendor/`, `.venv/`, `.pytest_cache/`, `.playwright-cli/`.
 - Do not leave compatibility shim files when the user asks to remove old names. Remove old files and update references instead.
 - Current naming: `generate_forecasts.py`, `ingest_k8s_workloads.py`, `resource_predict/core/k8s_workload_decision.py`, `generate_forecasts`, and `build_k8s_workload_advice`.
 - Avoid reintroducing old names: `generate_images.py`, `generate_k8s_pods.py`, `k8s_pod_decision.py`, `generate_all_images`, and `build_k8s_pod_advice`.
@@ -15,7 +16,7 @@ These notes capture project-specific mistakes already encountered in this repo. 
 - Keep K8S Prometheus CPU usage queries aligned with the configured `rate_window`; do not reintroduce hardcoded CPU `rate(...[10m])` windows in fetch or diagnose paths.
 - When prediction output schema changes, update both artifacts and docs. `forecast_error_report.json` is a first-class output and should report errors by resource, metric, model, and window with RMSE/MAE/MAPE/P95 error fields.
 - This repo often has a dirty worktree. Preserve unrelated user changes and do not revert files unless explicitly asked.
-- After Python edits, run the regression suite: compileall + pyflakes + vulture --min-confidence 80 + pytest -q (see README §6 or docs/development.md for exact commands).
+- After Python logic edits, run relevant checks; for broad/core changes run the full regression suite: compileall + pyflakes + vulture --min-confidence 80 + pytest -q (see README §6 or docs/development.md for exact commands).
 - After commands that create caches, remove project `__pycache__` directories outside `.venv`.
 - When `docs/` files are renamed, moved, or deleted, update the documentation index table in README.md's "详细文档" section to keep links valid.
 - Detailed reference documents are in `docs/`: [architecture.md](docs/architecture.md), [configuration.md](docs/configuration.md), [api-reference.md](docs/api-reference.md), [development.md](docs/development.md).

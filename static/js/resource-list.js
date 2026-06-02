@@ -121,20 +121,89 @@
     return n.toFixed(digits).replace(/\.0+$/, "");
   }
 
-  function triggerMetric(item) {
+  function baseMetricKey(metricKey) {
+    if (String(metricKey).startsWith("cpu_")) return "cpu";
+    if (String(metricKey).startsWith("memory_")) return "memory";
+    return metricKey;
+  }
+
+  function metricStatsFor(item, metricKey) {
+    const advice = item?.scaling_advice || {};
+    const stats = advice.stats || {};
+    const signalStats = advice.signal_stats || {};
+    const baseKey = baseMetricKey(metricKey);
+    return signalStats[metricKey] || stats[metricKey] || stats[baseKey] || {};
+  }
+
+  function metricActionFor(item, metricKey) {
     const metricActions = item?.scaling_advice?.metric_actions || {};
-    return metricKeysFor(item).find((key) => String(metricActions[key] || "hold") !== "hold") || metricKeysFor(item)[0];
+    const baseKey = baseMetricKey(metricKey);
+    return String(metricActions[metricKey] || metricActions[baseKey] || "hold");
+  }
+
+  function metricActionLabel(item, metricKey, action) {
+    return actionLabel(action);
+  }
+
+  function replicaTargetSummary(item) {
+    const target = item?.scaling_advice?.target_spec || {};
+    const targetReplicas = Number(target.replicas);
+    if (!Number.isFinite(targetReplicas) || targetReplicas <= 0) return "";
+    const current = Number(currentReplicas(item?.spec || {}));
+    if (!Number.isFinite(current) || current <= 0 || current === targetReplicas) {
+      return `目标副本 ${formatNumber(targetReplicas, 0)}`;
+    }
+    const label = targetReplicas > current ? "扩副本" : "缩副本";
+    return `${label} ${formatNumber(current, 0)} → ${formatNumber(targetReplicas, 0)}`;
+  }
+
+  function representativeK8sMetricStats(item, baseKey, action) {
+    const direct = metricStatsFor(item, baseKey);
+    if (direct.p95 !== undefined) return direct;
+    const preferredKey = action === "scale_out_candidate"
+      ? `${baseKey}_limit`
+      : action === "scale_in_candidate"
+        ? `${baseKey}_request`
+        : `${baseKey}_limit`;
+    const preferred = metricStatsFor(item, preferredKey);
+    if (preferred.p95 !== undefined) return preferred;
+    return metricKeysFor(item)
+      .filter((key) => baseMetricKey(key) === baseKey)
+      .map((key) => metricStatsFor(item, key))
+      .find((stat) => stat.p95 !== undefined) || {};
+  }
+
+  function k8sMetricSummary(item) {
+    const chips = [];
+    const overallAction = actionOf(item);
+    const replicaText = replicaTargetSummary(item);
+    if (replicaText) {
+      chips.push(`<span class="metric-pill is-${escapeHtml(overallAction)}">${escapeHtml(replicaText)}</span>`);
+    }
+    ["cpu", "memory"].forEach((baseKey) => {
+      const action = metricActionFor(item, baseKey);
+      const stat = representativeK8sMetricStats(item, baseKey, action);
+      const unit = resolveDisplayUnit(item, baseKey);
+      const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)}` : actionLabel(action);
+      const label = baseKey === "cpu" ? "CPU" : "内存";
+      chips.push(`<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(label)} ${escapeHtml(p95)}</span>`);
+    });
+    return chips.join("");
+  }
+
+  function triggerMetric(item) {
+    return metricKeysFor(item).find((key) => metricActionFor(item, key) !== "hold") || metricKeysFor(item)[0];
   }
 
   function metricSummary(item) {
-    const stats = item?.scaling_advice?.stats || {};
-    const metricActions = item?.scaling_advice?.metric_actions || {};
+    if (isK8s(item)) return k8sMetricSummary(item);
     return metricKeysFor(item).map((key) => {
-      const stat = stats[key] || {};
-      const action = String(metricActions[key] || "hold");
+      const stat = metricStatsFor(item, key);
+      const action = metricActionFor(item, key);
+      const label = metricActionLabel(item, key, action);
       const unit = resolveDisplayUnit(item, key);
       const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)}` : "";
-      return `<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(app.metricTitleMap[key])} ${escapeHtml(actionLabel(action))}${p95 ? ` · ${escapeHtml(p95)}` : ""}</span>`;
+      return `<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(app.metricTitleMap[key])} ${escapeHtml(label)}${p95 ? ` · ${escapeHtml(p95)}` : ""}</span>`;
     }).join("");
   }
 
@@ -455,18 +524,10 @@
     if (app.state.page < 1) app.state.page = 1;
     renderRows();
     if (!app.state.selectedResourceId && app.state.visibleItems.length) {
-      if (window.matchMedia("(max-width: 1180px)").matches) {
-        hideDetail();
-      } else {
-        selectResource(app.state.visibleItems[0].resource_id);
-      }
+      hideDetail();
     } else if (app.state.selectedResourceId && !app.state.visibleItems.some((x) => x.resource_id === app.state.selectedResourceId)) {
-      if (window.matchMedia("(max-width: 1180px)").matches) {
-        app.state.selectedResourceId = "";
-        hideDetail();
-      } else {
-        selectResource(app.state.visibleItems[0]?.resource_id || "");
-      }
+      app.state.selectedResourceId = "";
+      hideDetail();
     }
   }
 
@@ -518,7 +579,9 @@
     infoTooltip,
     isK8s,
     analysisOnlyReasons,
+    metricActionFor,
     metricKeysFor,
+    metricStatsFor,
     renderRows,
     resolveDisplayUnit,
     resourceTypeOf,

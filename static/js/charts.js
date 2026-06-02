@@ -547,7 +547,6 @@
     const advice = resource?.scaling_advice || {};
     const action = list.actionOf(resource);
     const confidence = list.confidenceOf(resource);
-    const stats = advice.stats || {};
     const actionText = list.actionLabel(action);
     const analysisReasons = list.analysisOnlyReasons(resource);
     const analysisReasonMarkup = analysisReasons.length ? `
@@ -573,13 +572,17 @@
       </div>
       <div class="reason-grid">
         ${list.metricKeysFor(resource).map((key) => {
-          const st = stats[key] || {};
-          const mAction = String(advice.metric_actions?.[key] || "hold");
+          const st = list.metricStatsFor(resource, key);
+          const mAction = list.metricActionFor(resource, key);
           const unit = list.resolveDisplayUnit(resource, key);
           return `<div class="reason-item">
             <span class="reason-metric">${list.escapeHtml(app.metricTitleMap[key])}</span>
             <strong class="reason-action">${list.escapeHtml(list.actionLabel(mAction))}</strong>
-            <small class="reason-stats">平均 ${list.formatStatValue(st.avg, unit)} · P95 ${list.formatStatValue(st.p95, unit)} · 峰值 ${list.formatStatValue(st.peak, unit)}</small>
+            <small class="reason-stats">
+              <span><b>平均</b><em>${list.formatStatValue(st.avg, unit)}</em></span>
+              <span><b>P95</b><em>${list.formatStatValue(st.p95, unit)}</em></span>
+              <span><b>峰值</b><em>${list.formatStatValue(st.peak, unit)}</em></span>
+            </small>
           </div>`;
         }).join("")}
       </div>`;
