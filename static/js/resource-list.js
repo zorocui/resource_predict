@@ -393,12 +393,11 @@
   }
 
   function currentPageItems() {
-    const start = (app.state.page - 1) * app.state.pageSize;
-    return app.state.visibleItems.slice(start, start + app.state.pageSize);
+    return app.state.visibleItems;
   }
 
   function updatePager() {
-    const totalPages = Math.max(1, Math.ceil(app.state.visibleItems.length / app.state.pageSize));
+    const totalPages = Math.max(1, Math.ceil(app.state.total / app.state.pageSize));
     app.state.page = Math.min(app.state.page, totalPages);
     app.els.prevPageBtn.disabled = app.state.page <= 1;
     app.els.nextPageBtn.disabled = app.state.page >= totalPages;
@@ -408,19 +407,28 @@
   function updateSummary() {
     const summaryItems = applyClientFilters(app.state.loadedItems, { ignoreAction: true });
     const counts = { scale_out: 0, scale_in: 0, mixed: 0, hold: 0 };
-    for (const item of summaryItems) {
-      const action = actionOf(item);
-      if (action === "scale_out" || action === "scale_out_candidate") counts.scale_out += 1;
-      else if (action === "scale_in" || action === "scale_in_candidate") counts.scale_in += 1;
-      else if (action === "mixed") counts.mixed += 1;
-      else counts.hold += 1;
+    const summaryCounts = app.state.adviceSummary?.action_counts;
+    const summaryTotal = Number(app.state.adviceSummary?.total ?? 0) || 0;
+    if (summaryCounts) {
+      counts.scale_out = Number(summaryCounts.scale_out || 0) + Number(summaryCounts.scale_out_candidate || 0);
+      counts.scale_in = Number(summaryCounts.scale_in || 0) + Number(summaryCounts.scale_in_candidate || 0);
+      counts.mixed = Number(summaryCounts.mixed || 0);
+      counts.hold = Number(summaryCounts.hold || 0);
+    } else {
+      for (const item of summaryItems) {
+        const action = actionOf(item);
+        if (action === "scale_out" || action === "scale_out_candidate") counts.scale_out += 1;
+        else if (action === "scale_in" || action === "scale_in_candidate") counts.scale_in += 1;
+        else if (action === "mixed") counts.mixed += 1;
+        else counts.hold += 1;
+      }
     }
     app.els.sumOut.textContent = String(counts.scale_out);
     app.els.sumIn.textContent = String(counts.scale_in);
     app.els.sumMixed.textContent = String(counts.mixed);
     app.els.sumHold.textContent = String(counts.hold);
-    app.els.sumTotal.textContent = String(summaryItems.length);
-    app.els.summaryText.textContent = `匹配 ${app.state.visibleItems.length} 个资源，当前显示 ${currentPageItems().length} 个`;
+    app.els.sumTotal.textContent = String(summaryTotal || app.state.total || summaryItems.length);
+    app.els.summaryText.textContent = `匹配 ${app.state.total || 0} 个资源，当前页显示 ${currentPageItems().length} 个`;
     app.els.summaryItems.forEach((el) => {
       el.classList.toggle("active", (el.dataset.summaryAction || "") === app.state.actionFilter);
     });
@@ -462,7 +470,8 @@
       return acc;
     }, {});
     const overviewCards = [
-      ["当前范围", summaryItems.length],
+      ["匹配总数", app.state.total || summaryItems.length],
+      ["当前页", summaryItems.length],
       ["VM", byType.VM || 0],
       ["Workload", byType.Workload || 0],
       ["需扩容", counts.scale_out],
@@ -518,8 +527,11 @@
     updateSummary();
   }
 
-  function setItems(items) {
+  function setItems(items, meta = {}) {
     app.state.loadedItems = items || [];
+    app.state.total = Number(meta.total ?? app.state.loadedItems.length) || 0;
+    app.state.page = Number(meta.page ?? app.state.page) || 1;
+    app.state.pageSize = Number(meta.page_size ?? app.state.pageSize) || app.state.pageSize;
     app.state.visibleItems = applyClientFilters(app.state.loadedItems);
     if (app.state.page < 1) app.state.page = 1;
     renderRows();

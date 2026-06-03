@@ -44,7 +44,10 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             else:
                 rows = [
                     x for x in rows
-                    if str((x.get("scaling_advice", {}) or {}).get("action", "hold")).lower() == action_filter
+                    if _matches_action_filter(
+                        str((x.get("scaling_advice", {}) or {}).get("action", "hold")).lower(),
+                        action_filter,
+                    )
                     and not bool((x.get("scaling_advice", {}) or {}).get("has_mixed_signals"))
                 ]
         rows = [
@@ -92,7 +95,10 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             rows = [
                 x
                 for x in rows
-                if str((x.get("scaling_advice", {}) or {}).get("action", "hold")).lower() == action_filter
+                if _matches_action_filter(
+                    str((x.get("scaling_advice", {}) or {}).get("action", "hold")).lower(),
+                    action_filter,
+                )
             ]
 
         counts = {
@@ -173,3 +179,11 @@ def _normalize_resource_type_filter(value: Any) -> str:
     if not raw:
         return ""
     return resource_type_of({"resource_type": raw})
+
+
+def _matches_action_filter(action: str, action_filter: str) -> bool:
+    if action_filter == "scale_out":
+        return action in {"scale_out", "scale_out_candidate"}
+    if action_filter == "scale_in":
+        return action in {"scale_in", "scale_in_candidate"}
+    return action == action_filter

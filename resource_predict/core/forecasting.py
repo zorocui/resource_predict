@@ -84,7 +84,7 @@ def ensure_regular_freq(y: pd.Series) -> pd.Series:
     if not isinstance(y.index, pd.DatetimeIndex):
         raise TypeError("y.index 必须是 DatetimeIndex")
     y = y.sort_index()
-    freq = pd.infer_freq(y.index)
+    freq = _safe_infer_freq(y.index)
     if freq is None:
         diffs = np.diff(y.index.values).astype("timedelta64[s]").astype(np.int64)
         diffs = diffs[diffs > 0]
@@ -104,7 +104,7 @@ def infer_steps_per_day(dt_index: pd.DatetimeIndex) -> int:
     """根据时间间隔推断一天有多少个采样点，用于 SARIMA 的季节周期 s。"""
     if len(dt_index) < 3:
         return 24
-    freq = pd.infer_freq(dt_index)
+    freq = _safe_infer_freq(dt_index)
     if freq is not None:
         try:
             # 兼容 pandas 新版本：不再使用已弃用的 offset.delta
@@ -125,7 +125,7 @@ def infer_steps_per_day(dt_index: pd.DatetimeIndex) -> int:
 
 def infer_pandas_freq(dt_index: pd.DatetimeIndex) -> str:
     """推断 pandas 频率字符串，供 Prophet 生成未来时间索引。"""
-    freq = pd.infer_freq(dt_index)
+    freq = _safe_infer_freq(dt_index)
     if freq is not None:
         return freq
     if len(dt_index) < 2:
@@ -135,7 +135,30 @@ def infer_pandas_freq(dt_index: pd.DatetimeIndex) -> str:
     if diffs.size == 0:
         return "D"
     step_s = int(np.median(diffs))
-    return pd.Timedelta(seconds=step_s).resolution_string
+    return _seconds_to_freq(step_s)
+
+
+def _safe_infer_freq(dt_index: pd.DatetimeIndex) -> Optional[str]:
+    if len(dt_index) < 3:
+        return None
+    try:
+        return pd.infer_freq(dt_index)
+    except ValueError:
+        return None
+
+
+def _seconds_to_freq(seconds: int) -> str:
+    seconds = max(1, int(seconds))
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return "D" if days == 1 else f"{days}D"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return "h" if hours == 1 else f"{hours}h"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return "min" if minutes == 1 else f"{minutes}min"
+    return f"{seconds}s"
 
 
 def forecast_arima(

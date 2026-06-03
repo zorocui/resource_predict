@@ -185,6 +185,10 @@ class InferPandasFreqTest(unittest.TestCase):
         idx = pd.date_range("2024-01-01", periods=100, freq="5min")
         self.assertIn("5", infer_pandas_freq(idx))
 
+    def test_two_point_five_minute_index_preserves_interval(self):
+        idx = pd.date_range("2024-01-01", periods=2, freq="5min")
+        self.assertEqual(infer_pandas_freq(idx), "5min")
+
 
 class EnsureRegularFreqTest(unittest.TestCase):
     def test_regular_series_unchanged(self):
@@ -199,6 +203,13 @@ class EnsureRegularFreqTest(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             ensure_regular_freq(y)
+
+    def test_two_point_datetime_series_does_not_require_inferred_frequency(self):
+        y = _make_series(n=2, freq="5min")
+        result = ensure_regular_freq(y)
+
+        self.assertEqual(len(result), 2)
+        self.assertFalse(result.isna().any())
 
 
 class ForecastArimaTest(unittest.TestCase):

@@ -291,6 +291,67 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         self.assertLess(advice["target_spec"]["cpu_request_cores"], 4.0)
         self.assertLess(advice["target_spec"]["memory_request_gb"], 4.0)
 
+    def test_cpu_idle_but_memory_busy_reduces_cpu_without_scaling_replicas(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 6,
+                **_containers(cpu_request=4.0, cpu_limit=4.0, memory_request=4.0, memory_limit=4.0),
+            },
+            "data_quality": _quality("good"),
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu_request": np.array([0.01, 0.01, 0.01]),
+                "cpu_limit": np.array([0.01, 0.01, 0.01]),
+                "memory_request": np.array([0.75, 0.75, 0.75]),
+                "memory_limit": np.array([0.75, 0.75, 0.75]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_in_candidate")
+        self.assertEqual(advice["metric_actions"]["cpu"], "scale_in_candidate")
+        self.assertEqual(advice["metric_actions"]["memory"], "hold")
+        self.assertLess(advice["target_spec"]["cpu_request_cores"], 4.0)
+        self.assertIn("cpu_limit_cores", advice["target_spec"])
+        self.assertNotIn("replicas", advice["target_spec"])
+        self.assertTrue(
+            any("replica scale-in requires both CPU and memory to be low" in note for note in advice["target_k8s_policy"]["notes"])
+        )
+
+    def test_replica_scale_in_is_capped_to_one_step_reduction(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 6,
+                **_containers(cpu_request=4.0, memory_request=4.0),
+            },
+            "data_quality": _quality("good"),
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu_request": np.array([0.01, 0.01, 0.01]),
+                "memory_request": np.array([0.01, 0.01, 0.01]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_in_candidate")
+        self.assertEqual(advice["target_spec"]["replicas"], 3)
+
     def test_daemonset_policy_does_not_recommend_replica_scaling(self):
         resource = {
             "resource_id": "k8s:cluster:cattle-system:daemonset:cattle-node-agent",

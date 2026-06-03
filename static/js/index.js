@@ -38,21 +38,26 @@
 
   async function loadQueue({ keepSelection = false } = {}) {
     app.els.summaryText.textContent = "正在加载资源...";
-    const [payload, forecastPayload] = await Promise.all([
+    const [payload, summaryPayload, forecastPayload] = await Promise.all([
       api.requestJson(api.buildQuery("/api/resources", {
-        page: 1,
-        page_size: app.API_PAGE_SIZE,
+        page: app.state.page,
+        page_size: app.state.pageSize,
         sort_by: "urgency_score",
         resource_type: app.state.resourceTypeFilter,
-        action: "",
+        action: app.state.actionFilter,
+        q: app.state.query,
+      })),
+      api.requestJson(api.buildQuery("/api/resources/advice-summary", {
+        resource_type: app.state.resourceTypeFilter,
         q: app.state.query,
       })),
       api.requestJson("/api/forecast-config", 1),
     ]);
+    app.state.adviceSummary = summaryPayload;
     app.state.forecastConfigPayload = forecastPayload;
     const items = payload.items || [];
     if (!keepSelection) app.state.selectedResourceId = "";
-    list.setItems(items);
+    list.setItems(items, payload);
     list.syncFilterButtons();
   }
 
@@ -60,9 +65,7 @@
     const nextValue = value || "";
     app.state.actionFilter = options.toggle && app.state.actionFilter === nextValue ? "" : nextValue;
     app.state.page = 1;
-    app.state.visibleItems = list.applyClientFilters(app.state.loadedItems);
-    list.renderRows();
-    list.syncFilterButtons();
+    loadQueue();
   }
 
   function applyConfidenceFilter(value) {
@@ -622,12 +625,12 @@
     app.els.prevPageBtn.addEventListener("click", () => {
       if (app.els.prevPageBtn.disabled) return;
       app.state.page -= 1;
-      list.renderRows();
+      loadQueue({ keepSelection: true });
     });
     app.els.nextPageBtn.addEventListener("click", () => {
       if (app.els.nextPageBtn.disabled) return;
       app.state.page += 1;
-      list.renderRows();
+      loadQueue({ keepSelection: true });
     });
     app.els.rowsRoot.addEventListener("click", (event) => {
       const row = event.target.closest(".risk-row");

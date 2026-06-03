@@ -1,6 +1,7 @@
 """单指标拟合：回测 + 未来预测 + 集成。"""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict
 
 import pandas as pd
@@ -13,6 +14,8 @@ from resource_predict.pipeline.model_selection import choose_best_method
 from resource_predict.pipeline.prophet_routing import prophet_routing_decision
 from resource_predict.pipeline.series_utils import compute_metrics
 from resource_predict.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 def fit_one_metric(
@@ -30,6 +33,7 @@ def fit_one_metric(
     timing: Dict[str, float] = {m: 0.0 for m in active_methods}
     preds: Dict[str, pd.Series] = {}
     metrics: Dict[str, Dict[str, float]] = {}
+    method_failures: Dict[str, str] = {}
 
     zscore_threshold = float(settings.forecast.anomaly_route_zscore_threshold)
     anom = anomaly_profile(y_full, zscore_threshold=zscore_threshold)
@@ -53,14 +57,19 @@ def fit_one_metric(
 
     preds_future: Dict[str, pd.Series] = {}
     for m in effective_methods:
-        if reuse_backtest_model:
-            res = forecast_by_method(m, y_train, ctx.test_size + ctx.future_steps)
-            pred = res.yhat.iloc[:ctx.test_size].copy()
-            future_pred = res.yhat.iloc[ctx.test_size:].copy()
-        else:
-            res = forecast_by_method(m, y_train, ctx.test_size)
-            pred = res.yhat.copy()
-            future_pred = pd.Series(dtype=float)
+        try:
+            if reuse_backtest_model:
+                res = forecast_by_method(m, y_train, ctx.test_size + ctx.future_steps)
+                pred = res.yhat.iloc[:ctx.test_size].copy()
+                future_pred = res.yhat.iloc[ctx.test_size:].copy()
+            else:
+                res = forecast_by_method(m, y_train, ctx.test_size)
+                pred = res.yhat.copy()
+                future_pred = pd.Series(dtype=float)
+        except Exception as exc:
+            method_failures[m] = str(exc)
+            logger.warning("[forecast] method %s failed during backtest: %s", m, exc)
+            continue
         pred.index = y_test.index
         preds[m] = pred
         metrics[m] = compute_metrics(y_test, pred)
@@ -76,6 +85,19 @@ def fit_one_metric(
         timing[m] += float(res.seconds)
         if reuse_backtest_model:
             preds_future[m] = future_pred
+
+    if not preds:
+        fallback = "rolling_mean"
+        res = forecast_by_method(fallback, y_train, ctx.test_size + ctx.future_steps)
+        pred = res.yhat.iloc[:ctx.test_size].copy()
+        pred.index = y_test.index
+        preds[fallback] = pred
+        metrics[fallback] = compute_metrics(y_test, pred)
+        metrics[fallback]["selection_rmse"] = float(metrics[fallback]["rmse"])
+        timing.setdefault(fallback, 0.0)
+        timing[fallback] += float(res.seconds)
+        preds_future[fallback] = res.yhat.iloc[ctx.test_size:].copy()
+        method_failures[fallback] = "used as fallback after all configured methods failed"
 
     ensemble_pred = ensemble_series(preds, metrics, enable_ensemble=enable_ensemble)
     if ensemble_pred is not None:
@@ -103,9 +125,26 @@ def fit_one_metric(
 
     if not reuse_backtest_model:
         for m in effective_methods:
-            res = forecast_by_method(m, y_full, ctx.future_steps)
+            if m not in preds:
+                continue
+            try:
+                res = forecast_by_method(m, y_full, ctx.future_steps)
+            except Exception as exc:
+                method_failures[m] = str(exc)
+                logger.warning("[forecast] method %s failed during future forecast: %s", m, exc)
+                continue
             preds_future[m] = res.yhat.copy()
             timing[m] += float(res.seconds)
+    if best not in preds_future:
+        fallback = "rolling_mean"
+        res = forecast_by_method(fallback, y_full, ctx.future_steps)
+        preds_future[best] = res.yhat.copy()
+        timing.setdefault(fallback, 0.0)
+        timing[fallback] += float(res.seconds)
+        method_failures[best] = method_failures.get(
+            best,
+            "future forecast unavailable; rolling_mean future used",
+        )
     ensemble_future = ensemble_series(preds_future, metrics, enable_ensemble=enable_ensemble)
     if ensemble_future is not None:
         preds_future["ensemble"] = ensemble_future
@@ -121,5 +160,6 @@ def fit_one_metric(
         },
         "prophet_routing": prophet_routing,
         "reuse_backtest_model_for_future": reuse_backtest_model,
+        "method_failures": method_failures,
     }
     return preds, metrics, best, preds_future, timing, diagnostics

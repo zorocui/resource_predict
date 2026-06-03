@@ -126,6 +126,46 @@ class ForecastOptimizationTest(unittest.TestCase):
         self.assertNotIn("prophet", future)
         self.assertEqual(diagnostics["prophet_routing"]["decision"], "skipped")
 
+    def test_failed_method_does_not_abort_metric_when_baseline_succeeds(self):
+        y_full = _series([0.1, 0.2, 0.3, 0.4, 0.5], freq="5min")
+        y_train = y_full.iloc[:-3]
+        y_test = y_full.iloc[-3:]
+        ctx = WorkerContext(
+            test_size=3,
+            future_steps=2,
+            active_methods=["arima", "rolling_mean"],
+            forecast_config={
+                "enabled_methods": ["arima", "rolling_mean"],
+                "enable_ensemble": False,
+                "reuse_backtest_model_for_future": True,
+                "prophet_routing_enabled": False,
+                "prophet_routing_mode": "auto",
+            },
+            metric_filter_by_id={},
+            metric_partial_enabled=False,
+            existing_partial_ids=set(),
+        )
+
+        def fake_forecast(method: str, y_train_arg: pd.Series, steps: int) -> ForecastResult:
+            if method == "arima":
+                raise ValueError("Need at least 3 dates to infer frequency")
+            idx = pd.date_range(y_train_arg.index[-1], periods=steps + 1, freq="5min")[1:]
+            return ForecastResult(pd.Series([0.2] * steps, index=idx), seconds=0.1)
+
+        with patch("resource_predict.pipeline.fit.forecast_by_method", fake_forecast):
+            preds, metrics, best, future, _timing, diagnostics = fit_one_metric(
+                y_train,
+                y_test,
+                y_full,
+                ctx=ctx,
+            )
+
+        self.assertEqual(best, "rolling_mean")
+        self.assertIn("rolling_mean", preds)
+        self.assertIn("rolling_mean", metrics)
+        self.assertEqual(len(future["rolling_mean"]), 2)
+        self.assertIn("arima", diagnostics["method_failures"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -169,6 +169,13 @@ def _recommend_k8s_policy(
     replica_target = _recommend_replicas(spec=spec, by_metric=by_metric, metric_actions=metric_actions, tier=tier)
     if replica_target:
         policy["recommendations"]["replicas"] = replica_target
+    elif (
+        any(v == "scale_in_candidate" for v in metric_actions.values())
+        and any(metric_actions.get(metric) != "scale_in_candidate" for metric in ("cpu", "memory"))
+    ):
+        policy["notes"].append(
+            "replica scale-in requires both CPU and memory to be low; per-resource recommendations remain available"
+        )
     if any(v == "scale_out_candidate" for v in metric_actions.values()):
         policy["notes"].append("consider HPA when CPU drives the recommendation")
     if any(v == "scale_in_candidate" for v in metric_actions.values()):
@@ -270,6 +277,8 @@ def _recommend_replicas(
         }
     if "scale_in_candidate" not in actions:
         return None
+    if any(metric_actions.get(metric) != "scale_in_candidate" for metric in ("cpu", "memory")):
+        return None
     target_util = _target_utilization(tier, "scale_in_candidate")
     pressure = max(
         (
@@ -281,6 +290,9 @@ def _recommend_replicas(
     )
     target = int(np.floor(current * max(pressure, 0.05) / target_util))
     target = max(1, min(current - 1, target)) if current > 1 else 1
+    max_reduction = max(0.0, min(1.0, float(settings.decision.scale_in_max_reduction_ratio)))
+    min_step_target = int(np.ceil(float(current) * (1.0 - max_reduction)))
+    target = max(target, min_step_target, 1)
     if target >= current:
         return None
     return {
@@ -593,7 +605,7 @@ def build_k8s_workload_advice(
     actions = set(metric_actions.values())
     if "scale_out_candidate" in actions:
         action = "scale_out_candidate"
-    elif actions == {"scale_in_candidate"} or ("scale_in_candidate" in actions and "hold" in actions):
+    elif "scale_in_candidate" in actions:
         action = "scale_in_candidate"
     elif blockers and len(blockers) == len(metric_actions):
         action = "insufficient_data"
@@ -690,7 +702,6 @@ def build_k8s_workload_advice(
         "target_k8s_policy": target_policy,
         "analysis_only": not bool(target_spec),
     }
-
 
 def _coordinate_total_capacity(
     policy: Dict[str, Any],
