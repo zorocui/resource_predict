@@ -73,7 +73,25 @@
 
   function metricKeysFor(item) {
     const type = resourceTypeOf(item);
-    return app.viewMetricMap[type] || app.viewMetricMap.openstack_vm;
+    const keys = app.viewMetricMap[type] || app.viewMetricMap.openstack_vm;
+    if (type !== "k8s_workload") return keys;
+    const seenRawBases = new Set();
+    return keys.filter((key) => {
+      const unit = resolveDisplayUnit(item, key);
+      if (unit === "percent") return true;
+      const base = baseMetricKey(key);
+      if (seenRawBases.has(base)) return false;
+      seenRawBases.add(base);
+      return true;
+    });
+  }
+
+  function metricTitleFor(item, metricKey) {
+    if (isK8s(item) && resolveDisplayUnit(item, metricKey) !== "percent") {
+      if (String(metricKey).startsWith("cpu_")) return "CPU 使用量";
+      if (String(metricKey).startsWith("memory_")) return "内存使用量";
+    }
+    return app.metricTitleMap[metricKey] || metricKey;
   }
 
   /**
@@ -135,6 +153,34 @@
     return signalStats[metricKey] || stats[metricKey] || stats[baseKey] || {};
   }
 
+  function metricObservedStatsFor(item, metricKey) {
+    const chart = item?.charts?.[metricKey] || {};
+    const values = []
+      .concat(Array.isArray(chart.y_train) ? chart.y_train : [])
+      .concat(Array.isArray(chart.y_test) ? chart.y_test : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value));
+    if (!values.length) return null;
+    values.sort((a, b) => a - b);
+    const sum = values.reduce((acc, value) => acc + value, 0);
+    return {
+      avg: sum / values.length,
+      p95: percentile(values, 95),
+      peak: values[values.length - 1],
+    };
+  }
+
+  function percentile(sortedValues, pct) {
+    if (!sortedValues.length) return 0;
+    if (sortedValues.length === 1) return sortedValues[0];
+    const rank = (pct / 100) * (sortedValues.length - 1);
+    const low = Math.floor(rank);
+    const high = Math.ceil(rank);
+    if (low === high) return sortedValues[low];
+    const weight = rank - low;
+    return sortedValues[low] * (1 - weight) + sortedValues[high] * weight;
+  }
+
   function metricActionFor(item, metricKey) {
     const metricActions = item?.scaling_advice?.metric_actions || {};
     const baseKey = baseMetricKey(metricKey);
@@ -158,19 +204,27 @@
   }
 
   function representativeK8sMetricStats(item, baseKey, action) {
-    const direct = metricStatsFor(item, baseKey);
-    if (direct.p95 !== undefined) return direct;
-    const preferredKey = action === "scale_out_candidate"
-      ? `${baseKey}_limit`
-      : action === "scale_in_candidate"
-        ? `${baseKey}_request`
-        : `${baseKey}_limit`;
+    const preferredKey = representativeK8sMetricKey(item, baseKey, action);
     const preferred = metricStatsFor(item, preferredKey);
-    if (preferred.p95 !== undefined) return preferred;
-    return metricKeysFor(item)
+    if (preferred.p95 !== undefined) return { key: preferredKey, stats: preferred };
+    const fallbackKey = metricKeysFor(item)
       .filter((key) => baseMetricKey(key) === baseKey)
-      .map((key) => metricStatsFor(item, key))
-      .find((stat) => stat.p95 !== undefined) || {};
+      .find((key) => metricStatsFor(item, key).p95 !== undefined);
+    if (fallbackKey) return { key: fallbackKey, stats: metricStatsFor(item, fallbackKey) };
+    const direct = metricStatsFor(item, baseKey);
+    return { key: baseKey, stats: direct.p95 !== undefined ? direct : {} };
+  }
+
+  function representativeK8sMetricKey(item, baseKey, action) {
+    if (action === "scale_out_candidate") return `${baseKey}_limit`;
+    if (action === "scale_in_candidate") return `${baseKey}_request`;
+    const limitKey = `${baseKey}_limit`;
+    const requestKey = `${baseKey}_request`;
+    const limitUnit = resolveDisplayUnit(item, limitKey);
+    const requestUnit = resolveDisplayUnit(item, requestKey);
+    if (limitUnit !== "percent") return limitKey;
+    if (requestUnit !== "percent") return requestKey;
+    return limitKey;
   }
 
   function k8sMetricSummary(item) {
@@ -182,8 +236,9 @@
     }
     ["cpu", "memory"].forEach((baseKey) => {
       const action = metricActionFor(item, baseKey);
-      const stat = representativeK8sMetricStats(item, baseKey, action);
-      const unit = resolveDisplayUnit(item, baseKey);
+      const representative = representativeK8sMetricStats(item, baseKey, action);
+      const stat = representative.stats;
+      const unit = resolveDisplayUnit(item, representative.key);
       const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)}` : actionLabel(action);
       const label = baseKey === "cpu" ? "CPU" : "内存";
       chips.push(`<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(label)} ${escapeHtml(p95)}</span>`);
@@ -211,6 +266,15 @@
     const advice = item?.scaling_advice || {};
     if (isK8s(item)) {
       const target = advice.target_spec || {};
+      const containerLines = formatTargetContainers(target.containers);
+      if (containerLines.length) {
+        const replicas = target.replicas != null ? formatNumber(target.replicas, 0) : null;
+        return [
+          "K8S 目标",
+          ...containerLines,
+          ...(replicas ? [`副本 ${replicas}`] : []),
+        ].join("\n");
+      }
       // 只在值真正存在时才显示；null/undefined 时该字段留空，不显示占位符
       const cpuReq = target.cpu_request_cores != null ? formatNumber(target.cpu_request_cores, 2) : null;
       const cpuLimit = target.cpu_limit_cores != null ? formatNumber(target.cpu_limit_cores, 2) : null;
@@ -246,6 +310,25 @@
     if (hasMem) parts.push(`${formatNumber(target.memory_gb, 0)}GB`);
     if (hasDisk) parts.push(`${formatNumber(target.disk_gb, 0)}GB`);
     return `目标规格 ${parts.join(" / ")}`;
+  }
+
+  function formatTargetContainers(containers) {
+    if (!containers || typeof containers !== "object" || Array.isArray(containers)) return [];
+    return Object.entries(containers)
+      .filter(([, values]) => values && typeof values === "object")
+      .map(([name, values]) => {
+        const fields = [];
+        const cpuReq = values.cpu_request_cores != null ? formatNumber(values.cpu_request_cores, 2) : null;
+        const cpuLimit = values.cpu_limit_cores != null ? formatNumber(values.cpu_limit_cores, 2) : null;
+        const memReq = values.memory_request_gb != null ? formatMemoryGiB(values.memory_request_gb, 2) : null;
+        const memLimit = values.memory_limit_gb != null ? formatMemoryGiB(values.memory_limit_gb, 2) : null;
+        if (cpuReq) fields.push(`CPU req ${cpuReq}C`);
+        if (cpuLimit) fields.push(`CPU limit ${cpuLimit}C`);
+        if (memReq) fields.push(`内存 req ${memReq}`);
+        if (memLimit) fields.push(`内存 limit ${memLimit}`);
+        return fields.length ? `${name}: ${fields.join(" / ")}` : "";
+      })
+      .filter(Boolean);
   }
 
   function positiveNumber(value) {
@@ -593,6 +676,8 @@
     analysisOnlyReasons,
     metricActionFor,
     metricKeysFor,
+    metricTitleFor,
+    metricObservedStatsFor,
     metricStatsFor,
     renderRows,
     resolveDisplayUnit,

@@ -140,11 +140,29 @@
     return { min: start - pad, max: end + pad, spanMs };
   }
 
+  function chartGridLeft(displayUnit) {
+    return 12;
+  }
+
+  function chartYAxisLabelMargin(displayUnit) {
+    return displayUnit === "gib" ? 12 : 8;
+  }
+
   function metricThresholds(metricKey) {
+    const title = app.metricTitleMap[metricKey] || metricKey;
     return {
-      upper: { value: 0.8, label: `${app.metricTitleMap[metricKey] || metricKey} 扩容阈值` },
-      lower: { value: 0.2, label: `${app.metricTitleMap[metricKey] || metricKey} 缩容阈值` },
+      upper: { value: 0.8, label: `${title} 扩容阈值` },
+      lower: { value: 0.2, label: `${title} 缩容阈值` },
     };
+  }
+
+  function auxiliaryMarkLines(metricKey, isPercentMode) {
+    if (!isPercentMode) return [];
+    const thresholds = metricThresholds(metricKey);
+    return [
+      { yAxis: thresholds.upper.value, name: thresholds.upper.label, lineStyle: { color: "rgba(220,38,38,.62)", type: "dashed", width: 1.2 } },
+      { yAxis: thresholds.lower.value, name: thresholds.lower.label, lineStyle: { color: "rgba(5,150,105,.62)", type: "dashed", width: 1.2 } },
+    ];
   }
 
   function metricContainerScope(resource, metricKey, displayUnit) {
@@ -217,34 +235,33 @@
       z: 2,
     }];
 
-    // 只在百分比模式下显示阈值辅助线；绝对值模式（cores/GiB）下阈值无意义
-    if (app.chartAuxiliaryVisible && isPercentMode) {
+    if (app.chartAuxiliaryVisible) {
       const futureStart = xPredFuture.length ? normalizeTsMs(xPredFuture[0]) : null;
       const futureEnd = xPredFuture.length ? normalizeTsMs(xPredFuture[xPredFuture.length - 1]) : null;
-      const thresholds = metricThresholds(metricKey);
-      series.push({
-        name: "辅助线",
-        type: "line",
-        data: [],
+      const markLineData = auxiliaryMarkLines(metricKey, isPercentMode);
+      const markArea = futureStart != null && futureEnd != null ? {
         silent: true,
-        tooltip: { show: false },
-        lineStyle: { opacity: 0 },
-        markLine: {
+        itemStyle: { color: "rgba(217,119,6,.09)" },
+        data: [[{ xAxis: futureStart }, { xAxis: futureEnd }]],
+      } : undefined;
+      if (markLineData.length || markArea) {
+        series.push({
+          name: "辅助线",
+          type: "line",
+          data: [],
           silent: true,
-          symbol: ["none", "none"],
-          label: { show: false },
-          data: [
-            { yAxis: thresholds.upper.value, name: thresholds.upper.label, lineStyle: { color: "rgba(220,38,38,.62)", type: "dashed", width: 1.2 } },
-            { yAxis: thresholds.lower.value, name: thresholds.lower.label, lineStyle: { color: "rgba(5,150,105,.62)", type: "dashed", width: 1.2 } },
-          ],
-        },
-        markArea: futureStart != null && futureEnd != null ? {
-          silent: true,
-          itemStyle: { color: "rgba(217,119,6,.09)" },
-          data: [[{ xAxis: futureStart }, { xAxis: futureEnd }]],
-        } : undefined,
-        z: 0,
-      });
+          tooltip: { show: false },
+          lineStyle: { opacity: 0 },
+          markLine: markLineData.length ? {
+            silent: true,
+            symbol: ["none", "none"],
+            label: { show: false },
+            data: markLineData,
+          } : undefined,
+          markArea,
+          z: 0,
+        });
+      }
     }
 
     series.push({
@@ -304,7 +321,7 @@
       backgroundColor: "transparent",
       animation: false,
       title: {
-        text: `${app.metricTitleMap[metricKey] || metricKey} 预测 · ${modeLabel}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
+        text: `${list.metricTitleFor(resource, metricKey)} 预测 · ${modeLabel}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
         subtext: containerScope,
         left: "center",
         top: 6,
@@ -329,7 +346,7 @@
         },
       },
       legend: { top: containerScope ? 54 : 34, left: 8, data: legendData, itemWidth: 12, itemHeight: 7, textStyle: { color: "#475569", fontSize: 10 } },
-      grid: { left: 48, right: 18, top: containerScope ? 88 : 70, bottom: 58 },
+      grid: { left: chartGridLeft(displayUnit), right: 18, top: containerScope ? 88 : 70, bottom: 58, containLabel: true },
       xAxis: {
         type: "time",
         min: timeAxis.min,
@@ -351,6 +368,7 @@
         min: 0,
         axisLabel: {
           color: "#64748b",
+          margin: chartYAxisLabelMargin(displayUnit),
           formatter: (v) => {
             if (!Number.isFinite(v)) return "-";
             if (displayUnit === "cores") return `${Math.round(v)} C`;
@@ -441,7 +459,7 @@
   function metricButtonsMarkup(resource, activeMetric, modal = false) {
     const attr = modal ? "data-modal-metric-key" : "data-metric-key";
     return list.metricKeysFor(resource).map((key) => (
-      `<button type="button" class="${key === activeMetric ? "active" : ""}" ${attr}="${list.escapeHtml(key)}">${list.escapeHtml(app.metricTitleMap[key])}</button>`
+      `<button type="button" class="${key === activeMetric ? "active" : ""}" ${attr}="${list.escapeHtml(key)}">${list.escapeHtml(list.metricTitleFor(resource, key))}</button>`
     )).join("");
   }
 
@@ -566,18 +584,19 @@
         </div>
         <div class="decision-row">
           <span class="decision-label">目标结果</span>
-          <small>${list.escapeHtml(list.targetSpecText(resource))}</small>
+          <small class="target-result">${list.escapeHtml(list.targetSpecText(resource))}</small>
         </div>
         ${analysisReasonMarkup}
       </div>
       <div class="reason-grid">
         ${list.metricKeysFor(resource).map((key) => {
-          const st = list.metricStatsFor(resource, key);
+          const observed = list.metricObservedStatsFor(resource, key);
           const mAction = list.metricActionFor(resource, key);
           const unit = list.resolveDisplayUnit(resource, key);
+          const st = observed || {};
           return `<div class="reason-item">
-            <span class="reason-metric">${list.escapeHtml(app.metricTitleMap[key])}</span>
-            <strong class="reason-action">${list.escapeHtml(list.actionLabel(mAction))}</strong>
+            <span class="reason-metric">${list.escapeHtml(list.metricTitleFor(resource, key))}</span>
+            <strong class="reason-action is-${list.escapeHtml(mAction)}">${list.escapeHtml(list.actionLabel(mAction))}</strong>
             <small class="reason-stats">
               <span><b>平均</b><em>${list.formatStatValue(st.avg, unit)}</em></span>
               <span><b>P95</b><em>${list.formatStatValue(st.p95, unit)}</em></span>
@@ -609,7 +628,7 @@
     const key = `${resourceId}:${metricKey}`;
     const data = app.chartDataByKey.get(key);
     if (!data) {
-      app.els.detailChart.innerHTML = `<div class="chart-state">暂无 ${list.escapeHtml(app.metricTitleMap[metricKey] || metricKey)} 图表数据</div>`;
+      app.els.detailChart.innerHTML = `<div class="chart-state">暂无 ${list.escapeHtml(list.metricTitleFor(resource, metricKey))} 图表数据</div>`;
       return;
     }
     if (typeof echarts === "undefined") {
@@ -634,7 +653,7 @@
     if (!data || typeof echarts === "undefined" || !app.els.chartModal || !app.els.chartModalChart) return;
     disposeModalChart();
     app.els.chartModal.hidden = false;
-    const metricName = app.metricTitleMap[activeMetric] || activeMetric;
+    const metricName = list.metricTitleFor(resource, activeMetric);
     app.els.chartModalTitle.textContent = `${metricName} 指标预测`;
     app.els.chartModalSubtitle.textContent = app.state.selectedResourceId;
     renderMetricTabs(resource, activeMetric);
