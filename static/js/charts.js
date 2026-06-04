@@ -584,7 +584,9 @@
         </div>
         <div class="decision-row">
           <span class="decision-label">目标结果</span>
-          <small class="target-result">${list.escapeHtml(list.targetSpecText(resource))}</small>
+          <div class="target-result" title="${list.escapeHtml(list.targetSpecText(resource))}">
+            ${list.targetSpecDetailMarkup(resource)}
+          </div>
         </div>
         ${analysisReasonMarkup}
       </div>

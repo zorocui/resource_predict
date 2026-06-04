@@ -154,6 +154,9 @@
   }
 
   function metricObservedStatsFor(item, metricKey) {
+    const observedStats = item?.observed_stats || {};
+    const observed = observedStats[metricKey];
+    if (observed && typeof observed === "object" && observed.p95 !== undefined) return observed;
     const chart = item?.charts?.[metricKey] || {};
     const values = []
       .concat(Array.isArray(chart.y_train) ? chart.y_train : [])
@@ -205,12 +208,14 @@
 
   function representativeK8sMetricStats(item, baseKey, action) {
     const preferredKey = representativeK8sMetricKey(item, baseKey, action);
+    const preferredObserved = metricObservedStatsFor(item, preferredKey);
+    if (preferredObserved?.p95 !== undefined) return { key: preferredKey, stats: preferredObserved };
     const preferred = metricStatsFor(item, preferredKey);
     if (preferred.p95 !== undefined) return { key: preferredKey, stats: preferred };
     const fallbackKey = metricKeysFor(item)
       .filter((key) => baseMetricKey(key) === baseKey)
-      .find((key) => metricStatsFor(item, key).p95 !== undefined);
-    if (fallbackKey) return { key: fallbackKey, stats: metricStatsFor(item, fallbackKey) };
+      .find((key) => metricObservedStatsFor(item, key)?.p95 !== undefined || metricStatsFor(item, key).p95 !== undefined);
+    if (fallbackKey) return { key: fallbackKey, stats: metricObservedStatsFor(item, fallbackKey) || metricStatsFor(item, fallbackKey) };
     const direct = metricStatsFor(item, baseKey);
     return { key: baseKey, stats: direct.p95 !== undefined ? direct : {} };
   }
@@ -240,7 +245,7 @@
       const stat = representative.stats;
       const unit = resolveDisplayUnit(item, representative.key);
       const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)}` : actionLabel(action);
-      const label = baseKey === "cpu" ? "CPU" : "内存";
+      const label = metricTitleFor(item, representative.key);
       chips.push(`<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(label)} ${escapeHtml(p95)}</span>`);
     });
     return chips.join("");
@@ -253,7 +258,7 @@
   function metricSummary(item) {
     if (isK8s(item)) return k8sMetricSummary(item);
     return metricKeysFor(item).map((key) => {
-      const stat = metricStatsFor(item, key);
+      const stat = metricObservedStatsFor(item, key) || metricStatsFor(item, key);
       const action = metricActionFor(item, key);
       const label = metricActionLabel(item, key, action);
       const unit = resolveDisplayUnit(item, key);
@@ -310,6 +315,52 @@
     if (hasMem) parts.push(`${formatNumber(target.memory_gb, 0)}GB`);
     if (hasDisk) parts.push(`${formatNumber(target.disk_gb, 0)}GB`);
     return `目标规格 ${parts.join(" / ")}`;
+  }
+
+  function targetSpecRows(item) {
+    const advice = item?.scaling_advice || {};
+    const target = advice.target_spec || {};
+    if (isK8s(item)) {
+      const containerLines = formatTargetContainers(target.containers);
+      if (containerLines.length) {
+        const rows = containerLines.map((line) => {
+          const [name, ...rest] = String(line).split(": ");
+          return { label: name || "容器", value: rest.join(": ") || line };
+        });
+        if (target.replicas != null) rows.push({ label: "副本", value: formatNumber(target.replicas, 0) });
+        return rows;
+      }
+      const rows = [];
+      const cpuFields = [];
+      const memFields = [];
+      const cpuReq = target.cpu_request_cores != null ? formatNumber(target.cpu_request_cores, 2) : null;
+      const cpuLimit = target.cpu_limit_cores != null ? formatNumber(target.cpu_limit_cores, 2) : null;
+      const memReq = target.memory_request_gb != null ? formatMemoryGiB(target.memory_request_gb, 2) : null;
+      const memLimit = target.memory_limit_gb != null ? formatMemoryGiB(target.memory_limit_gb, 2) : null;
+      if (cpuReq) cpuFields.push(`Request ${cpuReq}C`);
+      if (cpuLimit) cpuFields.push(`Limit ${cpuLimit}C`);
+      if (memReq) memFields.push(`Request ${memReq}`);
+      if (memLimit) memFields.push(`Limit ${memLimit}`);
+      if (cpuFields.length) rows.push({ label: "CPU", value: cpuFields.join(" / ") });
+      if (memFields.length) rows.push({ label: "内存", value: memFields.join(" / ") });
+      if (target.replicas != null) rows.push({ label: "副本", value: formatNumber(target.replicas, 0) });
+      return rows;
+    }
+    const rows = [];
+    if (target.cpu_cores != null && Number.isFinite(Number(target.cpu_cores))) rows.push({ label: "CPU", value: `${formatNumber(target.cpu_cores, 0)}C` });
+    if (target.memory_gb != null && Number.isFinite(Number(target.memory_gb))) rows.push({ label: "内存", value: `${formatNumber(target.memory_gb, 0)}GB` });
+    if (target.disk_gb != null && Number.isFinite(Number(target.disk_gb))) rows.push({ label: "磁盘", value: `${formatNumber(target.disk_gb, 0)}GB` });
+    return rows;
+  }
+
+  function targetSpecDetailMarkup(item) {
+    const rows = targetSpecRows(item);
+    if (!rows.length) return `<span class="target-result-empty">${escapeHtml(targetSpecText(item))}</span>`;
+    return rows.map((row) => `
+      <span class="target-result-item">
+        <b>${escapeHtml(row.label)}</b>
+        <em>${escapeHtml(row.value)}</em>
+      </span>`).join("");
   }
 
   function formatTargetContainers(containers) {
@@ -529,8 +580,15 @@
     return methods;
   }
 
-  function bestMethodCounts(summaryItems) {
+  function bestMethodCounts(summaryItems, summaryPayload = null) {
     const methods = activeForecastMethods();
+    const backendCounts = summaryPayload?.best_method_counts;
+    if (backendCounts && typeof backendCounts === "object") {
+      return methods.map((method) => [
+        `${app.labelMap[method] || method} 最优`,
+        Number(backendCounts[method] || 0),
+      ]);
+    }
     const enabled = new Set(methods);
     const counts = Object.fromEntries(methods.map((method) => [method, 0]));
     for (const item of summaryItems) {
@@ -548,19 +606,35 @@
 
   function renderOverview(counts, summaryItems) {
     if (!app.els.overviewGrid) return;
-    const byType = summaryItems.reduce((acc, item) => {
-      acc[typeLabel(item)] = (acc[typeLabel(item)] || 0) + 1;
-      return acc;
-    }, {});
+    const overview = app.state.overviewSummary || {};
+    const overviewCounts = overview.action_counts || {};
+    const overviewTypeCounts = overview.resource_type_counts || {};
+    const hasOverview = Number.isFinite(Number(overview.total));
+    const byType = hasOverview
+      ? {
+        VM: Number(overviewTypeCounts.openstack_vm || 0),
+        Workload: Number(overviewTypeCounts.k8s_workload || 0),
+      }
+      : summaryItems.reduce((acc, item) => {
+        acc[typeLabel(item)] = (acc[typeLabel(item)] || 0) + 1;
+        return acc;
+      }, {});
+    const actionCounts = hasOverview
+      ? {
+        scale_out: Number(overviewCounts.scale_out || 0) + Number(overviewCounts.scale_out_candidate || 0),
+        scale_in: Number(overviewCounts.scale_in || 0) + Number(overviewCounts.scale_in_candidate || 0),
+        mixed: Number(overviewCounts.mixed || 0),
+      }
+      : counts;
     const overviewCards = [
-      ["匹配总数", app.state.total || summaryItems.length],
-      ["当前页", summaryItems.length],
+      ["匹配总数", hasOverview ? Number(overview.total || 0) : (app.state.total || summaryItems.length)],
+      ["当前页", currentPageItems().length],
       ["VM", byType.VM || 0],
       ["Workload", byType.Workload || 0],
-      ["需扩容", counts.scale_out],
-      ["需缩容", counts.scale_in],
-      ["混合信号", counts.mixed],
-      ...bestMethodCounts(summaryItems),
+      ["需扩容", actionCounts.scale_out || 0],
+      ["需缩容", actionCounts.scale_in || 0],
+      ["混合信号", actionCounts.mixed || 0],
+      ...bestMethodCounts(summaryItems, overview),
     ];
     app.els.overviewGrid.innerHTML = overviewCards
       .map(([k, v]) => `<div class="overview-card"><span>${escapeHtml(k)}</span><strong>${escapeHtml(v)}</strong></div>`)
@@ -686,6 +760,7 @@
     setItems,
     subtitleFor,
     syncFilterButtons,
+    targetSpecDetailMarkup,
     targetSpecText,
     titleFor,
     triggerMetric,

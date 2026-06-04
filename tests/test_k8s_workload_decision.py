@@ -165,7 +165,7 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         self.assertEqual(advice["target_spec"]["memory_request_gb"], 0.5)
         self.assertGreater(advice["target_spec"]["replicas"], 2)
 
-    def test_scale_in_does_not_round_small_specs_up_into_resource_expansion(self):
+    def test_scale_in_preserves_small_spec_granularity(self):
         resource = {
             "resource_id": "k8s:cluster:ns:deployment:api",
             "resource_type": "k8s_workload",
@@ -192,8 +192,10 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         )
 
         self.assertEqual(advice["action"], "scale_in_candidate")
-        self.assertNotIn("cpu_request_cores", advice["target_spec"])
-        self.assertNotIn("memory_request_gb", advice["target_spec"])
+        self.assertLess(advice["target_spec"]["cpu_request_cores"], 1.0)
+        self.assertLess(advice["target_spec"]["cpu_limit_cores"], 2.0)
+        self.assertLess(advice["target_spec"]["memory_request_gb"], 1.0)
+        self.assertLess(advice["target_spec"]["memory_limit_gb"], 2.0)
         self.assertLess(advice["target_spec"]["replicas"], 3)
 
     def test_replica_policy_prefers_controller_replicas_over_observed_pods(self):
@@ -325,6 +327,42 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         self.assertTrue(
             any("replica scale-in requires both CPU and memory to be low" in note for note in advice["target_k8s_policy"]["notes"])
         )
+
+    def test_cpu_two_core_boundary_can_scale_down_when_memory_scales_out(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 6,
+                **_containers(cpu_request=2.0, cpu_limit=2.0, memory_request=2.0, memory_limit=2.0),
+            },
+            "data_quality": _quality("good"),
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu_request": np.array([0.157, 0.157, 0.157]),
+                "cpu_limit": np.array([0.157, 0.157, 0.157]),
+                "memory_request": np.array([0.971, 0.971, 0.971]),
+                "memory_limit": np.array([0.971, 0.971, 0.971]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_out_candidate")
+        self.assertTrue(advice["has_mixed_signals"])
+        self.assertEqual(advice["metric_actions"]["cpu"], "scale_in_candidate")
+        self.assertEqual(advice["metric_actions"]["memory"], "scale_out_candidate")
+        self.assertLess(advice["target_spec"]["cpu_request_cores"], 2.0)
+        self.assertLess(advice["target_spec"]["cpu_limit_cores"], 2.0)
+        self.assertEqual(advice["target_spec"]["replicas"], 9)
+        notes = advice["target_k8s_policy"]["notes"]
+        self.assertTrue(any("mixed scale signals" in note for note in notes))
+        self.assertFalse(any("CPU drives" in note for note in notes))
 
     def test_replica_scale_in_is_capped_to_one_step_reduction(self):
         resource = {

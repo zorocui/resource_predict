@@ -106,7 +106,7 @@ def merge_partial_forecast_items(
         merged = dict(old)
         if isinstance(new.get("spec"), dict):
             merged["spec"] = new.get("spec", {})
-        for field in ("best_methods", "metrics", "charts_forecast"):
+        for field in ("best_methods", "metrics", "charts_forecast", "observed_stats"):
             old_obj = old.get(field, {})
             new_obj = new.get(field, {})
             if not isinstance(old_obj, dict) or not isinstance(new_obj, dict):

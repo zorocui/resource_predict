@@ -15,6 +15,7 @@ from resource_predict.pipeline._types import WorkerContext
 from resource_predict.pipeline.fit import fit_one_metric
 from resource_predict.pipeline.resource_profile import build_resource_profile
 from resource_predict.pipeline.series_utils import series_to_lists, to_ms
+from resource_predict.utils import compute_metric_stats
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,12 @@ def worker(
     best_methods: Dict[str, str] = {}
     metrics_out: Dict[str, Dict[str, Dict[str, float]]] = {}
     charts_forecast: Dict[str, Dict[str, Any]] = {}
+    observed_stats: Dict[str, Dict[str, float]] = {}
     futures_for_advice: Dict[str, np.ndarray] = {}
     forecast_diagnostics: Dict[str, Any] = {}
     for metric_name in metrics_to_fit:
         pred, metric_scores, best, future_pred, _timing, diagnostics = computed[metric_name]
+        observed_stats[metric_name] = compute_metric_stats(source[metric_name].to_numpy(dtype=float))
         best_methods[metric_name] = best
         metrics_out[metric_name] = metric_scores
         forecast_diagnostics[metric_name] = diagnostics
@@ -115,6 +118,7 @@ def worker(
         "spec": spec if isinstance(spec, dict) else {},
         "best_methods": best_methods,
         "metrics": metrics_out,
+        "observed_stats": observed_stats,
         "charts_forecast": charts_forecast,
         "forecast_diagnostics": forecast_diagnostics,
         "resource_profile": resource_profile,

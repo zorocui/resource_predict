@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
@@ -17,6 +19,8 @@ from resource_predict.services.cluster_configs import (
     ClusterConfigValidationError,
     read_k8s_prometheus_clusters,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,10 @@ WorkloadKey = Tuple[str, str, str]
 BYTES_PER_GIB = 1024 ** 3
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def k8s_workload_prometheus_provider(
     *,
     resources: int,
@@ -105,18 +113,74 @@ def k8s_workload_prometheus_provider(
     limit = int(resources or 0)
     out: List[Dict[str, Any]] = []
     errors: List[str] = []
+    started_at = _utc_timestamp()
+    started_perf = time.perf_counter()
+    logger.info(
+        "[k8s_prometheus] fetch started: clusters=%s targets=%d resources_limit=%s history_hours=%s started_at=%s",
+        ",".join(target.cluster for target in targets),
+        len(targets),
+        "unlimited" if limit <= 0 else str(limit),
+        history_hours if history_hours is not None else "default",
+        started_at,
+    )
     for target in targets:
+        target_started_at = _utc_timestamp()
+        target_started_perf = time.perf_counter()
+        fetched_count = 0
         try:
             remaining = 0 if limit <= 0 else max(0, limit - len(out))
             if limit > 0 and remaining <= 0:
                 break
-            out.extend(_fetch_target(target, remaining, history_hours=history_hours))
+            logger.info(
+                "[k8s_prometheus] fetch target started: cluster=%s url=%s resources_limit=%s "
+                "history_hours=%s started_at=%s",
+                target.cluster,
+                target.prometheus_url,
+                "unlimited" if remaining <= 0 else str(remaining),
+                history_hours if history_hours is not None else "default",
+                target_started_at,
+            )
+            items = _fetch_target(target, remaining, history_hours=history_hours)
+            fetched_count = len(items)
+            out.extend(items)
+            target_finished_at = _utc_timestamp()
+            logger.info(
+                "[k8s_prometheus] fetch target finished: cluster=%s resources=%d elapsed=%.2fs "
+                "started_at=%s finished_at=%s",
+                target.cluster,
+                fetched_count,
+                time.perf_counter() - target_started_perf,
+                target_started_at,
+                target_finished_at,
+            )
         except Exception as exc:
             msg = f"{target.cluster}({target.prometheus_url}): {exc}"
             errors.append(msg)
+            target_finished_at = _utc_timestamp()
+            logger.error(
+                "[k8s_prometheus] fetch target failed: cluster=%s resources=%d elapsed=%.2fs "
+                "started_at=%s finished_at=%s error=%s",
+                target.cluster,
+                fetched_count,
+                time.perf_counter() - target_started_perf,
+                target_started_at,
+                target_finished_at,
+                exc,
+            )
             if cfg.fail_fast:
                 raise RuntimeError(f"K8S Prometheus 拉取失败: {msg}") from exc
 
+    finished_at = _utc_timestamp()
+    logger.info(
+        "[k8s_prometheus] fetch finished: resources=%d targets=%d errors=%d elapsed=%.2fs "
+        "started_at=%s finished_at=%s",
+        len(out),
+        len(targets),
+        len(errors),
+        time.perf_counter() - started_perf,
+        started_at,
+        finished_at,
+    )
     if not out and errors:
         raise RuntimeError("所有 K8S Prometheus 集群拉取失败: " + "；".join(errors))
     return out

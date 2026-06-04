@@ -6,23 +6,32 @@ from resource_predict.api.resources import register_resource_routes
 from resource_predict.services.store import action_priority, matches_query, safe_int
 
 
-def _resource(resource_id: str, action: str) -> dict:
+def _resource(
+    resource_id: str,
+    action: str,
+    *,
+    resource_type: str = "k8s_workload",
+    confidence: str = "medium",
+    best_methods: dict | None = None,
+) -> dict:
     return {
         "resource_id": resource_id,
-        "resource_type": "k8s_workload",
-        "scaling_advice": {"action": action, "confidence": "medium"},
+        "resource_type": resource_type,
+        "scaling_advice": {"action": action, "confidence": confidence},
+        "best_methods": best_methods or {},
         "anomaly_score": 0.0,
     }
 
 
-def _app(resources: list[dict]) -> Flask:
+def _app(resources: list[dict], details: dict[str, dict] | None = None) -> Flask:
+    details = details or {}
     app = Flask(__name__)
     helpers = {
         "safe_int": safe_int,
         "action_priority": action_priority,
         "matches_query": matches_query,
         "get_summary": lambda: {"resources": resources},
-        "get_resource_detail": lambda _resource_id: None,
+        "get_resource_detail": lambda resource_id: details.get(resource_id),
         "prediction_pending_for": lambda _resource_id: None,
     }
     register_resource_routes(app, helpers)
@@ -57,3 +66,46 @@ def test_scale_out_filter_includes_candidate_actions():
     payload = response.get_json()
     assert payload["total"] == 2
     assert [item["resource_id"] for item in payload["items"]] == ["candidate", "ready"]
+
+
+def test_advice_summary_counts_full_filtered_scope_not_current_page():
+    resources = [
+        _resource("vm-hot", "scale_out", resource_type="openstack_vm", confidence="high", best_methods={"cpu": "arima"}),
+        _resource("vm-cold", "scale_in", resource_type="openstack_vm", confidence="low", best_methods={"cpu": "rolling_mean"}),
+        _resource("wl-hot", "scale_out_candidate", confidence="high", best_methods={"cpu_limit": "arima", "memory_limit": "arima"}),
+        _resource("wl-cold", "scale_in_candidate", confidence="high", best_methods={"cpu_request": "rolling_mean"}),
+        _resource("wl-hold", "hold", confidence="medium", best_methods={"cpu_limit": "seasonal_naive"}),
+    ]
+    app = _app(resources)
+
+    response = app.test_client().get("/api/resources/advice-summary?confidence=high")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["total"] == 3
+    assert payload["action_counts"]["scale_out"] == 1
+    assert payload["action_counts"]["scale_out_candidate"] == 1
+    assert payload["action_counts"]["scale_in_candidate"] == 1
+    assert payload["resource_type_counts"] == {"openstack_vm": 1, "k8s_workload": 2}
+    assert payload["best_method_counts"]["arima"] == 3
+    assert payload["best_method_counts"]["rolling_mean"] == 1
+
+
+def test_resources_endpoint_returns_observed_stats_from_summary_item():
+    app = _app(
+        [
+            {
+                **_resource("workload", "hold"),
+                "observed_stats": {"memory_limit": {"avg": 2.5, "p95": 3.85, "peak": 4.0}},
+            }
+        ],
+    )
+
+    response = app.test_client().get("/api/resources?page_size=20")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    stats = payload["items"][0]["observed_stats"]["memory_limit"]
+    assert stats["avg"] == 2.5
+    assert stats["peak"] == 4.0
+    assert stats["p95"] == 3.85

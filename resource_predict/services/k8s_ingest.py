@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from resource_predict.data.updater import (
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _k8s_stop_event = threading.Event()
 _k8s_scheduler_thread: Optional[threading.Thread] = None
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def fetch_k8s_prometheus_items(
@@ -50,15 +55,35 @@ def run_k8s_prometheus_upsert(
     full_refresh: bool = False,
 ) -> Dict[str, Any]:
     """Fetch K8S Workload metrics from Prometheus and merge them into outputs."""
+    cluster_list = list(clusters) if clusters is not None else None
     mark_external_update_started("fetching_k8s_prometheus", "正在从 K8S Prometheus 拉取 Workload 指标")
     try:
         out_dir = scoped_out_dir("k8s", settings.app.out_dir)
         history_hours = _history_hours_for_fetch(
             out_dir=out_dir,
-            clusters=clusters,
+            clusters=cluster_list,
             full_refresh=full_refresh,
         )
-        items = fetch_k8s_prometheus_items(clusters, history_hours=history_hours)
+        fetch_started_at = _utc_timestamp()
+        fetch_started_perf = time.perf_counter()
+        logger.info(
+            "[k8s_ingest] K8S Prometheus fetch started: clusters=%s history_hours=%s "
+            "full_refresh=%s started_at=%s",
+            ",".join(str(x) for x in cluster_list) if cluster_list else "all",
+            history_hours if history_hours is not None else "default",
+            full_refresh,
+            fetch_started_at,
+        )
+        items = fetch_k8s_prometheus_items(cluster_list, history_hours=history_hours)
+        fetch_finished_at = _utc_timestamp()
+        logger.info(
+            "[k8s_ingest] K8S Prometheus fetch finished: resources=%d elapsed=%.2fs "
+            "started_at=%s finished_at=%s",
+            len(items),
+            time.perf_counter() - fetch_started_perf,
+            fetch_started_at,
+            fetch_finished_at,
+        )
 
         result = run_upsert_with_data(items, fail_if_busy=fail_if_busy, out_dir=out_dir)
         if not result.get("success"):

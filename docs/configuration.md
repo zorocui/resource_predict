@@ -214,6 +214,7 @@ outputs/
 ### `summary_index.json`
 
 资源列表摘要，包含扩缩容建议、紧急度、预测方法选择和 anomaly_score。前端列表页直接读取此文件。
+每个资源还包含轻量 `observed_stats`，按指标保存历史观测窗口的 `avg`、`p95`、`peak`，风险队列和详情抽屉统一读取该字段展示历史统计。
 
 ### `manifest.json`
 

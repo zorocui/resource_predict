@@ -38,22 +38,31 @@
 
   async function loadQueue({ keepSelection = false } = {}) {
     app.els.summaryText.textContent = "正在加载资源...";
-    const [payload, summaryPayload, forecastPayload] = await Promise.all([
+    const [payload, summaryPayload, overviewPayload, forecastPayload] = await Promise.all([
       api.requestJson(api.buildQuery("/api/resources", {
         page: app.state.page,
         page_size: app.state.pageSize,
         sort_by: "urgency_score",
         resource_type: app.state.resourceTypeFilter,
         action: app.state.actionFilter,
+        confidence: app.state.confidenceFilter,
         q: app.state.query,
       })),
       api.requestJson(api.buildQuery("/api/resources/advice-summary", {
         resource_type: app.state.resourceTypeFilter,
+        confidence: app.state.confidenceFilter,
+        q: app.state.query,
+      })),
+      api.requestJson(api.buildQuery("/api/resources/advice-summary", {
+        resource_type: app.state.resourceTypeFilter,
+        action: app.state.actionFilter,
+        confidence: app.state.confidenceFilter,
         q: app.state.query,
       })),
       api.requestJson("/api/forecast-config", 1),
     ]);
     app.state.adviceSummary = summaryPayload;
+    app.state.overviewSummary = overviewPayload;
     app.state.forecastConfigPayload = forecastPayload;
     const items = payload.items || [];
     if (!keepSelection) app.state.selectedResourceId = "";
@@ -71,9 +80,7 @@
   function applyConfidenceFilter(value) {
     app.state.confidenceFilter = value || "";
     app.state.page = 1;
-    app.state.visibleItems = list.applyClientFilters(app.state.loadedItems);
-    list.renderRows();
-    list.syncFilterButtons();
+    loadQueue();
   }
 
   function resetFilters() {

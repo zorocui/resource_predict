@@ -4,6 +4,7 @@ These notes capture project-specific mistakes already encountered in this repo. 
 
 - Treat `README.md` as a CentOS/Linux-facing document. Use `bash` command blocks, `source .venv/bin/activate`, `export ...`, and `python ...`; do not introduce PowerShell commands.
 - Edit text files as UTF-8. Do not use PowerShell `Set-Content` for Chinese Markdown or source text unless encoding is explicitly verified. Prefer `apply_patch` for manual edits.
+- PowerShell tool output may render Chinese text as mojibake even when the underlying UTF-8 files are correct. Treat this as a terminal display issue by default; verify with UTF-8 reads or `git diff` only when file encoding is genuinely in doubt, and avoid spending extra tokens re-investigating the same display artifact.
 - README.md is a quick-start guide (~270 lines). Detailed docs live in `docs/`. Keep README concise with architecture diagrams, commands, API summary, and links to docs/.
 - To reduce token and output waste, exclude generated/vendor-heavy paths from normal searches unless explicitly needed: `outputs/`, `static/vendor/`, `.venv/`, `.pytest_cache/`, `.playwright-cli/`.
 - Do not leave compatibility shim files when the user asks to remove old names. Remove old files and update references instead.

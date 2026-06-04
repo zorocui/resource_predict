@@ -198,7 +198,7 @@ class K8SPrometheusConfig:
     # 全局命名空间过滤正则；单集群未配置 namespace_regex 时使用该值。
     namespace_regex: str = ""
     # Prometheus HTTP 请求超时时间，单位秒。
-    request_timeout_seconds: int = 30
+    request_timeout_seconds: int = 300
     # 多集群拉取时是否遇到任一集群失败就立即中断；False 表示尽量保留成功集群。
     fail_fast: bool = False
     # 是否启用 K8S Prometheus 后台定时拉取；关闭时仍可手动通过 API 或 CLI 触发。

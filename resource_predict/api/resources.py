@@ -23,6 +23,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         resources = summary.get("resources", []) if isinstance(summary, dict) else []
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
+        confidence_filter = _normalize_confidence_filter(request.args.get("confidence"))
         resource_type_filter = _normalize_resource_type_filter(request.args.get("resource_type"))
         sort_by = (request.args.get("sort_by") or "urgency_score").strip().lower()
         top_n = safe_int(request.args.get("top_n"), 0)
@@ -35,6 +36,8 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             rows = [x for x in rows if resource_type_of(x) == resource_type_filter]
         if q:
             rows = [x for x in rows if matches_query(x, q)]
+        if confidence_filter:
+            rows = [x for x in rows if _confidence_of(x) == confidence_filter]
         if action_filter in {"scale_out", "scale_in", "hold", "mixed", "scale_out_candidate", "scale_in_candidate", "insufficient_data"}:
             if action_filter == "mixed":
                 rows = [
@@ -85,21 +88,31 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         resources = summary.get("resources", []) if isinstance(summary, dict) else []
         q = (request.args.get("q") or "").strip().lower()
         action_filter = (request.args.get("action") or "").strip().lower()
+        confidence_filter = _normalize_confidence_filter(request.args.get("confidence"))
         resource_type_filter = _normalize_resource_type_filter(request.args.get("resource_type"))
         rows = [x for x in resources if isinstance(x, dict)]
         if resource_type_filter:
             rows = [x for x in rows if resource_type_of(x) == resource_type_filter]
         if q:
             rows = [x for x in rows if matches_query(x, q)]
-        if action_filter in {"scale_out", "scale_in", "hold", "scale_out_candidate", "scale_in_candidate", "insufficient_data"}:
-            rows = [
-                x
-                for x in rows
-                if _matches_action_filter(
-                    str((x.get("scaling_advice", {}) or {}).get("action", "hold")).lower(),
-                    action_filter,
-                )
-            ]
+        if confidence_filter:
+            rows = [x for x in rows if _confidence_of(x) == confidence_filter]
+        if action_filter in {"scale_out", "scale_in", "hold", "mixed", "scale_out_candidate", "scale_in_candidate", "insufficient_data"}:
+            if action_filter == "mixed":
+                rows = [
+                    x for x in rows
+                    if bool((x.get("scaling_advice", {}) or {}).get("has_mixed_signals"))
+                ]
+            else:
+                rows = [
+                    x
+                    for x in rows
+                    if _matches_action_filter(
+                        str((x.get("scaling_advice", {}) or {}).get("action", "hold")).lower(),
+                        action_filter,
+                    )
+                    and not bool((x.get("scaling_advice", {}) or {}).get("has_mixed_signals"))
+                ]
 
         counts = {
             "scale_out": 0,
@@ -111,11 +124,11 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             "insufficient_data": 0,
         }
         confidence_counts = {"high": 0, "medium": 0, "low": 0}
+        resource_type_counts: Dict[str, int] = {}
+        best_method_counts: Dict[str, int] = {}
         for item in rows:
             advice = item.get("scaling_advice", {})
-            confidence = str(advice.get("confidence", "medium"))
-            if confidence not in confidence_counts:
-                confidence = "medium"
+            confidence = _confidence_of(item)
             if bool(advice.get("has_mixed_signals")):
                 counts["mixed"] += 1
             else:
@@ -124,12 +137,22 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                     action = "hold"
                 counts[action] += 1
             confidence_counts[confidence] += 1
+            rtype = resource_type_of(item)
+            resource_type_counts[rtype] = resource_type_counts.get(rtype, 0) + 1
+            best_methods = item.get("best_methods", {})
+            if isinstance(best_methods, dict):
+                for method in best_methods.values():
+                    key = str(method or "").strip()
+                    if key:
+                        best_method_counts[key] = best_method_counts.get(key, 0) + 1
 
         return jsonify(
             {
                 "total": len(rows),
                 "action_counts": counts,
                 "confidence_counts": confidence_counts,
+                "resource_type_counts": resource_type_counts,
+                "best_method_counts": best_method_counts,
             }
         )
     @app.get("/api/resources/<resource_id>")
@@ -179,6 +202,17 @@ def _normalize_resource_type_filter(value: Any) -> str:
     if not raw:
         return ""
     return resource_type_of({"resource_type": raw})
+
+
+def _normalize_confidence_filter(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in {"high", "medium", "low"} else ""
+
+
+def _confidence_of(item: Dict[str, Any]) -> str:
+    advice = item.get("scaling_advice", {}) if isinstance(item, dict) else {}
+    confidence = str((advice or {}).get("confidence", "medium")).lower()
+    return confidence if confidence in {"high", "medium", "low"} else "medium"
 
 
 def _matches_action_filter(action: str, action_filter: str) -> bool:

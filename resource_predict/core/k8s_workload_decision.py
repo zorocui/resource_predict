@@ -176,7 +176,13 @@ def _recommend_k8s_policy(
         policy["notes"].append(
             "replica scale-in requires both CPU and memory to be low; per-resource recommendations remain available"
         )
-    if any(v == "scale_out_candidate" for v in metric_actions.values()):
+    has_mixed_signals = (
+        "scale_out_candidate" in set(metric_actions.values())
+        and "scale_in_candidate" in set(metric_actions.values())
+    )
+    if has_mixed_signals:
+        policy["notes"].append("CPU and memory have mixed scale signals; review combined target before execution")
+    if metric_actions.get("cpu") == "scale_out_candidate":
         policy["notes"].append("consider HPA when CPU drives the recommendation")
     if any(v == "scale_in_candidate" for v in metric_actions.values()):
         policy["notes"].append("apply gradually and observe one cooldown window")
@@ -207,11 +213,11 @@ def _round_k8s_even_target(value: float, *, action: str, base: float) -> int | f
     避免 0.5C 级别的 request/limit 被直接放大到 2C。
     """
     if action == "scale_in_candidate":
-        if base < 2.0:
-            # 小规格 workload 缩容时向上取到 2 会超过原始 base，跳过 per-replica 推荐
-            return None
-        rounded = int(np.floor(float(value) / 2.0) * 2)
-        rounded = max(2, rounded)
+        if float(value) < 2.0:
+            rounded = _round_small_k8s_target(value)
+        else:
+            rounded = int(np.floor(float(value) / 2.0) * 2)
+            rounded = max(2, rounded)
         if rounded >= float(base):
             return None
         return rounded
@@ -228,6 +234,12 @@ def _round_k8s_even_target_limit(
     current_limit: float | None,
     request: int | float,
 ) -> int | float:
+    if action == "scale_in_candidate":
+        target = max(float(value), float(request))
+        if target < 2.0:
+            return _round_small_k8s_target(target)
+        return max(request, int(np.floor(target / 2.0) * 2), 2)
+
     largest_small_value = max(
         float(value),
         float(request),
@@ -603,6 +615,7 @@ def build_k8s_workload_advice(
             decision_stats[metric] = st_limit if has_limit else st_request
 
     actions = set(metric_actions.values())
+    has_mixed_signals = "scale_out_candidate" in actions and "scale_in_candidate" in actions
     if "scale_out_candidate" in actions:
         action = "scale_out_candidate"
     elif "scale_in_candidate" in actions:
@@ -694,6 +707,7 @@ def build_k8s_workload_advice(
             else "ready for execution review",
         },
         "metric_actions": metric_actions,
+        "has_mixed_signals": has_mixed_signals,
         "metric_reasons": metric_reasons,
         "stats": decision_stats,
         "signal_stats": by_metric,
