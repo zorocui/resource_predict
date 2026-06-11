@@ -66,6 +66,8 @@
 
 - `timestamps`：毫秒级 Unix 时间戳（也支持秒级和 ISO 字符串）
 - `values`：使用率小数 `[0, 1]`
+- K8S Workload 可额外携带 `container_metrics.<container>.<metric>`；系统会继续保留 Workload 级 `metrics` 作为汇总视图，并对 container 级序列分别预测。资源详情会返回 `container_charts.<container>.<metric>`，前端在同一 ECharts 图中展示多个 container 的实际/预测曲线。
+- 多 container Workload 的 request/limit 建议写入 `scaling_advice.target_spec.containers.<container>`；副本数建议仍写入 Workload 级 `scaling_advice.target_spec.replicas`。
 - `/api/update-data` 和 `/api/upsert-data` 均为异步接口（HTTP 202），合并与预测在后台线程执行
 - `/api/upsert-data` 新增资源时，该资源必须提供所有指标的完整非空序列
 - 并发冲突时返回 HTTP 409，查询 `/api/update-status` 确认当前状态
@@ -269,7 +271,7 @@ curl http://127.0.0.1:5000/api/update-status
 | `kube_pod_container_resource_requests*` | CPU/Memory request |
 | `kube_pod_container_resource_limits*` | CPU/Memory limit |
 
-Provider 会把 Pod/Container 序列聚合为 `k8s_workload`，resource_id 格式为：
+Provider 会把 Pod/Container 序列聚合为 `k8s_workload`，同时保留 `container_metrics` 供 container 级预测和图表展示。resource_id 格式为：
 
 ```text
 k8s:<cluster>:<namespace>:<workload-kind>:<workload-name>

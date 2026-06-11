@@ -54,8 +54,10 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([0.9, 0.95, 1.0]),
-                "memory": np.array([0.5, 0.55, 0.6]),
+                "cpu_limit": np.array([0.9, 0.95, 1.0]),
+                "cpu_request": np.array([0.9, 0.95, 1.0]),
+                "memory_limit": np.array([0.5, 0.55, 0.6]),
+                "memory_request": np.array([0.5, 0.55, 0.6]),
             },
             resource=resource,
         )
@@ -78,7 +80,12 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         }
 
         advice = build_k8s_workload_advice(
-            {"cpu": np.array([0.9, 0.95]), "memory": np.array([0.8, 0.85])},
+            {
+                "cpu_limit": np.array([0.9, 0.95]),
+                "cpu_request": np.array([0.9, 0.95]),
+                "memory_limit": np.array([0.8, 0.85]),
+                "memory_request": np.array([0.8, 0.85]),
+            },
             resource=resource,
         )
 
@@ -106,8 +113,10 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([0.92, 0.95, 0.98]),
-                "memory": np.array([0.82, 0.86, 0.9]),
+                "cpu_limit": np.array([0.92, 0.95, 0.98]),
+                "cpu_request": np.array([0.92, 0.95, 0.98]),
+                "memory_limit": np.array([0.82, 0.86, 0.9]),
+                "memory_request": np.array([0.82, 0.86, 0.9]),
             },
             resource=resource,
         )
@@ -130,6 +139,134 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
             advice["target_spec"]["replicas"],
         )
 
+    def test_multi_container_targets_use_container_granularity(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 2,
+                "containers_observed": ["app", "sidecar"],
+                "containers": {
+                    "app": {
+                        "cpu_request_cores": 1.0,
+                        "cpu_limit_cores": 1.0,
+                        "memory_request_gb": 1.0,
+                        "memory_limit_gb": 1.0,
+                    },
+                    "sidecar": {
+                        "cpu_request_cores": 0.5,
+                        "cpu_limit_cores": 0.5,
+                        "memory_request_gb": 0.5,
+                        "memory_limit_gb": 0.5,
+                    },
+                },
+            },
+            "data_quality": _quality("good"),
+            "container_data_quality": {
+                "app": _quality("good"),
+                "sidecar": _quality("good"),
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu_limit": np.array([0.9, 0.95, 0.98]),
+                "cpu_request": np.array([0.9, 0.95, 0.98]),
+                "memory_limit": np.array([0.8, 0.85, 0.9]),
+                "memory_request": np.array([0.8, 0.85, 0.9]),
+            },
+            resource=resource,
+            container_future_values={
+                "app": {
+                    "cpu_limit": np.array([0.9, 0.95, 0.98]),
+                    "cpu_request": np.array([0.9, 0.95, 0.98]),
+                    "memory_limit": np.array([0.8, 0.85, 0.9]),
+                    "memory_request": np.array([0.8, 0.85, 0.9]),
+                },
+                "sidecar": {
+                    "cpu_limit": np.array([0.1, 0.12, 0.11]),
+                    "cpu_request": np.array([0.1, 0.12, 0.11]),
+                    "memory_limit": np.array([0.1, 0.12, 0.11]),
+                    "memory_request": np.array([0.1, 0.12, 0.11]),
+                },
+            },
+        )
+
+        target = advice["target_spec"]
+        self.assertIn("containers", target)
+        self.assertIn("app", target["containers"])
+        self.assertNotIn("cpu_request_cores", target)
+        self.assertNotIn("memory_request_gb", target)
+        self.assertGreater(target["replicas"], 2)
+        self.assertIn("container_recommendations", advice["target_k8s_policy"])
+
+    def test_container_target_promotes_top_level_action(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 3,
+                "containers_observed": ["app", "sidecar"],
+                "containers": {
+                    "app": {
+                        "cpu_request_cores": 1.0,
+                        "cpu_limit_cores": 1.0,
+                        "memory_request_gb": 1.0,
+                        "memory_limit_gb": 1.0,
+                    },
+                    "sidecar": {
+                        "cpu_request_cores": 0.5,
+                        "cpu_limit_cores": 0.5,
+                        "memory_request_gb": 0.5,
+                        "memory_limit_gb": 0.5,
+                    },
+                },
+            },
+            "data_quality": _quality("good"),
+            "container_data_quality": {
+                "app": _quality("good"),
+                "sidecar": _quality("good"),
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu_limit": np.array([0.5, 0.5, 0.5]),
+                "cpu_request": np.array([0.5, 0.5, 0.5]),
+                "memory_limit": np.array([0.5, 0.5, 0.5]),
+                "memory_request": np.array([0.5, 0.5, 0.5]),
+            },
+            resource=resource,
+            container_future_values={
+                "app": {
+                    "cpu_limit": np.array([0.9, 0.95, 0.98]),
+                    "cpu_request": np.array([0.9, 0.95, 0.98]),
+                    "memory_limit": np.array([0.8, 0.85, 0.9]),
+                    "memory_request": np.array([0.8, 0.85, 0.9]),
+                },
+                "sidecar": {
+                    "cpu_limit": np.array([0.1, 0.12, 0.11]),
+                    "cpu_request": np.array([0.1, 0.12, 0.11]),
+                    "memory_limit": np.array([0.1, 0.12, 0.11]),
+                    "memory_request": np.array([0.1, 0.12, 0.11]),
+                },
+            },
+        )
+
+        self.assertEqual(advice["action"], "scale_out_candidate")
+        self.assertEqual(advice["metric_actions"]["cpu"], "scale_out_candidate")
+        self.assertEqual(advice["metric_actions"]["memory"], "scale_out_candidate")
+        self.assertIn("app", advice["target_spec"]["containers"])
+        self.assertGreater(advice["confidence_score"], 50)
+
     def test_scale_out_preserves_small_request_limit_granularity(self):
         resource = {
             "resource_id": "k8s:cluster:ns:deployment:api",
@@ -150,8 +287,10 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([0.92, 0.95, 0.98]),
-                "memory": np.array([0.82, 0.86, 0.9]),
+                "cpu_limit": np.array([0.92, 0.95, 0.98]),
+                "cpu_request": np.array([0.92, 0.95, 0.98]),
+                "memory_limit": np.array([0.82, 0.86, 0.9]),
+                "memory_request": np.array([0.82, 0.86, 0.9]),
             },
             resource=resource,
         )
@@ -249,8 +388,10 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([8.0, 10.0, 12.0]),
-                "memory": np.array([9.0, 11.0, 13.0]),
+                "cpu_limit": np.array([0.45, 0.5, 0.55]),
+                "cpu_request": np.array([8.0, 10.0, 12.0]),
+                "memory_limit": np.array([0.45, 0.5, 0.55]),
+                "memory_request": np.array([9.0, 11.0, 13.0]),
             },
             resource=resource,
         )

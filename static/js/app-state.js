@@ -95,6 +95,7 @@
     chartAuxiliaryVisible: true,
     chartRangeKey: "3d",
     chartModeKey: "trend",
+    selectedContainerByResourceMetric: new Map(),
     detailChartInstance: null,
     modalChartInstance: null,
     chartDataByKey: new Map(),

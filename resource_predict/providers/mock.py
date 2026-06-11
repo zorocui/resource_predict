@@ -18,6 +18,41 @@ import pandas as pd
 from resource_predict.resource_types import metric_names_for_resource
 
 
+def _positive_float(value: Any) -> float | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if np.isfinite(n) and n > 0 else None
+
+
+def _normalize_usage(raw_usage: np.ndarray, base: Any) -> np.ndarray:
+    base_value = _positive_float(base)
+    if base_value is None:
+        return raw_usage
+    return raw_usage / base_value
+
+
+def _sum_positive(values: List[Any]) -> float | None:
+    nums = [_positive_float(value) for value in values]
+    total = sum(value for value in nums if value is not None)
+    return total if total > 0 else None
+
+
+def _aggregate_normalized(raw_by_container: Dict[str, np.ndarray], bases_by_container: Dict[str, Any]) -> np.ndarray:
+    scoped = [
+        raw_by_container[name]
+        for name, base in bases_by_container.items()
+        if _positive_float(base) is not None and name in raw_by_container
+    ]
+    base_total = _sum_positive(list(bases_by_container.values()))
+    if scoped and base_total is not None:
+        return np.sum(scoped, axis=0) / base_total
+    if raw_by_container:
+        return np.sum(list(raw_by_container.values()), axis=0)
+    return np.array([], dtype=float)
+
+
 # ---------------------------------------------------------------------------
 # 增量数据模拟：基于现有序列末尾趋势，生成后续数据点
 # ---------------------------------------------------------------------------
@@ -255,6 +290,8 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
         cpu_limit = cpu_limits[i % len(cpu_limits)]
         memory_request = memory_requests[i % len(memory_requests)]
         memory_limit = memory_limits[i % len(memory_limits)]
+        total_cpu_base = _sum_positive([cpu_limit, cpu_request]) or 1.0
+        total_memory_base = _sum_positive([memory_limit, memory_request]) or 1.0
         container_specs = {
             name: {
                 "cpu_request_cores": cpu_request,
@@ -264,6 +301,52 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
             }
             for name in containers
         }
+        container_metrics: Dict[str, Dict[str, Any]] = {}
+        container_data_quality: Dict[str, Dict[str, Any]] = {}
+        container_metric_modes: Dict[str, Dict[str, str]] = {}
+        raw_cpu_by_container: Dict[str, np.ndarray] = {}
+        raw_memory_by_container: Dict[str, np.ndarray] = {}
+        for pos, name in enumerate(containers):
+            weight = 0.82 if name == "app" else 0.18
+            jitter = np.random.default_rng(base_seed + i * 17 + pos).normal(0, 0.015, size=n)
+            c_cpu_raw = np.clip(cpu * total_cpu_base * weight + jitter, 0.0, None)
+            c_memory_raw = np.clip(memory * total_memory_base * weight + jitter, 0.0, None)
+            raw_cpu_by_container[name] = c_cpu_raw
+            raw_memory_by_container[name] = c_memory_raw
+            container_metrics[name] = {
+                "cpu_limit": {"timestamps": idx_list, "values": _normalize_usage(c_cpu_raw, cpu_limit).astype(float).tolist()},
+                "cpu_request": {"timestamps": idx_list, "values": _normalize_usage(c_cpu_raw, cpu_request).astype(float).tolist()},
+                "memory_limit": {"timestamps": idx_list, "values": _normalize_usage(c_memory_raw, memory_limit).astype(float).tolist()},
+                "memory_request": {"timestamps": idx_list, "values": _normalize_usage(c_memory_raw, memory_request).astype(float).tolist()},
+            }
+            container_data_quality[name] = {
+                "cpu_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                "cpu_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                "memory_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                "memory_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+            }
+            container_metric_modes[name] = {
+                "cpu_limit": "cpu_usage/cpu_limit" if cpu_limit else "cpu_usage_cores",
+                "cpu_request": "cpu_usage/cpu_request" if cpu_request else "cpu_usage_cores",
+                "memory_limit": "memory_working_set/memory_limit" if memory_limit else "memory_working_set_gb",
+                "memory_request": "memory_working_set/memory_request" if memory_request else "memory_working_set_gb",
+            }
+        cpu_limit_values = _aggregate_normalized(
+            raw_cpu_by_container,
+            {name: container_specs[name]["cpu_limit_cores"] for name in containers},
+        )
+        cpu_request_values = _aggregate_normalized(
+            raw_cpu_by_container,
+            {name: container_specs[name]["cpu_request_cores"] for name in containers},
+        )
+        memory_limit_values = _aggregate_normalized(
+            raw_memory_by_container,
+            {name: container_specs[name]["memory_limit_gb"] for name in containers},
+        )
+        memory_request_values = _aggregate_normalized(
+            raw_memory_by_container,
+            {name: container_specs[name]["memory_request_gb"] for name in containers},
+        )
         out.append(
             {
                 "resource_id": f"k8s:{clusters[i % len(clusters)]}:{namespace}:{owner_kind.lower()}:{workload_name}",
@@ -286,10 +369,10 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
                     "memory_request_metric_mode": "memory_working_set/memory_request" if memory_request else "memory_working_set_gb",
                 },
                 "metrics": {
-                    "cpu_limit": {"timestamps": idx_list, "values": cpu.astype(float).tolist()},
-                    "cpu_request": {"timestamps": idx_list, "values": cpu.astype(float).tolist()},
-                    "memory_limit": {"timestamps": idx_list, "values": memory.astype(float).tolist()},
-                    "memory_request": {"timestamps": idx_list, "values": memory.astype(float).tolist()},
+                    "cpu_limit": {"timestamps": idx_list, "values": cpu_limit_values.astype(float).tolist()},
+                    "cpu_request": {"timestamps": idx_list, "values": cpu_request_values.astype(float).tolist()},
+                    "memory_limit": {"timestamps": idx_list, "values": memory_limit_values.astype(float).tolist()},
+                    "memory_request": {"timestamps": idx_list, "values": memory_request_values.astype(float).tolist()},
                 },
                 "data_quality": {
                     "cpu_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
@@ -297,6 +380,9 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
                     "memory_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
                     "memory_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
                 },
+                "container_metrics": container_metrics,
+                "container_data_quality": container_data_quality,
+                "container_metric_modes": container_metric_modes,
             }
         )
     return out

@@ -57,7 +57,7 @@ python -m pytest -q
 
 - 根目录只放直接运行的 CLI 或项目级配置文件
 - 所有业务逻辑放入 `resource_predict/` 包内，CLI 只做参数解析和输出
-- 新增 K8S 相关代码使用 `workload` 命名；`pod` 仅作为 Prometheus 标签或历史产物兼容词
+- 新增 K8S 相关代码使用 `workload` 命名；`pod` 仅作为 Prometheus / Kubernetes 标签或观测字段
 - 预测产物统一称为 `outputs` 或 `forecast artifacts`，不使用 `images` 命名
 - 注释和日志消息使用中文
 
@@ -73,9 +73,9 @@ python -m pytest -q
 | 规范名 | 来源字符串 | 指标集 |
 | --- | --- | --- |
 | `openstack_vm` | `openstack`, `vm`, `openstack_vm` | `cpu`, `memory`, `disk` |
-| `k8s_workload` | `k8s_workload`, `workload`, `controller`, `k8s_controller`, `pod`, `k8s_pod`, `k8s`, `kubernetes`, `container`, `k8s_container` | `cpu_limit`, `cpu_request`, `memory_limit`, `memory_request` |
+| `k8s_workload` | `k8s_workload`, `workload`, `controller`, `k8s`, `kubernetes` | `cpu_limit`, `cpu_request`, `memory_limit`, `memory_request` |
 
-使用 `resource_type_of(item)` 归一化类型，使用 `metric_names_for_resource(item)` 获取指标名列表。所有 K8S 相关字符串统一归一到 `k8s_workload`。
+使用 `resource_type_of(item)` 归一化类型，使用 `metric_names_for_resource(item)` 获取指标名列表。历史资源类型输入（如 `pod`、`k8s_pod`、`container`、`k8s_container`）不再兼容；开发阶段数据可重新导入为 `k8s_workload`。
 
 ## Provider 接口
 

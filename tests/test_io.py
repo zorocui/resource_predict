@@ -142,6 +142,48 @@ class RawDatasetRoundtripTest(unittest.TestCase):
         # Metric values should survive the roundtrip approximately
         self.assertAlmostEqual(loaded["cpu"].iloc[0], 0.1, places=4)
 
+    def test_write_then_read_k8s_container_metrics(self):
+        idx = pd.date_range("2024-01-01", periods=12, freq="h")
+        series = pd.Series(np.linspace(0.1, 0.6, 12), index=idx)
+        res = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "containers_observed": ["app"],
+                "containers": {
+                    "app": {
+                        "cpu_request_cores": 0.5,
+                        "cpu_limit_cores": 1.0,
+                        "memory_request_gb": 0.5,
+                        "memory_limit_gb": 1.0,
+                    }
+                },
+            },
+            "cpu_limit": series,
+            "cpu_request": series,
+            "memory_limit": series,
+            "memory_request": series,
+            "container_metrics": {
+                "app": {
+                    "cpu_limit": series,
+                    "cpu_request": series,
+                    "memory_limit": series,
+                    "memory_request": series,
+                }
+            },
+            "container_data_quality": {"app": {"cpu_limit": {"level": "good"}}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw_data.json"
+            write_raw_dataset(path, [res], freq="h")
+            prepared_list, _meta = read_raw_dataset(path)
+
+        loaded = prepared_list[0]
+        self.assertIn("container_metrics", loaded)
+        self.assertIsInstance(loaded["container_metrics"]["app"]["cpu_limit"], pd.Series)
+        self.assertAlmostEqual(loaded["container_metrics"]["app"]["cpu_limit"].iloc[-1], 0.6)
+        self.assertEqual(loaded["container_data_quality"]["app"]["cpu_limit"]["level"], "good")
+
     def test_read_missing_file_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "nonexistent.json"
@@ -190,6 +232,59 @@ class MergeChartsIntoDetailTest(unittest.TestCase):
         self.assertEqual(len(cpu_chart["y_train"]), n - test_size)
         self.assertEqual(len(cpu_chart["y_test"]), test_size)
         self.assertEqual(cpu_chart["best_method"], "arima")
+
+    def test_merges_container_charts(self):
+        n = 30
+        test_size = 5
+        series = self._make_raw_series(n)
+        raw = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {},
+            "cpu_limit": series,
+            "cpu_request": series,
+            "memory_limit": series,
+            "memory_request": series,
+            "container_metrics": {
+                "app": {
+                    "cpu_limit": series,
+                    "cpu_request": series,
+                    "memory_limit": series,
+                    "memory_request": series,
+                }
+            },
+        }
+        detail = {
+            "resource_id": raw["resource_id"],
+            "charts_forecast": {
+                "cpu_limit": {
+                    "preds": {"arima": [0.5]},
+                    "x_pred_ms": [1],
+                    "preds_future": {"arima": [0.6]},
+                    "metrics": {},
+                    "best_method": "arima",
+                }
+            },
+            "container_charts_forecast": {
+                "app": {
+                    "cpu_limit": {
+                        "preds": {"arima": [0.5]},
+                        "x_pred_ms": [1],
+                        "preds_future": {"arima": [0.6]},
+                        "metrics": {},
+                        "best_method": "arima",
+                    }
+                }
+            },
+        }
+        result = merge_charts_into_detail(detail, {raw["resource_id"]: raw}, test_size=test_size)
+
+        self.assertIn("container_charts", result)
+        app_cpu = result["container_charts"]["app"]["cpu_limit"]
+        self.assertEqual(len(app_cpu["y_train"]), n - test_size)
+        self.assertEqual(len(app_cpu["y_test"]), test_size)
+        self.assertEqual(app_cpu["best_method"], "arima")
+        self.assertNotIn("container_charts_forecast", result)
 
     def test_skips_if_already_has_y_train(self):
         """Detail already containing y_train is returned unchanged."""

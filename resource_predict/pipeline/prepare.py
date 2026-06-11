@@ -104,6 +104,16 @@ def build_prepared_data(
                     prepared_item["data_quality"] = item["data_quality"]
                 for metric_name in metric_names_for_resource(prepared_item):
                     prepared_item[metric_name] = coerce_metric_series(metrics.get(metric_name), metric_name)
+                container_metrics = _prepare_container_metrics(
+                    item.get("container_metrics"),
+                    metric_names_for_resource(prepared_item),
+                )
+                if container_metrics:
+                    prepared_item["container_metrics"] = container_metrics
+                if isinstance(item.get("container_data_quality"), dict):
+                    prepared_item["container_data_quality"] = item["container_data_quality"]
+                if isinstance(item.get("container_metric_modes"), dict):
+                    prepared_item["container_metric_modes"] = item["container_metric_modes"]
 
                 min_len = min(len(prepared_item[m]) for m in metric_names_for_resource(prepared_item))
                 if test_size > 0 and min_len <= test_size:
@@ -157,4 +167,22 @@ def build_prepared_data(
                 "disk": y_disk,
             }
         )
+    return out
+
+
+def _prepare_container_metrics(value: Any, metric_names: tuple[str, ...]) -> Dict[str, Dict[str, pd.Series]]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Dict[str, pd.Series]] = {}
+    for container, metrics in value.items():
+        name = str(container or "").strip()
+        if not name or not isinstance(metrics, dict):
+            continue
+        metric_out: Dict[str, pd.Series] = {}
+        for metric in metric_names:
+            if metric not in metrics:
+                continue
+            metric_out[metric] = coerce_metric_series(metrics.get(metric), f"{name}.{metric}")
+        if metric_out:
+            out[name] = metric_out
     return out

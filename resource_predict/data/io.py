@@ -146,7 +146,35 @@ def prepared_dict_to_raw_record(p: Dict[str, Any]) -> Dict[str, Any]:
     }
     if isinstance(p.get("data_quality"), dict):
         rec["data_quality"] = p["data_quality"]
+    container_metrics = _serialize_container_metric_series(p.get("container_metrics"))
+    if container_metrics:
+        rec["container_metrics"] = container_metrics
+    if isinstance(p.get("container_data_quality"), dict):
+        rec["container_data_quality"] = p["container_data_quality"]
+    if isinstance(p.get("container_metric_modes"), dict):
+        rec["container_metric_modes"] = p["container_metric_modes"]
     return rec
+
+
+def _serialize_container_metric_series(value: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for container, metrics in value.items():
+        name = str(container or "").strip()
+        if not name or not isinstance(metrics, dict):
+            continue
+        metric_out: Dict[str, Dict[str, Any]] = {}
+        for metric, series in metrics.items():
+            if not isinstance(series, pd.Series):
+                continue
+            metric_out[str(metric)] = {
+                "timestamps": _timestamps_ms_from_index(series.index),
+                "values": _series_to_lists(series),
+            }
+        if metric_out:
+            out[name] = metric_out
+    return out
 
 
 def write_raw_dataset(path: Path, prepared_resources: List[Dict[str, Any]], *, freq: str) -> None:
@@ -192,12 +220,40 @@ def read_raw_dataset(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             if metric not in metrics:
                 raise ValueError(f"{rid} 缺少 {metric} 指标")
             item[metric] = coerce_metric_series(metrics.get(metric), metric)
+        container_metrics = _coerce_container_metric_series(
+            rec.get("container_metrics"),
+            metric_names_for_resource(item),
+        )
+        if container_metrics:
+            item["container_metrics"] = container_metrics
+        if isinstance(rec.get("container_data_quality"), dict):
+            item["container_data_quality"] = rec["container_data_quality"]
+        if isinstance(rec.get("container_metric_modes"), dict):
+            item["container_metric_modes"] = rec["container_metric_modes"]
         prepared.append(item)
     return prepared, meta if isinstance(meta, dict) else {}
 
 
 def index_prepared_by_id(prepared: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(p["resource_id"]): p for p in prepared}
+
+
+def _coerce_container_metric_series(value: Any, metric_names: Tuple[str, ...]) -> Dict[str, Dict[str, pd.Series]]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Dict[str, pd.Series]] = {}
+    for container, metrics in value.items():
+        name = str(container or "").strip()
+        if not name or not isinstance(metrics, dict):
+            continue
+        metric_out: Dict[str, pd.Series] = {}
+        for metric in metric_names:
+            if metric not in metrics:
+                continue
+            metric_out[metric] = coerce_metric_series(metrics.get(metric), f"{name}.{metric}")
+        if metric_out:
+            out[name] = metric_out
+    return out
 
 
 def merge_charts_into_detail(
@@ -252,7 +308,56 @@ def merge_charts_into_detail(
             "best_method": block.get("best_method", ""),
         }
     out["charts"] = merged_charts
+    container_charts = _merge_container_charts(raw, detail, test_size=test_size)
+    if container_charts:
+        out["container_charts"] = container_charts
+    if isinstance(raw.get("container_data_quality"), dict):
+        out["container_data_quality"] = raw["container_data_quality"]
+    if isinstance(raw.get("container_metric_modes"), dict):
+        out["container_metric_modes"] = raw["container_metric_modes"]
     out.pop("charts_forecast", None)
+    out.pop("container_charts_forecast", None)
+    return out
+
+
+def _merge_container_charts(
+    raw: Dict[str, Any],
+    detail: Dict[str, Any],
+    *,
+    test_size: int,
+) -> Dict[str, Dict[str, Any]]:
+    raw_container_metrics = raw.get("container_metrics")
+    forecast_container_metrics = detail.get("container_charts_forecast")
+    if not isinstance(raw_container_metrics, dict) or not isinstance(forecast_container_metrics, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for container, metrics in raw_container_metrics.items():
+        if not isinstance(metrics, dict):
+            continue
+        forecast_metrics = forecast_container_metrics.get(container, {})
+        if not isinstance(forecast_metrics, dict):
+            continue
+        metric_out: Dict[str, Any] = {}
+        for metric, y_full in metrics.items():
+            if not isinstance(y_full, pd.Series) or y_full.empty or len(y_full) <= test_size:
+                continue
+            block = forecast_metrics.get(metric, {})
+            if not isinstance(block, dict):
+                continue
+            y_train, y_test = y_full.iloc[:-test_size], y_full.iloc[-test_size:]
+            metric_out[str(metric)] = {
+                "x_train_ms": _timestamps_ms_from_index(y_train.index),
+                "y_train": _series_to_lists(y_train),
+                "x_test_ms": _timestamps_ms_from_index(y_test.index),
+                "y_test": _series_to_lists(y_test),
+                "preds": block.get("preds", {}),
+                "x_pred_ms": block.get("x_pred_ms", []),
+                "preds_future": block.get("preds_future", {}),
+                "metrics": block.get("metrics", {}),
+                "best_method": block.get("best_method", ""),
+            }
+        if metric_out:
+            out[str(container)] = metric_out
     return out
 
 

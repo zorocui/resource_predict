@@ -100,12 +100,8 @@ def _detect_resource_type(
         "vm": "openstack_vm",
         "k8s": "k8s_workload",
         "kubernetes": "k8s_workload",
-        "container": "k8s_workload",
-        "k8s_container": "k8s_workload",
         "k8s_workload": "k8s_workload",
         "workload": "k8s_workload",
-        "k8s_pod": "k8s_workload",
-        "pod": "k8s_workload",
     }
     if value in aliases:
         return aliases[value]

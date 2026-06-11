@@ -300,12 +300,14 @@ sequenceDiagram
 ### K8S Workload 决策引擎（`core/k8s_workload_decision.py`）
 
 - **当前资源规格**：K8S 当前 request/limit 只保存在 `spec.containers.<container>`，不保留 Workload 级累加 request/limit 字段；前端也按 container 粒度展示。
+- **Container 级预测**：K8S Workload 仍是资源主体；provider 同时输出 Workload 聚合 `metrics` 和 `container_metrics.<container>.<metric>`。预测产物保留 Workload 聚合 `charts`，并新增 `container_charts.<container>.<metric>` 供详情页在同一 ECharts 图中绘制多条 container 曲线。
 - **扩容判断**：基于 `cpu_limit` / `memory_limit`，P95 >= 0.8 或峰值 >= 0.9；没有 limit 时不提出扩容建议
 - **缩容判断**：基于 `cpu_request` / `memory_request`，均值 < 0.2 且 P95 < 0.35
 - **数据质量**：`_quality_level()` 评估每个指标的数据质量，poor 质量自动跳过执行建议
 - **Baseline 缺失处理**：缺少 request/limit 时降级为 trend-only 分析
 - **目标利用率分级**：`_target_utilization()` 按策略层级返回差异化利用率目标（0.55~0.78）
 - **requests/limits 建议**：按容器粒度，per-replica target 与副本数独立计算避免双重缩放；小于 `2C/2Gi` 的 Workload 保留小数粒度，避免 `0.5C` 级别 request/limit 被放大到 `2C`
+- **多容器执行目标**：多 container Workload 的 request/limit 建议写入 `target_spec.containers.<container>`；`replicas` 仍保留在 Workload 级 `target_spec.replicas`。
 - **副本数建议**：Deployment / StatefulSet / ReplicaSet 支持；DaemonSet 跳过副本缩放并给出警告
 - **Namespace 策略**：自动从 spec 中识别 namespace 并匹配 conservative / aggressive 分组
 - **Workload 类型归一化**：`_workload_kind()` 标准化控制器类型字符串

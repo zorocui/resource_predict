@@ -74,7 +74,6 @@ def worker(
         for m in active_methods:
             timing_by_model[m] += float(timing_part.get(m, 0.0))
 
-    timing_total = float(sum(timing_by_model.values()))
     best_methods: Dict[str, str] = {}
     metrics_out: Dict[str, Dict[str, Dict[str, float]]] = {}
     charts_forecast: Dict[str, Dict[str, Any]] = {}
@@ -96,10 +95,22 @@ def worker(
         }
         futures_for_advice[metric_name] = future_pred[best].to_numpy(dtype=float)
 
+    container_charts_forecast, container_futures_for_advice = _fit_container_metrics(
+        source,
+        metric_names=metric_names,
+        ctx=ctx,
+        timing_by_model=timing_by_model,
+    )
+    timing_total = float(sum(timing_by_model.values()))
+
     advice = None
     # 根据资源类型构建对应的 scaling_advice
     if resource_type == "k8s_workload" and len(futures_for_advice) == len(metric_names):
-        advice = build_k8s_workload_advice(futures_for_advice, resource=source)
+        advice = build_k8s_workload_advice(
+            futures_for_advice,
+            resource=source,
+            container_future_values=container_futures_for_advice,
+        )
     elif len(futures_for_advice) == len(METRIC_NAMES):
         advice = build_scaling_advice(
             futures_for_advice,
@@ -127,6 +138,49 @@ def worker(
     }
     if isinstance(source.get("data_quality"), dict):
         item["data_quality"] = source["data_quality"]
+    if container_charts_forecast:
+        item["container_charts_forecast"] = container_charts_forecast
+    if isinstance(source.get("container_data_quality"), dict):
+        item["container_data_quality"] = source["container_data_quality"]
+    if isinstance(source.get("container_metric_modes"), dict):
+        item["container_metric_modes"] = source["container_metric_modes"]
     if advice is not None:
         item["scaling_advice"] = advice
     return item
+
+
+def _fit_container_metrics(
+    source: Dict[str, Any],
+    *,
+    metric_names: tuple[str, ...],
+    ctx: WorkerContext,
+    timing_by_model: Dict[str, float],
+) -> tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Dict[str, np.ndarray]]]:
+    raw = source.get("container_metrics")
+    if not isinstance(raw, dict):
+        return {}, {}
+    charts: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    futures: Dict[str, Dict[str, np.ndarray]] = {}
+    for container, metrics in raw.items():
+        name = str(container or "").strip()
+        if not name or not isinstance(metrics, dict):
+            continue
+        for metric_name in metric_names:
+            series = metrics.get(metric_name)
+            if series is None or len(series) <= ctx.test_size:
+                continue
+            y_train = series.iloc[:-ctx.test_size]
+            y_test = series.iloc[-ctx.test_size:]
+            pred, metric_scores, best, future_pred, timing_part, diagnostics = fit_one_metric(y_train, y_test, series, ctx=ctx)
+            for method in ctx.active_methods:
+                timing_by_model[method] += float(timing_part.get(method, 0.0))
+            charts.setdefault(name, {})[metric_name] = {
+                "preds": {m: series_to_lists(pred[m]) for m in pred.keys()},
+                "x_pred_ms": to_ms(next(iter(future_pred.values())).index),
+                "preds_future": {m: series_to_lists(future_pred[m]) for m in future_pred.keys()},
+                "metrics": metric_scores,
+                "best_method": best,
+                "forecast_diagnostics": diagnostics,
+            }
+            futures.setdefault(name, {})[metric_name] = future_pred[best].to_numpy(dtype=float)
+    return charts, futures

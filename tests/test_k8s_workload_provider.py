@@ -267,6 +267,13 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         )
         self.assertTrue(any('container!="POD"' in query for query in FakePrometheusClient.queries))
         self.assertEqual(set(item["metrics"]), {"cpu_limit", "cpu_request", "memory_limit", "memory_request"})
+        self.assertEqual(set(item["container_metrics"]), {"app", "sidecar"})
+        self.assertEqual(
+            set(item["container_metrics"]["app"]),
+            {"cpu_limit", "cpu_request", "memory_limit", "memory_request"},
+        )
+        self.assertIn("app", item["container_data_quality"])
+        self.assertEqual(item["container_metric_modes"]["app"]["cpu_request"], "cpu_usage/cpu_request")
         self.assertAlmostEqual(item["metrics"]["cpu_limit"]["values"][0], 0.3)
         self.assertAlmostEqual(item["metrics"]["cpu_limit"]["values"][1], 0.6)
         self.assertAlmostEqual(item["metrics"]["cpu_request"]["values"][0], 0.15)

@@ -4,7 +4,8 @@
 - openstack_vm: VM 资源，预测 cpu / memory / disk
 - k8s_workload: K8S Workload 资源，预测 cpu_limit / cpu_request / memory_limit / memory_request
 
-所有遗留别名（pod、k8s_pod、k8s、kubernetes、container 等）统一归一到 k8s_workload。
+K8S Workload 使用规范资源类型 k8s_workload；Prometheus / Kubernetes 标签中的 pod
+只作为上游字段处理，不作为项目资源类型输入。
 """
 from __future__ import annotations
 
@@ -24,12 +25,7 @@ def resource_type_of(item: dict) -> str:
     raw = str(item.get("resource_type") or "").strip().lower().replace("-", "_")
     if raw in {"openstack", "openstack_vm", "vm"}:
         return "openstack_vm"
-    # 所有 K8S 相关字符串统一归一到 k8s_workload
-    if raw in {
-        "k8s_workload", "k8s_controller", "workload", "controller",
-        "k8s_pod", "pod",
-        "k8s", "kubernetes", "k8s_container", "container",
-    }:
+    if raw in {"k8s_workload", "workload", "controller", "k8s", "kubernetes"}:
         return "k8s_workload"
     return raw or "openstack_vm"
 

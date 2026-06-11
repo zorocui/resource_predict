@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -500,6 +500,7 @@ def build_k8s_workload_advice(
     metric_future_values: Dict[str, np.ndarray],
     *,
     resource: Dict[str, Any],
+    container_future_values: Dict[str, Dict[str, np.ndarray]] | None = None,
 ) -> Dict[str, Any]:
     spec = resource.get("spec", {})
     if not isinstance(spec, dict):
@@ -512,8 +513,7 @@ def build_k8s_workload_advice(
     by_metric: Dict[str, Dict[str, float]] = {}
     signal_keys = ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
     for m in signal_keys:
-        legacy_key = "cpu" if m.startswith("cpu_") else "memory"
-        vals = np.asarray(metric_future_values.get(m, metric_future_values.get(legacy_key, np.array([]))), dtype=float)
+        vals = np.asarray(metric_future_values.get(m, np.array([])), dtype=float)
         st = compute_metric_stats(vals, extended=True)
         tr = _trend_features(vals, cfg.trend_window_points)
         st.update(tr)
@@ -657,6 +657,39 @@ def build_k8s_workload_advice(
         tier=tier,
     )
     target_spec = _target_spec_from_policy(target_policy)
+    container_targets, container_policies, container_advice = _container_targets_from_future_values(
+        container_future_values,
+        resource=resource,
+    )
+    if container_targets:
+        target_spec = _target_spec_with_container_targets(target_spec, container_targets)
+        target_policy["container_recommendations"] = container_policies
+        _merge_container_advice(
+            metric_actions,
+            metric_reasons,
+            metric_confidence_scores,
+            container_advice,
+        )
+        actions = set(metric_actions.values())
+        has_mixed_signals = "scale_out_candidate" in actions and "scale_in_candidate" in actions
+        if "scale_out_candidate" in actions:
+            action = "scale_out_candidate"
+        elif "scale_in_candidate" in actions:
+            action = "scale_in_candidate"
+        elif blockers and len(blockers) == len(metric_actions):
+            action = "insufficient_data"
+        else:
+            action = "hold"
+        if metric_confidence_scores:
+            scores = list(metric_confidence_scores.values())
+            confidence_score = 0.65 * max(scores) + 0.35 * float(np.mean(scores))
+            if len(scores) >= 2:
+                confidence_score += 4.0
+    elif _has_multiple_containers(spec) and _has_resource_target_fields(target_spec):
+        target_policy.setdefault("notes", []).append(
+            "multiple-container workload lacks container-level forecasts; request/limit target is analysis-only"
+        )
+        target_policy["ready_for_execution"] = False
 
     # Total capacity coordination: 校验 per_replica * replicas 的总量合理性
     _coordinate_total_capacity(target_policy, target_spec, spec, decision_stats, metric_actions)
@@ -765,3 +798,144 @@ def _coordinate_total_capacity(
                 f"{label} total capacity increase is {change_ratio * 100:.0f}%; "
                 "verify this is within budget"
             )
+
+
+def _resource_target_fields() -> set[str]:
+    return {
+        "cpu_request_cores",
+        "cpu_cores",
+        "cpu_limit_cores",
+        "memory_request_gb",
+        "memory_gb",
+        "memory_limit_gb",
+    }
+
+
+def _has_resource_target_fields(target_spec: Dict[str, Any]) -> bool:
+    return any(target_spec.get(field) is not None for field in _resource_target_fields())
+
+
+def _target_spec_with_container_targets(
+    target_spec: Dict[str, Any],
+    container_targets: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    out = {key: value for key, value in target_spec.items() if key not in _resource_target_fields()}
+    out["containers"] = container_targets
+    return out
+
+
+def _has_multiple_containers(spec: Dict[str, Any]) -> bool:
+    raw = spec.get("containers")
+    if isinstance(raw, dict):
+        names = {str(name or "").strip() for name in raw if str(name or "").strip()}
+        if len(names) > 1:
+            return True
+    observed = spec.get("containers_observed")
+    if isinstance(observed, list):
+        names = {str(name or "").strip() for name in observed if str(name or "").strip()}
+        if len(names) > 1:
+            return True
+    return False
+
+
+def _container_targets_from_future_values(
+    container_future_values: Dict[str, Dict[str, np.ndarray]] | None,
+    *,
+    resource: Dict[str, Any],
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    if not isinstance(container_future_values, dict) or not container_future_values:
+        return {}, {}, {}
+    spec = resource.get("spec", {})
+    if not isinstance(spec, dict):
+        spec = {}
+    containers = spec.get("containers", {})
+    if not isinstance(containers, dict):
+        return {}, {}, {}
+    targets: Dict[str, Dict[str, Any]] = {}
+    policies: Dict[str, Dict[str, Any]] = {}
+    summaries: Dict[str, Dict[str, Any]] = {}
+    for container, futures in container_future_values.items():
+        name = str(container or "").strip()
+        if not name or name not in containers or not isinstance(futures, dict):
+            continue
+        container_spec = dict(spec)
+        for replica_field in ("replicas", "replicas_observed", "current_replicas"):
+            container_spec.pop(replica_field, None)
+        container_spec["containers"] = {name: containers[name]}
+        container_spec["containers_observed"] = [name]
+        container_resource = dict(resource)
+        container_resource["spec"] = container_spec
+        container_quality = resource.get("container_data_quality", {})
+        if isinstance(container_quality, dict) and isinstance(container_quality.get(name), dict):
+            container_resource["data_quality"] = container_quality[name]
+        advice = build_k8s_workload_advice(futures, resource=container_resource)
+        target = advice.get("target_spec", {})
+        if isinstance(target, dict):
+            normalized = {
+                key: target[key]
+                for key in (
+                    "cpu_request_cores",
+                    "cpu_limit_cores",
+                    "memory_request_gb",
+                    "memory_limit_gb",
+                )
+                if target.get(key) is not None
+            }
+            if normalized:
+                targets[name] = normalized
+        policy = advice.get("target_k8s_policy", {})
+        if isinstance(policy, dict):
+            policies[name] = policy
+        summaries[name] = {
+            "action": advice.get("action"),
+            "metric_actions": advice.get("metric_actions", {}),
+            "metric_reasons": advice.get("metric_reasons", {}),
+            "confidence_metric_scores": advice.get("confidence_metric_scores", {}),
+        }
+    return targets, policies, summaries
+
+
+def _merge_container_advice(
+    metric_actions: Dict[str, str],
+    metric_reasons: Dict[str, str],
+    metric_confidence_scores: Dict[str, float],
+    container_advice: Dict[str, Dict[str, Any]],
+) -> None:
+    for metric in ("cpu", "memory"):
+        actions_by_container: Dict[str, str] = {}
+        reasons_by_container: Dict[str, str] = {}
+        scores: List[float] = []
+        for name, advice in container_advice.items():
+            actions = advice.get("metric_actions", {})
+            action = str(actions.get(metric) if isinstance(actions, dict) else "hold")
+            if action not in {"scale_out_candidate", "scale_in_candidate"}:
+                continue
+            actions_by_container[name] = action
+            reasons = advice.get("metric_reasons", {})
+            if isinstance(reasons, dict) and reasons.get(metric):
+                reasons_by_container[name] = str(reasons[metric])
+            score_map = advice.get("confidence_metric_scores", {})
+            score = score_map.get(metric) if isinstance(score_map, dict) else None
+            try:
+                score_value = float(score)
+            except (TypeError, ValueError):
+                score_value = float("nan")
+            if np.isfinite(score_value):
+                scores.append(score_value)
+        if not actions_by_container:
+            continue
+        action_values = set(actions_by_container.values())
+        if "scale_out_candidate" in action_values:
+            metric_actions[metric] = "scale_out_candidate"
+        elif "scale_in_candidate" in action_values:
+            metric_actions[metric] = "scale_in_candidate"
+        labels = [
+            f"{name}: {reason}"
+            for name, reason in sorted(reasons_by_container.items())
+        ]
+        if labels:
+            metric_reasons[metric] = "; ".join(labels)
+        elif action_values:
+            metric_reasons[metric] = "container-level forecast recommends adjustment"
+        if scores:
+            metric_confidence_scores[metric] = max(scores)

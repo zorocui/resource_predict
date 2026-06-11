@@ -130,10 +130,37 @@ def _recompute_advice(item: Dict[str, Any]) -> bool:
             return False
         future_by_metric[metric] = np.asarray(futures.get(best) or [], dtype=float)
     if resource_type_of(item) == "k8s_workload":
-        item["scaling_advice"] = build_k8s_workload_advice(future_by_metric, resource=item)
+        item["scaling_advice"] = build_k8s_workload_advice(
+            future_by_metric,
+            resource=item,
+            container_future_values=_container_futures_from_item(item, metric_names),
+        )
     else:
         item["scaling_advice"] = build_scaling_advice(future_by_metric, current_spec=item.get("spec", {}))
     return True
+
+
+def _container_futures_from_item(
+    item: Dict[str, Any],
+    metric_names: tuple[str, ...],
+) -> Dict[str, Dict[str, np.ndarray]]:
+    charts = item.get("container_charts_forecast", {})
+    if not isinstance(charts, dict):
+        return {}
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for container, metrics in charts.items():
+        if not isinstance(metrics, dict):
+            continue
+        for metric in metric_names:
+            block = metrics.get(metric, {})
+            if not isinstance(block, dict):
+                continue
+            best = str(block.get("best_method") or "")
+            futures = block.get("preds_future", {})
+            if not best or not isinstance(futures, dict) or best not in futures:
+                continue
+            out.setdefault(str(container), {})[metric] = np.asarray(futures.get(best) or [], dtype=float)
+    return out
 
 
 def _read_json(path: Path) -> Any:

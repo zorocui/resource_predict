@@ -410,6 +410,8 @@ def _fetch_target(
     )
     cpu_usage_by_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners)
     mem_usage_by_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners)
+    cpu_usage_by_container = _sum_series_by_workload_container(cpu_usage, pod_owners)
+    mem_usage_by_container = _sum_series_by_workload_container(mem_usage, pod_owners)
     cpu_request_by_workload, _ = _sum_values_by_workload(cpu_request, target.cluster, pod_owners)
     cpu_limit_by_workload, _ = _sum_values_by_workload(cpu_limit, target.cluster, pod_owners)
     mem_request_by_workload, _ = _sum_values_by_workload(mem_request, target.cluster, pod_owners)
@@ -468,6 +470,74 @@ def _fetch_target(
         cpu_request_quality = _data_quality(cpu_request_norm, step)
         mem_limit_quality = _data_quality(mem_limit_norm, step)
         mem_request_quality = _data_quality(mem_request_norm, step)
+        meta = metadata_by_workload.get(key, {})
+        container_metrics: Dict[str, Dict[str, Any]] = {}
+        container_quality: Dict[str, Dict[str, Any]] = {}
+        container_modes: Dict[str, Dict[str, str]] = {}
+        container_names = sorted(meta.get("containers", []))
+        for container in container_names:
+            cpu_container_s = cpu_usage_by_container.get(key, {}).get(container)
+            mem_container_s = mem_usage_by_container.get(key, {}).get(container)
+            if cpu_container_s is None or mem_container_s is None:
+                continue
+            cpu_limit_container_metric, cpu_limit_container_norm = _normalize_scoped_series(
+                (
+                    cpu_container_s if _container_value(cpu_limit_by_container.get(key, {}), container) else None,
+                    _container_value(cpu_limit_by_container.get(key, {}), container),
+                    "cpu_usage/cpu_limit",
+                ),
+                raw_series=cpu_container_s,
+                raw_name="cpu_usage_cores",
+            )
+            cpu_request_container_metric, cpu_request_container_norm = _normalize_scoped_series(
+                (
+                    cpu_container_s if _container_value(cpu_request_by_container.get(key, {}), container) else None,
+                    _container_value(cpu_request_by_container.get(key, {}), container),
+                    "cpu_usage/cpu_request",
+                ),
+                raw_series=cpu_container_s,
+                raw_name="cpu_usage_cores",
+            )
+            mem_limit_container_metric, mem_limit_container_norm = _normalize_scoped_series(
+                (
+                    _series_bytes_to_gb(mem_container_s)
+                    if _container_value(mem_limit_by_container.get(key, {}), container)
+                    else None,
+                    _bytes_to_gb(_container_value(mem_limit_by_container.get(key, {}), container)),
+                    "memory_working_set/memory_limit",
+                ),
+                raw_series=mem_container_s / BYTES_PER_GIB,
+                raw_name="memory_working_set_gb",
+            )
+            mem_request_container_metric, mem_request_container_norm = _normalize_scoped_series(
+                (
+                    _series_bytes_to_gb(mem_container_s)
+                    if _container_value(mem_request_by_container.get(key, {}), container)
+                    else None,
+                    _bytes_to_gb(_container_value(mem_request_by_container.get(key, {}), container)),
+                    "memory_working_set/memory_request",
+                ),
+                raw_series=mem_container_s / BYTES_PER_GIB,
+                raw_name="memory_working_set_gb",
+            )
+            container_quality[container] = {
+                "cpu_limit": _data_quality(cpu_limit_container_norm, step),
+                "cpu_request": _data_quality(cpu_request_container_norm, step),
+                "memory_limit": _data_quality(mem_limit_container_norm, step),
+                "memory_request": _data_quality(mem_request_container_norm, step),
+            }
+            container_metrics[container] = {
+                "cpu_limit": _series_payload(_regularize_series(cpu_limit_container_norm, step)),
+                "cpu_request": _series_payload(_regularize_series(cpu_request_container_norm, step)),
+                "memory_limit": _series_payload(_regularize_series(mem_limit_container_norm, step)),
+                "memory_request": _series_payload(_regularize_series(mem_request_container_norm, step)),
+            }
+            container_modes[container] = {
+                "cpu_limit": cpu_limit_container_metric,
+                "cpu_request": cpu_request_container_metric,
+                "memory_limit": mem_limit_container_metric,
+                "memory_request": mem_request_container_metric,
+            }
         cpu_limit_norm = _regularize_series(cpu_limit_norm, step)
         cpu_request_norm = _regularize_series(cpu_request_norm, step)
         mem_limit_norm = _regularize_series(mem_limit_norm, step)
@@ -525,6 +595,10 @@ def _fetch_target(
                 "memory_request": mem_request_quality,
             },
         }
+        if container_metrics:
+            item["container_metrics"] = container_metrics
+            item["container_data_quality"] = container_quality
+            item["container_metric_modes"] = container_modes
         out.append(item)
         if limit > 0 and len(out) >= limit:
             break
@@ -791,6 +865,29 @@ def _sum_series_by_workload(
         if not series_list:
             continue
         out[key] = pd.concat(series_list, axis=1).sum(axis=1, min_count=1).dropna().sort_index()
+    return out
+
+
+def _sum_series_by_workload_container(
+    series_by_container: Dict[ContainerKey, pd.Series],
+    pod_owners: Dict[Tuple[str, str], WorkloadKey],
+) -> Dict[WorkloadKey, Dict[str, pd.Series]]:
+    grouped: Dict[WorkloadKey, Dict[str, List[pd.Series]]] = {}
+    for key, series in series_by_container.items():
+        wk = _workload_key(key, pod_owners)
+        if wk is None:
+            continue
+        _namespace, _pod, container = key
+        if not container:
+            continue
+        grouped.setdefault(wk, {}).setdefault(container, []).append(series.astype(float))
+    out: Dict[WorkloadKey, Dict[str, pd.Series]] = {}
+    for wk, by_container in grouped.items():
+        out[wk] = {}
+        for container, series_list in by_container.items():
+            if not series_list:
+                continue
+            out[wk][container] = pd.concat(series_list, axis=1).sum(axis=1, min_count=1).dropna().sort_index()
     return out
 
 

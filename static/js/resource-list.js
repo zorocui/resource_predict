@@ -136,7 +136,14 @@
   function formatNumber(value, digits = 1) {
     const n = Number(value);
     if (!Number.isFinite(n)) return "-";
-    return n.toFixed(digits).replace(/\.0+$/, "");
+    return String(Number(n.toFixed(digits)));
+  }
+
+  function formatCpuCores(value, digits = 2) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "-";
+    if (Math.abs(n) > 0 && Math.abs(n) < 1) return `${formatNumber(n * 1000, 0)}m`;
+    return `${formatNumber(n, digits)}C`;
   }
 
   function baseMetricKey(metricKey) {
@@ -154,10 +161,46 @@
   }
 
   function metricObservedStatsFor(item, metricKey) {
+    const containerStats = containerMetricObservedStatsFor(item, metricKey);
+    if (containerStats) return containerStats;
     const observedStats = item?.observed_stats || {};
     const observed = observedStats[metricKey];
     if (observed && typeof observed === "object" && observed.p95 !== undefined) return observed;
     const chart = item?.charts?.[metricKey] || {};
+    return chartObservedStats(chart);
+  }
+
+  function containerMetricObservedStatsFor(item, metricKey, containerName = "") {
+    if (!isK8s(item)) return null;
+    const name = containerName || representativeContainerName(item, metricKey);
+    if (!name) return null;
+    const chart = item?.container_charts?.[name]?.[metricKey];
+    return chartObservedStats(chart);
+  }
+
+  function representativeContainerName(item, metricKey) {
+    const targetContainers = item?.scaling_advice?.target_spec?.containers;
+    if (targetContainers && typeof targetContainers === "object" && !Array.isArray(targetContainers)) {
+      const targetNames = Object.keys(targetContainers).filter((name) => {
+        const values = targetContainers[name];
+        return values && typeof values === "object" && Object.keys(values).length;
+      });
+      if (targetNames.length === 1) return targetNames[0];
+      if (targetNames.length > 1) {
+        const withMetric = targetNames.find((name) => item?.container_charts?.[name]?.[metricKey]);
+        if (withMetric) return withMetric;
+        return targetNames[0];
+      }
+    }
+    const charts = item?.container_charts;
+    if (charts && typeof charts === "object" && !Array.isArray(charts)) {
+      return Object.keys(charts).find((name) => charts[name]?.[metricKey]) || "";
+    }
+    return "";
+  }
+
+  function chartObservedStats(chart) {
+    if (!chart || typeof chart !== "object") return null;
     const values = []
       .concat(Array.isArray(chart.y_train) ? chart.y_train : [])
       .concat(Array.isArray(chart.y_test) ? chart.y_test : [])
@@ -354,6 +397,31 @@
   }
 
   function targetSpecDetailMarkup(item) {
+    const advice = item?.scaling_advice || {};
+    const target = advice.target_spec || {};
+    if (isK8s(item) && target.containers && typeof target.containers === "object" && !Array.isArray(target.containers)) {
+      const groups = targetContainerGroups(target.containers);
+      if (groups.length) {
+        const replica = target.replicas != null ? `
+          <span class="target-result-item target-result-replica">
+            <b>副本</b>
+            <em>${escapeHtml(formatNumber(target.replicas, 0))}</em>
+          </span>` : "";
+        return `
+          <div class="target-container-grid">
+            ${groups.map((group) => `
+              <section class="target-container-card">
+                <header title="${escapeHtml(group.name)}">${escapeHtml(group.name)}</header>
+                <div class="target-container-matrix">
+                  ${targetContainerResourceRow("CPU", group.cpu)}
+                  ${targetContainerResourceRow("内存", group.memory)}
+                </div>
+              </section>
+            `).join("")}
+            ${replica}
+          </div>`;
+      }
+    }
     const rows = targetSpecRows(item);
     if (!rows.length) return `<span class="target-result-empty">${escapeHtml(targetSpecText(item))}</span>`;
     return rows.map((row) => `
@@ -369,17 +437,48 @@
       .filter(([, values]) => values && typeof values === "object")
       .map(([name, values]) => {
         const fields = [];
-        const cpuReq = values.cpu_request_cores != null ? formatNumber(values.cpu_request_cores, 2) : null;
-        const cpuLimit = values.cpu_limit_cores != null ? formatNumber(values.cpu_limit_cores, 2) : null;
+        const cpuReq = values.cpu_request_cores != null ? formatCpuCores(values.cpu_request_cores, 2) : null;
+        const cpuLimit = values.cpu_limit_cores != null ? formatCpuCores(values.cpu_limit_cores, 2) : null;
         const memReq = values.memory_request_gb != null ? formatMemoryGiB(values.memory_request_gb, 2) : null;
         const memLimit = values.memory_limit_gb != null ? formatMemoryGiB(values.memory_limit_gb, 2) : null;
-        if (cpuReq) fields.push(`CPU req ${cpuReq}C`);
-        if (cpuLimit) fields.push(`CPU limit ${cpuLimit}C`);
+        if (cpuReq) fields.push(`CPU req ${cpuReq}`);
+        if (cpuLimit) fields.push(`CPU limit ${cpuLimit}`);
         if (memReq) fields.push(`内存 req ${memReq}`);
         if (memLimit) fields.push(`内存 limit ${memLimit}`);
         return fields.length ? `${name}: ${fields.join(" / ")}` : "";
       })
       .filter(Boolean);
+  }
+
+  function targetContainerGroups(containers) {
+    if (!containers || typeof containers !== "object" || Array.isArray(containers)) return [];
+    return Object.entries(containers)
+      .filter(([, values]) => values && typeof values === "object")
+      .map(([name, values]) => {
+        const cpu = [];
+        const memory = [];
+        if (values.cpu_request_cores != null) cpu.push({ label: "request", value: formatCpuCores(values.cpu_request_cores, 2) });
+        if (values.cpu_limit_cores != null) cpu.push({ label: "limit", value: formatCpuCores(values.cpu_limit_cores, 2) });
+        if (values.memory_request_gb != null) memory.push({ label: "request", value: formatMemoryGiB(values.memory_request_gb, 2) });
+        if (values.memory_limit_gb != null) memory.push({ label: "limit", value: formatMemoryGiB(values.memory_limit_gb, 2) });
+        return { name, cpu, memory };
+      })
+      .filter((group) => group.cpu.length || group.memory.length);
+  }
+
+  function targetContainerResourceRow(label, fields) {
+    if (!Array.isArray(fields) || !fields.length) return "";
+    const byLabel = new Map(fields.map((field) => [field.label, field.value]));
+    const cell = (fieldLabel) => {
+      const value = byLabel.get(fieldLabel);
+      const emptyClass = value == null ? " is-empty" : "";
+      return `<span class="target-resource-value${emptyClass}"><b>${escapeHtml(fieldLabel)}</b><em>${escapeHtml(value || "-")}</em></span>`;
+    };
+    return `
+      <span class="target-resource-label">${escapeHtml(label)}</span>
+      ${cell("request")}
+      ${cell("limit")}
+    `;
   }
 
   function positiveNumber(value) {
@@ -505,7 +604,7 @@
   function titleFor(item) {
     const spec = item?.spec || {};
     if (isK8s(item)) {
-      return spec.workload_name || spec.owner_name || spec.pod || item.resource_id || "-";
+      return spec.workload_name || spec.owner_name || item.resource_id || "-";
     }
     return item.resource_id || "-";
   }
@@ -752,6 +851,8 @@
     metricKeysFor,
     metricTitleFor,
     metricObservedStatsFor,
+    containerMetricObservedStatsFor,
+    representativeContainerName,
     metricStatsFor,
     renderRows,
     resolveDisplayUnit,

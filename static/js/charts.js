@@ -17,7 +17,6 @@
     { key: "peak", label: "峰值" },
     { key: "raw", label: "原始" },
   ];
-
   function toPairs(xMs, y) {
     const res = [];
     for (let i = 0; i < xMs.length; i++) {
@@ -207,6 +206,46 @@
     return `${clean.slice(0, 3).join(", ")} 等 ${clean.length} 个`;
   }
 
+  function containerChartEntries(resource, metricKey) {
+    const raw = resource?.container_charts;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    return Object.keys(raw).sort().map((name) => ({
+      name,
+      chart: raw[name]?.[metricKey],
+    })).filter((item) => item.chart && typeof item.chart === "object");
+  }
+
+  function containerSelectionKey(resource, metricKey) {
+    return `${resource?.resource_id || app.state.selectedResourceId || ""}:${metricKey}`;
+  }
+
+  function resourceContainerSelectionKey(resource) {
+    return `${resource?.resource_id || app.state.selectedResourceId || ""}:*`;
+  }
+
+  function selectedContainerEntry(resource, metricKey) {
+    if (!list.isK8s(resource)) return null;
+    const entries = containerChartEntries(resource, metricKey);
+    if (!entries.length) return null;
+    const key = containerSelectionKey(resource, metricKey);
+    const selectedName = app.selectedContainerByResourceMetric.get(key)
+      || app.selectedContainerByResourceMetric.get(resourceContainerSelectionKey(resource));
+    const suggestedName = list.representativeContainerName(resource, metricKey);
+    return entries.find((item) => item.name === selectedName)
+      || entries.find((item) => item.name === suggestedName)
+      || entries[0];
+  }
+
+  function activeChartData(resource, metricKey, fallbackChartData) {
+    const containerEntry = selectedContainerEntry(resource, metricKey);
+    return containerEntry?.chart || fallbackChartData;
+  }
+
+  function activeContainerSubtext(resource, metricKey) {
+    const containerEntry = selectedContainerEntry(resource, metricKey);
+    return containerEntry ? `Container: ${containerEntry.name}` : "";
+  }
+
   function buildChartOption(chartData, metricKey, displayUnit = "percent", resource = null) {
     const bestMethod = chartData.best_method;
     const isVm = resource ? !list.isK8s(resource) : false;
@@ -316,7 +355,7 @@
 
     const bestRmse = chartData.metrics?.[bestMethod]?.rmse;
     const timeAxis = buildTimeAxisConfigFromPairs(series.map((item) => item.data), windowInfo);
-    const containerScope = metricContainerScope(resource, metricKey, displayUnit);
+    const containerScope = activeContainerSubtext(resource, metricKey) || metricContainerScope(resource, metricKey, displayUnit);
     return {
       backgroundColor: "transparent",
       animation: false,
@@ -443,6 +482,20 @@
     return `<button type="button" class="${stateKey === option.key ? "active" : ""}${extraClass}" data-chart-${group}="${list.escapeHtml(option.key)}">${list.escapeHtml(option.label)}</button>`;
   }
 
+  function containerSelectorMarkup(resource) {
+    const metricKey = app.state.selectedMetricKey;
+    const entries = metricKey ? containerChartEntries(resource, metricKey) : [];
+    if (!entries.length) return "";
+    const activeName = selectedContainerEntry(resource, metricKey)?.name || entries[0].name;
+    return `
+      <div class="chart-control-group chart-container-group" aria-label="容器选择">
+        ${entries.map((item) => `
+          <button type="button" class="${item.name === activeName ? "active" : ""}" data-chart-container="${list.escapeHtml(item.name)}" title="${list.escapeHtml(item.name)}">${list.escapeHtml(item.name)}</button>
+        `).join("")}
+      </div>
+    `;
+  }
+
   function chartControlsMarkup(resource) {
     // VM 资源不显示时间范围和显示模式选择器
     if (resource && !list.isK8s(resource)) return "";
@@ -453,6 +506,7 @@
       <div class="chart-control-group" aria-label="图表显示模式">
         ${CHART_MODES.map((option) => chartButton(option, "mode")).join("")}
       </div>
+      ${containerSelectorMarkup(resource)}
     `;
   }
 
@@ -592,12 +646,15 @@
       </div>
       <div class="reason-grid">
         ${list.metricKeysFor(resource).map((key) => {
-          const observed = list.metricObservedStatsFor(resource, key);
+          const containerName = selectedContainerEntry(resource, key)?.name || "";
+          const observed = list.containerMetricObservedStatsFor(resource, key, containerName)
+            || list.metricObservedStatsFor(resource, key);
           const mAction = list.metricActionFor(resource, key);
           const unit = list.resolveDisplayUnit(resource, key);
           const st = observed || {};
+          const metricTitle = `${list.metricTitleFor(resource, key)}${containerName ? ` · ${containerName}` : ""}`;
           return `<div class="reason-item">
-            <span class="reason-metric">${list.escapeHtml(list.metricTitleFor(resource, key))}</span>
+            <span class="reason-metric">${list.escapeHtml(metricTitle)}</span>
             <strong class="reason-action is-${list.escapeHtml(mAction)}">${list.escapeHtml(list.actionLabel(mAction))}</strong>
             <small class="reason-stats">
               <span><b>平均</b><em>${list.formatStatValue(st.avg, unit)}</em></span>
@@ -628,7 +685,8 @@
     disposeDetailChart();
     app.els.detailChart.innerHTML = "";
     const key = `${resourceId}:${metricKey}`;
-    const data = app.chartDataByKey.get(key);
+    const fallbackData = app.chartDataByKey.get(key);
+    const data = activeChartData(resource, metricKey, fallbackData);
     if (!data) {
       app.els.detailChart.innerHTML = `<div class="chart-state">暂无 ${list.escapeHtml(list.metricTitleFor(resource, metricKey))} 图表数据</div>`;
       return;
@@ -651,7 +709,8 @@
     if (!metricKeys.includes(activeMetric)) activeMetric = list.triggerMetric(resource);
     app.state.selectedMetricKey = activeMetric;
     const key = `${app.state.selectedResourceId}:${activeMetric}`;
-    const data = app.chartDataByKey.get(key);
+    const fallbackData = app.chartDataByKey.get(key);
+    const data = activeChartData(resource, activeMetric, fallbackData);
     if (!data || typeof echarts === "undefined" || !app.els.chartModal || !app.els.chartModalChart) return;
     disposeModalChart();
     app.els.chartModal.hidden = false;
@@ -720,6 +779,7 @@
   async function refreshChartDisplayControls() {
     if (!app.state.selectedResourceId || !app.state.selectedMetricKey) return;
     const resource = await ensureResource(app.state.selectedResourceId);
+    renderAdvice(resource);
     renderMetricTabs(resource, app.state.selectedMetricKey);
     await renderChart(app.state.selectedResourceId, app.state.selectedMetricKey, resource);
     if (app.els.chartModal && !app.els.chartModal.hidden) {
@@ -731,11 +791,22 @@
   function handleChartControlClick(event) {
     const rangeBtn = event.target.closest("button[data-chart-range]");
     const modeBtn = event.target.closest("button[data-chart-mode]");
-    if (!rangeBtn && !modeBtn) return false;
+    const containerBtn = event.target.closest("button[data-chart-container]");
+    if (!rangeBtn && !modeBtn && !containerBtn) return false;
     event.preventDefault();
     event.stopPropagation();
     if (rangeBtn) app.chartRangeKey = rangeBtn.dataset.chartRange || app.chartRangeKey;
     if (modeBtn) app.chartModeKey = modeBtn.dataset.chartMode || app.chartModeKey;
+    if (containerBtn && app.state.selectedMetricKey) {
+      app.selectedContainerByResourceMetric.set(
+        `${app.state.selectedResourceId || ""}:*`,
+        containerBtn.dataset.chartContainer || ""
+      );
+      app.selectedContainerByResourceMetric.set(
+        `${app.state.selectedResourceId || ""}:${app.state.selectedMetricKey}`,
+        containerBtn.dataset.chartContainer || ""
+      );
+    }
     refreshChartDisplayControls();
     return true;
   }
