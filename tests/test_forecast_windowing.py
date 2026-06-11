@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from resource_predict.data.io import read_raw_dataset
+from resource_predict.data.io import read_raw_dataset, write_raw_dataset
 from resource_predict.data.updater import run_upsert_with_data
 from resource_predict.pipeline.constants import FORECAST_ERROR_REPORT_FILENAME
 from resource_predict.pipeline.run import generate_forecasts
@@ -158,6 +158,132 @@ class ForecastWindowingTest(unittest.TestCase):
             self.assertTrue(result["success"], result)
             _prepared, meta = read_raw_dataset(base / "raw_data.json")
             self.assertEqual(meta.get("freq"), "5min")
+
+    def test_k8s_upsert_merges_container_metrics_for_existing_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            idx = pd.date_range("2026-01-01", periods=300, freq="5min")
+            old_values = [0.2] * len(idx)
+            existing = {
+                "resource_id": "k8s:cluster-a:ns:deployment:api",
+                "resource_type": "k8s_workload",
+                "spec": {
+                    "cluster": "cluster-a",
+                    "namespace": "ns",
+                    "workload_kind": "Deployment",
+                    "workload_name": "api",
+                    "containers_observed": ["app"],
+                    "containers": {
+                        "app": {
+                            "cpu_request_cores": 0.5,
+                            "cpu_limit_cores": 1.0,
+                            "memory_request_gb": 0.5,
+                            "memory_limit_gb": 1.0,
+                        }
+                    },
+                },
+                **{metric: pd.Series(old_values, index=idx) for metric in K8S_METRICS},
+                "container_metrics": {
+                    "app": {
+                        metric: pd.Series(old_values, index=idx)
+                        for metric in K8S_METRICS
+                    }
+                },
+            }
+            write_raw_dataset(base / "raw_data.json", [existing], freq="5min")
+
+            new_idx = pd.date_range(idx[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min")
+            timestamps = (new_idx.view("int64") // 1_000_000).tolist()
+            incoming = {
+                "resource_id": existing["resource_id"],
+                "resource_type": "k8s_workload",
+                "metrics": {
+                    metric: {"timestamps": timestamps, "values": [0.3, 0.4]}
+                    for metric in K8S_METRICS
+                },
+                "spec": existing["spec"],
+                "container_metrics": {
+                    "app": {
+                        metric: {"timestamps": timestamps, "values": [0.6, 0.8]}
+                        for metric in K8S_METRICS
+                    }
+                },
+                "container_data_quality": {"app": {"cpu_limit": {"level": "good"}}},
+                "container_metric_modes": {"app": {"cpu_limit": "cpu_usage/cpu_limit"}},
+            }
+
+            with patch("resource_predict.pipeline.generate_predictions_only", return_value=[{"resource_id": existing["resource_id"]}]):
+                result = run_upsert_with_data([incoming], out_dir=base, fail_if_busy=True)
+
+            self.assertTrue(result["success"], result)
+            prepared, _meta = read_raw_dataset(base / "raw_data.json")
+            loaded = prepared[0]
+            self.assertAlmostEqual(loaded["container_metrics"]["app"]["cpu_limit"].iloc[-1], 0.8)
+            self.assertEqual(len(loaded["container_metrics"]["app"]["cpu_limit"]), len(idx) + 2)
+            self.assertEqual(loaded["container_data_quality"]["app"]["cpu_limit"]["level"], "good")
+            self.assertEqual(loaded["container_metric_modes"]["app"]["cpu_limit"], "cpu_usage/cpu_limit")
+
+    def test_k8s_upsert_patches_container_specs_without_dropping_untouched_containers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            idx = pd.date_range("2026-01-01", periods=300, freq="5min")
+            existing = {
+                "resource_id": "k8s:cluster-a:ns:deployment:api",
+                "resource_type": "k8s_workload",
+                "spec": {
+                    "cluster": "cluster-a",
+                    "namespace": "ns",
+                    "workload_kind": "Deployment",
+                    "workload_name": "api",
+                    "containers_observed": ["app", "sidecar"],
+                    "containers": {
+                        "app": {
+                            "cpu_request_cores": 0.5,
+                            "cpu_limit_cores": 1.0,
+                            "memory_request_gb": 0.5,
+                            "memory_limit_gb": 1.0,
+                        },
+                        "sidecar": {
+                            "cpu_request_cores": 0.1,
+                            "cpu_limit_cores": 0.2,
+                            "memory_request_gb": 0.1,
+                            "memory_limit_gb": 0.2,
+                        },
+                    },
+                },
+                **{metric: pd.Series([0.2] * len(idx), index=idx) for metric in K8S_METRICS},
+            }
+            write_raw_dataset(base / "raw_data.json", [existing], freq="5min")
+
+            new_idx = pd.date_range(idx[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min")
+            timestamps = (new_idx.view("int64") // 1_000_000).tolist()
+            incoming = {
+                "resource_id": existing["resource_id"],
+                "resource_type": "k8s_workload",
+                "metrics": {
+                    metric: {"timestamps": timestamps, "values": [0.3, 0.4]}
+                    for metric in K8S_METRICS
+                },
+                "spec": {
+                    "containers": {
+                        "app": {
+                            "cpu_request_cores": 0.8,
+                            "cpu_limit_cores": None,
+                        }
+                    }
+                },
+            }
+
+            with patch("resource_predict.pipeline.generate_predictions_only", return_value=[{"resource_id": existing["resource_id"]}]):
+                result = run_upsert_with_data([incoming], out_dir=base, fail_if_busy=True)
+
+            self.assertTrue(result["success"], result)
+            prepared, _meta = read_raw_dataset(base / "raw_data.json")
+            containers = prepared[0]["spec"]["containers"]
+            self.assertEqual(containers["app"]["cpu_request_cores"], 0.8)
+            self.assertEqual(containers["app"]["cpu_limit_cores"], 1.0)
+            self.assertEqual(containers["sidecar"]["cpu_request_cores"], 0.1)
+            self.assertEqual(containers["sidecar"]["memory_limit_gb"], 0.2)
 
     def test_generate_forecasts_writes_effective_workload_window_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

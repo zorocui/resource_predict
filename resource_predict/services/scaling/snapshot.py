@@ -109,9 +109,31 @@ def _validate_effective_spec(plan: Any, effective_spec: Dict[str, Any]) -> None:
 def _merge_spec(current: Any, effective: Dict[str, Any]) -> Dict[str, Any]:
     base = dict(current) if isinstance(current, dict) else {}
     for key, value in effective.items():
-        if value is not None:
+        if key == "containers" and isinstance(value, dict):
+            merged_containers = _merge_container_specs(base.get("containers"), value)
+            if merged_containers:
+                base["containers"] = merged_containers
+        elif value is not None:
             base[key] = value
     return base
+
+
+def _merge_container_specs(current: Any, incoming: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {
+        str(name): dict(values) if isinstance(values, dict) else values
+        for name, values in current.items()
+    } if isinstance(current, dict) else {}
+    for name, values in incoming.items():
+        container = str(name or "").strip()
+        if not container or not isinstance(values, dict):
+            continue
+        current_values = merged.get(container)
+        base = dict(current_values) if isinstance(current_values, dict) else {}
+        for field, field_value in values.items():
+            if field_value is not None:
+                base[field] = field_value
+        merged[container] = base
+    return merged
 
 
 def _recompute_advice(item: Dict[str, Any]) -> bool:

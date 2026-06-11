@@ -385,7 +385,143 @@ def _build_new_resource_from_upsert(item: Dict[str, Any]) -> Dict[str, Any]:
                 f"{len(ts_list)} vs {len(val_list)}"
             )
         prepared[metric] = coerce_metric_series(metric_data, metric)
+    container_metrics = _coerce_container_metrics_from_upsert(
+        item.get("container_metrics"),
+        metric_names_for_resource(prepared),
+    )
+    if container_metrics:
+        prepared["container_metrics"] = container_metrics
+    if isinstance(item.get("container_data_quality"), dict):
+        prepared["container_data_quality"] = item["container_data_quality"]
+    if isinstance(item.get("container_metric_modes"), dict):
+        prepared["container_metric_modes"] = item["container_metric_modes"]
     return prepared
+
+
+def _coerce_container_metrics_from_upsert(
+    value: Any,
+    metric_names: Tuple[str, ...],
+) -> Dict[str, Dict[str, pd.Series]]:
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Dict[str, pd.Series]] = {}
+    for container, metrics in value.items():
+        name = str(container or "").strip()
+        if not name or not isinstance(metrics, dict):
+            continue
+        metric_out: Dict[str, pd.Series] = {}
+        for metric in metric_names:
+            payload = metrics.get(metric)
+            if not isinstance(payload, dict):
+                continue
+            ts_list = payload.get("timestamps", [])
+            val_list = payload.get("values", [])
+            if not ts_list and not val_list:
+                continue
+            if bool(ts_list) ^ bool(val_list):
+                raise ValueError(
+                    f"{name}.{metric}：timestamps 与 values 必须同时为空或同时非空"
+                )
+            metric_out[metric] = coerce_metric_series(payload, f"{name}.{metric}")
+        if metric_out:
+            out[name] = metric_out
+    return out
+
+
+def _merge_container_metrics_into_resource(
+    res: Dict[str, Any],
+    incoming: Dict[str, Any],
+    metric_names: Tuple[str, ...],
+    *,
+    use_sliding_window: bool,
+) -> bool:
+    incoming_metrics = _coerce_container_metrics_from_upsert(
+        incoming.get("container_metrics"),
+        metric_names,
+    )
+    changed = False
+    if incoming_metrics:
+        current = res.get("container_metrics")
+        if not isinstance(current, dict):
+            current = {}
+        merged: Dict[str, Dict[str, pd.Series]] = {
+            str(container): dict(metrics)
+            for container, metrics in current.items()
+            if isinstance(metrics, dict)
+        }
+        for container, metrics in incoming_metrics.items():
+            current_metrics = merged.setdefault(container, {})
+            for metric, incoming_series in metrics.items():
+                before_series = current_metrics.get(metric)
+                if isinstance(before_series, pd.Series):
+                    validation = _validate_incoming_data(
+                        before_series,
+                        _timestamps_ms_from_series(incoming_series),
+                        metric_name=f"{container}.{metric}",
+                        resource_id=str(res.get("resource_id") or ""),
+                    )
+                    if not validation.get("ok", True):
+                        msg = "; ".join(validation.get("warnings") or ["时间戳校验未通过"])
+                        raise ValueError(msg)
+                    updated = _merge_incremental_into_series(
+                        before_series,
+                        _timestamps_ms_from_series(incoming_series),
+                        _values_from_series(incoming_series),
+                    )
+                    if use_sliding_window and len(updated) > len(before_series):
+                        updated = updated.iloc[len(updated) - len(before_series):]
+                    if not updated.equals(before_series):
+                        changed = True
+                    current_metrics[metric] = updated
+                else:
+                    current_metrics[metric] = incoming_series
+                    changed = True
+        if changed or res.get("container_metrics") is not merged:
+            res["container_metrics"] = merged
+    for field in ("container_data_quality", "container_metric_modes"):
+        value = incoming.get(field)
+        if isinstance(value, dict) and res.get(field) != value:
+            res[field] = value
+            changed = True
+    return changed
+
+
+def _timestamps_ms_from_series(series: pd.Series) -> List[int]:
+    return (series.index.view("int64") // 1_000_000).tolist()
+
+
+def _values_from_series(series: pd.Series) -> List[float]:
+    return series.to_numpy(dtype=float).tolist()
+
+
+def _merge_spec_for_upsert(current: Any, incoming: Dict[str, Any]) -> Dict[str, Any]:
+    base = dict(current) if isinstance(current, dict) else {}
+    for key, value in incoming.items():
+        if key == "containers" and isinstance(value, dict):
+            merged = _merge_container_specs_for_upsert(base.get("containers"), value)
+            if merged:
+                base["containers"] = merged
+        else:
+            base[key] = value
+    return base
+
+
+def _merge_container_specs_for_upsert(current: Any, incoming: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {
+        str(name): dict(values) if isinstance(values, dict) else values
+        for name, values in current.items()
+    } if isinstance(current, dict) else {}
+    for name, values in incoming.items():
+        container = str(name or "").strip()
+        if not container or not isinstance(values, dict):
+            continue
+        current_values = merged.get(container)
+        base = dict(current_values) if isinstance(current_values, dict) else {}
+        for field, field_value in values.items():
+            if field_value is not None:
+                base[field] = field_value
+        merged[container] = base
+    return merged
 
 
 def run_update_with_data(
@@ -592,7 +728,7 @@ def _do_update(
                 current_spec = res.get("spec", {})
                 if not isinstance(current_spec, dict):
                     current_spec = {}
-                merged_spec = {**current_spec, **incoming_spec}
+                merged_spec = _merge_spec_for_upsert(current_spec, incoming_spec)
                 if merged_spec != current_spec:
                     res["spec"] = merged_spec
                     spec_changed = True
@@ -603,6 +739,13 @@ def _do_update(
             incoming_dq = new_info.get("data_quality")
             if isinstance(incoming_dq, dict) and res.get("data_quality") != incoming_dq:
                 res["data_quality"] = incoming_dq
+                spec_changed = True
+            if _merge_container_metrics_into_resource(
+                res,
+                new_info,
+                metric_names_for_resource(res),
+                use_sliding_window=use_sw,
+            ):
                 spec_changed = True
 
             new_metrics = new_info.get("metrics", {})

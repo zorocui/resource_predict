@@ -207,14 +207,30 @@
     setControlsBusy(container);
     if (statusEl) statusEl.textContent = mode === "dry_run" ? "正在提交预检..." : "正在提交调配...";
     renderModal({ resource_id: resourceId, mode, status: "submitting" }, "submitting");
-    try {
-      const payload = await deps.postJson(`/api/resources/${encodeURIComponent(resourceId)}/scale`, {
+    const requestBody = {
         mode,
         confirm: mode === "execute",
         confirm_create_flavor: confirmCreateFlavor,
         target_source: source,
         ...(targetSpec ? { target_spec: targetSpec } : {}),
-      });
+      };
+    try {
+      let payload;
+      try {
+        payload = await deps.postJson(`/api/resources/${encodeURIComponent(resourceId)}/scale`, requestBody);
+      } catch (e) {
+        const message = String(e.message || e);
+        const canRetryCooldown = mode === "execute" && /cooldown is active/i.test(message);
+        if (!canRetryCooldown) throw e;
+        const ok = window.confirm(
+          `${message}\n\n资源仍处于冷却期。确认已人工复核风险，并跳过本次 cooldown 门控继续调配？`
+        );
+        if (!ok) throw e;
+        payload = await deps.postJson(`/api/resources/${encodeURIComponent(resourceId)}/scale`, {
+          ...requestBody,
+          ignore_cooldown: true,
+        });
+      }
       const taskId = payload.task_id || payload.task?.task_id;
       if (!taskId) throw new Error("后端未返回 task_id");
       renderModal(payload.task || { task_id: taskId, resource_id: resourceId, mode, status: "queued" });

@@ -140,6 +140,36 @@ class ScalingTasksTest(unittest.TestCase):
         self.assertTrue(any("data_quality" in item for item in failures))
         self.assertTrue(any("cooldown" in item for item in failures))
 
+    def test_execution_gate_can_explicitly_ignore_cooldown_only(self):
+        now_ms = 1_780_000_000_000
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "last_scaled_at_epoch_ms": now_ms - 10 * 60_000,
+            },
+            "data_quality": K8S_QUALITY_GOOD,
+            "scaling_advice": {
+                "action": "scale_out_candidate",
+                "confidence": "high",
+                "confidence_score": 88.0,
+                "policy_tier": "balanced",
+                "action_gate": {"state": "ready"},
+                "metric_actions": {"cpu": "scale_out_candidate", "memory": "hold"},
+                "risk_profile": {"cooldown_minutes": 60},
+                "target_k8s_policy": {"ready_for_execution": True},
+                "target_spec": {"cpu_request_cores": 0.5},
+            },
+        }
+
+        failures = _execution_gate_failures(resource, now_ms=now_ms, ignore_cooldown=True)
+
+        self.assertEqual(failures, [])
+
     def test_execution_gate_accepts_ready_high_confidence_good_quality(self):
         now_ms = 1_780_000_000_000
         resource = {

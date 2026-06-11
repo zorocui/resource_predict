@@ -129,6 +129,16 @@
     return aggregatePairs(visible, chooseBucketMs(windowInfo.spanMs, visible.length, isVm));
   }
 
+  function prependBridgePoint(seriesData, bridgePoint) {
+    if (!Array.isArray(seriesData) || !seriesData.length || !Array.isArray(bridgePoint)) {
+      return seriesData;
+    }
+    const first = seriesData[0];
+    if (!Array.isArray(first)) return seriesData;
+    if (first[0] === bridgePoint[0]) return seriesData;
+    return [bridgePoint].concat(seriesData);
+  }
+
   function buildTimeAxisConfigFromPairs(groups, windowInfo) {
     const bucket = collectTimes(groups);
     if (!bucket.length) return { spanMs: 0 };
@@ -263,10 +273,16 @@
     // VM 资源强制显示原始数据模式标题
     const modeLabel = isVm ? "原始" : activeMode.label;
     const isPercentMode = displayUnit === "percent";
+    const historyData = prepareSeriesData(rawTrainPairs, windowInfo, isVm);
+    const historyBridgePoint = historyData.length ? historyData[historyData.length - 1] : null;
+    const testData = prependBridgePoint(
+      prepareSeriesData(rawTestPairs, windowInfo, isVm),
+      historyBridgePoint
+    );
     const series = [{
       name: "历史",
       type: "line",
-      data: prepareSeriesData(rawTrainPairs, windowInfo, isVm),
+      data: historyData,
       showSymbol: false,
       sampling: "lttb",
       lineStyle: { color: "#2563eb", width: 1.35, opacity: (isVm || activeMode.key === "raw") ? 0.55 : 0.78 },
@@ -306,7 +322,7 @@
     series.push({
       name: "测试",
       type: "line",
-      data: prepareSeriesData(rawTestPairs, windowInfo, isVm),
+      data: testData,
       showSymbol: false,
       sampling: "lttb",
       lineStyle: { color: "#dc2626", width: 2.1 },

@@ -98,6 +98,7 @@
 | `target_spec` | 可选，覆盖预测建议的目标规格 |
 | `confirm_create_flavor` | 可选，允许自动创建 OpenStack flavor |
 | `target_source` | 可选，标记目标规格来源：`suggested`（默认建议）、`confirmed`（人工复核后的建议）、`manual`（手动目标规格） |
+| `ignore_cooldown` | 可选，`true` 表示操作人已人工复核风险并跳过本次冷却期门控；默认 `false` |
 
 `execute` 模式会在入队前执行门控校验；`dry_run` 只生成计划，不执行命令，也不要求 `action_gate=ready`。
 
@@ -115,6 +116,7 @@
 手动目标规格执行（传入 `target_spec`，或 `target_source=manual`）使用操作人提供的目标规格。该模式不要求建议自身的 `action_gate` 和置信度达标，但仍需通过有效策略层级、数据质量、冷却期和 K8S 目标策略校验。
 
 任一门控失败都会返回 `execution gate blocked scaling: ...` 并拒绝创建执行任务。
+如需在开发、纠错或紧急恢复场景下重复调配同一资源，可在确认风险后传入 `ignore_cooldown=true`；该参数只跳过冷却期检查，仍保留数据质量、策略层级、置信度和 K8S 目标策略等其他门控。
 
 ### 任务状态流转
 

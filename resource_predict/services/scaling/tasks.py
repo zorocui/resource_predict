@@ -31,6 +31,7 @@ def create_scaling_task(
     allow_create_flavor: bool = False,
     target_spec_override: Any = None,
     target_source: str = "",
+    ignore_cooldown: bool = False,
 ) -> Dict[str, Any]:
     mode = mode if mode in {"dry_run", "execute"} else "dry_run"
     resource_id = str(resource.get("resource_id", "")).strip()
@@ -47,6 +48,7 @@ def create_scaling_task(
         gate_failures = _execution_gate_failures(
             resource,
             target_source=resolved_target_source,
+            ignore_cooldown=ignore_cooldown,
         )
         if gate_failures:
             logger.warning(
@@ -67,6 +69,7 @@ def create_scaling_task(
         "operator": operator,
         "allow_create_flavor": bool(allow_create_flavor),
         "target_source": resolved_target_source,
+        "ignore_cooldown": bool(ignore_cooldown),
         "status": "queued",
         "created_at_ms": now,
         "updated_at_ms": now,
@@ -98,6 +101,7 @@ def _execution_gate_failures(
     *,
     target_source: str = "suggested",
     now_ms: Optional[int] = None,
+    ignore_cooldown: bool = False,
 ) -> List[str]:
     """执行前门控：建议未就绪、置信度低、数据质量差或冷却期内均拒绝执行。"""
     failures: List[str] = []
@@ -130,9 +134,10 @@ def _execution_gate_failures(
                 f"(confidence={confidence or 'missing'}, score={confidence_score})"
             )
     failures.extend(_data_quality_failures(resource, advice))
-    cooldown_failure = _cooldown_failure(resource, advice, action=action, now_ms=now_ms)
-    if cooldown_failure:
-        failures.append(cooldown_failure)
+    if not ignore_cooldown:
+        cooldown_failure = _cooldown_failure(resource, advice, action=action, now_ms=now_ms)
+        if cooldown_failure:
+            failures.append(cooldown_failure)
     k8s_policy = advice.get("target_k8s_policy", {})
     if (
         resource_type_of(resource) == "k8s_workload"

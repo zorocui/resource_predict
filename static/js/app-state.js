@@ -109,9 +109,9 @@
     memory_request: "内存 Request",
   });
   window.ResourcePredictApp.viewMetricMap.k8s_workload = [
-    "cpu_limit",
     "cpu_request",
-    "memory_limit",
+    "cpu_limit",
     "memory_request",
+    "memory_limit",
   ];
 })();

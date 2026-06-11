@@ -295,6 +295,15 @@
   }
 
   function triggerMetric(item) {
+    if (isK8s(item)) {
+      const keys = metricKeysFor(item);
+      for (const baseKey of ["cpu", "memory"]) {
+        const action = metricActionFor(item, baseKey);
+        if (action === "hold") continue;
+        const preferredKey = representativeK8sMetricKey(item, baseKey, action);
+        if (keys.includes(preferredKey)) return preferredKey;
+      }
+    }
     return metricKeysFor(item).find((key) => metricActionFor(item, key) !== "hold") || metricKeysFor(item)[0];
   }
 
