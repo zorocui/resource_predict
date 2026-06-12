@@ -237,16 +237,38 @@
     return actionLabel(action);
   }
 
+  function historyCoverage(item) {
+    const direct = item?.history_coverage;
+    const advice = item?.scaling_advice?.history_coverage;
+    const value = direct && typeof direct === "object" ? direct : advice;
+    return value && typeof value === "object" ? value : {};
+  }
+
+  function historyCoverageLabel(item) {
+    const coverage = historyCoverage(item);
+    if (!coverage.is_short) return "";
+    const days = Number(coverage.span_days);
+    const threshold = Number(coverage.threshold_days || 5);
+    const dayText = Number.isFinite(days) ? `${formatNumber(days, 1)} 天` : "不足";
+    return `历史不足 ${formatNumber(threshold, 0)} 天 · ${dayText}`;
+  }
+
+  function historyCoveragePill(item) {
+    const label = historyCoverageLabel(item);
+    return label ? `<span class="metric-pill is-insufficient_data">${escapeHtml(label)}</span>` : "";
+  }
+
   function replicaTargetSummary(item) {
     const target = item?.scaling_advice?.target_spec || {};
     const targetReplicas = Number(target.replicas);
-    if (!Number.isFinite(targetReplicas) || targetReplicas <= 0) return "";
+    if (!Number.isFinite(targetReplicas) || targetReplicas <= 0) return null;
     const current = Number(currentReplicas(item?.spec || {}));
     if (!Number.isFinite(current) || current <= 0 || current === targetReplicas) {
-      return `目标副本 ${formatNumber(targetReplicas, 0)}`;
+      return { text: `目标副本 ${formatNumber(targetReplicas, 0)}`, action: "hold" };
     }
+    const action = targetReplicas > current ? "scale_out_candidate" : "scale_in_candidate";
     const label = targetReplicas > current ? "扩副本" : "缩副本";
-    return `${label} ${formatNumber(current, 0)} → ${formatNumber(targetReplicas, 0)}`;
+    return { text: `${label} ${formatNumber(current, 0)} → ${formatNumber(targetReplicas, 0)}`, action };
   }
 
   function representativeK8sMetricStats(item, baseKey, action) {
@@ -277,17 +299,16 @@
 
   function k8sMetricSummary(item) {
     const chips = [];
-    const overallAction = actionOf(item);
-    const replicaText = replicaTargetSummary(item);
-    if (replicaText) {
-      chips.push(`<span class="metric-pill is-${escapeHtml(overallAction)}">${escapeHtml(replicaText)}</span>`);
+    const replica = replicaTargetSummary(item);
+    if (replica) {
+      chips.push(`<span class="metric-pill is-${escapeHtml(replica.action)}">${escapeHtml(replica.text)}</span>`);
     }
     ["cpu", "memory"].forEach((baseKey) => {
       const action = metricActionFor(item, baseKey);
       const representative = representativeK8sMetricStats(item, baseKey, action);
       const stat = representative.stats;
       const unit = resolveDisplayUnit(item, representative.key);
-      const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)}` : actionLabel(action);
+      const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)} · Workload` : actionLabel(action);
       const label = metricTitleFor(item, representative.key);
       chips.push(`<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(label)} ${escapeHtml(p95)}</span>`);
     });
@@ -308,15 +329,15 @@
   }
 
   function metricSummary(item) {
-    if (isK8s(item)) return k8sMetricSummary(item);
-    return metricKeysFor(item).map((key) => {
+    if (isK8s(item)) return [historyCoveragePill(item), k8sMetricSummary(item)].filter(Boolean).join("");
+    return [historyCoveragePill(item), ...metricKeysFor(item).map((key) => {
       const stat = metricObservedStatsFor(item, key) || metricStatsFor(item, key);
       const action = metricActionFor(item, key);
       const label = metricActionLabel(item, key, action);
       const unit = resolveDisplayUnit(item, key);
       const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)}` : "";
       return `<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(app.metricTitleMap[key])} ${escapeHtml(label)}${p95 ? ` · ${escapeHtml(p95)}` : ""}</span>`;
-    }).join("");
+    })].filter(Boolean).join("");
   }
 
   function targetSpecText(item) {
@@ -853,6 +874,7 @@
     formatNumber,
     formatStatValue,
     formatMemoryGiB,
+    historyCoverageLabel,
     infoTooltip,
     isK8s,
     analysisOnlyReasons,

@@ -77,6 +77,7 @@ def write_prediction_outputs(
                 "anomaly_score": anomaly_score,
                 "scaling_advice": item.get("scaling_advice", {}),
                 "observed_stats": item.get("observed_stats", {}),
+                "history_coverage": item.get("history_coverage", {}),
                 "resource_profile": item.get("resource_profile", {}),
                 "detail_ref": details_lookup.get(rid, {}),
         }

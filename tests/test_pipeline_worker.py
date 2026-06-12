@@ -45,3 +45,6 @@ def test_worker_writes_observed_stats_for_full_history():
     assert item["observed_stats"]["cpu"]["peak"] == 4.0
     assert item["observed_stats"]["cpu"]["p95"] == 3.8499999999999996
     assert item["observed_stats"]["memory"]["p95"] == 0.385
+    assert item["history_coverage"]["span_hours"] == 3.0
+    assert item["history_coverage"]["span_days"] == 0.12
+    assert item["history_coverage"]["is_short"] is True

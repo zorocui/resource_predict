@@ -54,7 +54,9 @@
   }
 
   function chartRange() {
-    return CHART_RANGES.find((item) => item.key === app.chartRangeKey) || CHART_RANGES[1];
+    return CHART_RANGES.find((item) => item.key === app.chartRangeKey)
+      || CHART_RANGES.find((item) => item.key === "7d")
+      || CHART_RANGES[0];
   }
 
   function chartMode() {
@@ -644,7 +646,8 @@
             ${analysisReasons.map((reason) => `<li>${list.escapeHtml(reason)}</li>`).join("")}
           </ul>
         </div>` : "";
-    app.els.detailConfidence.innerHTML = `置信度 ${list.escapeHtml(list.CONFIDENCE_LABELS[confidence] || confidence)}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""} ${list.infoTooltip(list.CONFIDENCE_HELP, "置信度计算说明")}`;
+    const historyLabel = list.historyCoverageLabel(resource);
+    app.els.detailConfidence.innerHTML = `置信度 ${list.escapeHtml(list.CONFIDENCE_LABELS[confidence] || confidence)}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""}${historyLabel ? ` · ${list.escapeHtml(historyLabel)}` : ""} ${list.infoTooltip(list.CONFIDENCE_HELP, "置信度计算说明")}`;
     app.els.detailConfidence.className = `confidence-chip is-${confidence}`;
     app.els.detailAdvice.innerHTML = `
       <div class="decision-summary is-${list.escapeHtml(action)}">
@@ -669,12 +672,13 @@
           const unit = list.resolveDisplayUnit(resource, key);
           const st = observed || {};
           const metricTitle = `${list.metricTitleFor(resource, key)}${containerName ? ` · ${containerName}` : ""}`;
+          const statScope = list.isK8s(resource) ? (containerName ? "Container" : "Workload") : "Resource";
           return `<div class="reason-item">
             <span class="reason-metric">${list.escapeHtml(metricTitle)}</span>
             <strong class="reason-action is-${list.escapeHtml(mAction)}">${list.escapeHtml(list.actionLabel(mAction))}</strong>
             <small class="reason-stats">
               <span><b>平均</b><em>${list.formatStatValue(st.avg, unit)}</em></span>
-              <span><b>P95</b><em>${list.formatStatValue(st.p95, unit)}</em></span>
+              <span><b>P95 · ${list.escapeHtml(statScope)}</b><em>${list.formatStatValue(st.p95, unit)}</em></span>
               <span><b>峰值</b><em>${list.formatStatValue(st.peak, unit)}</em></span>
             </small>
           </div>`;

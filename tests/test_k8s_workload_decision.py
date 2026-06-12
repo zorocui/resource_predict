@@ -139,6 +139,44 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
             advice["target_spec"]["replicas"],
         )
 
+    def test_short_history_caps_k8s_confidence_below_execution_threshold(self):
+        resource = {
+            "resource_id": "k8s:cluster:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "spec": {
+                "cluster": "cluster",
+                "namespace": "ns",
+                "workload_kind": "Deployment",
+                "workload_name": "api",
+                "replicas_observed": 2,
+                **_containers(cpu_request=2.0, cpu_limit=4.0, memory_request=2.0, memory_limit=4.0),
+            },
+            "data_quality": _quality("good"),
+            "history_coverage": {
+                "span_hours": 24.0,
+                "span_days": 1.0,
+                "threshold_hours": 120,
+                "threshold_days": 5,
+                "is_short": True,
+            },
+        }
+
+        advice = build_k8s_workload_advice(
+            {
+                "cpu_limit": np.array([0.95, 0.96, 0.97]),
+                "cpu_request": np.array([0.95, 0.96, 0.97]),
+                "memory_limit": np.array([0.95, 0.96, 0.97]),
+                "memory_request": np.array([0.95, 0.96, 0.97]),
+            },
+            resource=resource,
+        )
+
+        self.assertEqual(advice["action"], "scale_out_candidate")
+        self.assertLess(advice["confidence_score"], 72.0)
+        self.assertEqual(advice["confidence"], "medium")
+        self.assertIn("history coverage is below 5 days", advice["history_warning"])
+        self.assertTrue(any("history coverage is below 5 days" in note for note in advice["target_k8s_policy"]["notes"]))
+
     def test_multi_container_targets_use_container_granularity(self):
         resource = {
             "resource_id": "k8s:cluster:ns:deployment:api",

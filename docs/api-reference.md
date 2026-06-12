@@ -105,7 +105,7 @@
 自动建议执行（`target_source=suggested` 或未传）必须同时满足：
 
 - `action_gate.state=ready`，即建议已达到当前策略层级要求的确认轮次。
-- `confidence=high` 且 `confidence_score >= 72`。
+- `confidence=high` 且 `confidence_score >= 72`。如果资源历史覆盖不足 5 天且建议不是 `hold`，`scaling_advice.history_warning` 会说明短历史风险，`confidence_score` 会被降级到执行阈值以下。
 - `policy_tier` 为 `conservative` / `balanced` / `aggressive` 之一。
 - 相关指标的数据质量满足执行要求：K8S Workload 的相关 request/limit 指标必须为 `data_quality=good`；VM 若记录了非 good 的指标质量，也会阻断。
 - 当前资源不在冷却期内：扩容默认 60 分钟，缩容默认 360 分钟，可由 `risk_profile.cooldown_minutes` 覆盖。

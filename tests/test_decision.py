@@ -426,6 +426,8 @@ class TestDecision(unittest.TestCase):
             "target_spec",
             "stats",
             "has_mixed_signals",
+            "history_coverage",
+            "history_warning",
         }
         self.assertEqual(set(advice.keys()), expected_keys)
 
@@ -438,6 +440,21 @@ class TestDecision(unittest.TestCase):
             advice = build_scaling_advice(future, current_spec=VM_SPEC)
         # With scale_out_threshold=0.7, p95=0.75 >= 0.7 -> hot -> scale_out.
         self.assertEqual(advice["action"], "scale_out")
+
+    def test_short_history_caps_non_hold_confidence_below_execution_threshold(self):
+        future = _future({"cpu": [0.95] * 24, "memory": [0.95] * 24})
+
+        advice = build_scaling_advice(
+            future,
+            current_spec=VM_SPEC,
+            history_coverage={"span_hours": 24.0, "span_days": 1.0, "threshold_hours": 120, "threshold_days": 5},
+        )
+
+        self.assertEqual(advice["action"], "scale_out")
+        self.assertLess(advice["confidence_score"], 72.0)
+        self.assertEqual(advice["confidence"], "medium")
+        self.assertIn("历史覆盖不足", advice["history_warning"])
+        self.assertEqual(advice["action_gate"]["state"], "observe")
 
     def test_build_scaling_advice_rightsize_detection(self):
         """中等使用率（20%~55%）应被识别为 rightsize 候选。"""

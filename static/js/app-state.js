@@ -93,7 +93,7 @@
       chartModalChart: document.getElementById("chart-modal-chart"),
     },
     chartAuxiliaryVisible: true,
-    chartRangeKey: "3d",
+    chartRangeKey: "7d",
     chartModeKey: "trend",
     selectedContainerByResourceMetric: new Map(),
     detailChartInstance: null,

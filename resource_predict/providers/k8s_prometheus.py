@@ -480,10 +480,14 @@ def _fetch_target(
             mem_container_s = mem_usage_by_container.get(key, {}).get(container)
             if cpu_container_s is None or mem_container_s is None:
                 continue
+            cpu_limit_total = _container_total_value(cpu_limit_by_container.get(key, {}), container)
+            cpu_request_total = _container_total_value(cpu_request_by_container.get(key, {}), container)
+            mem_limit_total = _container_total_value(mem_limit_by_container.get(key, {}), container)
+            mem_request_total = _container_total_value(mem_request_by_container.get(key, {}), container)
             cpu_limit_container_metric, cpu_limit_container_norm = _normalize_scoped_series(
                 (
-                    cpu_container_s if _container_value(cpu_limit_by_container.get(key, {}), container) else None,
-                    _container_value(cpu_limit_by_container.get(key, {}), container),
+                    cpu_container_s if cpu_limit_total else None,
+                    cpu_limit_total,
                     "cpu_usage/cpu_limit",
                 ),
                 raw_series=cpu_container_s,
@@ -491,8 +495,8 @@ def _fetch_target(
             )
             cpu_request_container_metric, cpu_request_container_norm = _normalize_scoped_series(
                 (
-                    cpu_container_s if _container_value(cpu_request_by_container.get(key, {}), container) else None,
-                    _container_value(cpu_request_by_container.get(key, {}), container),
+                    cpu_container_s if cpu_request_total else None,
+                    cpu_request_total,
                     "cpu_usage/cpu_request",
                 ),
                 raw_series=cpu_container_s,
@@ -501,9 +505,9 @@ def _fetch_target(
             mem_limit_container_metric, mem_limit_container_norm = _normalize_scoped_series(
                 (
                     _series_bytes_to_gb(mem_container_s)
-                    if _container_value(mem_limit_by_container.get(key, {}), container)
+                    if mem_limit_total
                     else None,
-                    _bytes_to_gb(_container_value(mem_limit_by_container.get(key, {}), container)),
+                    _bytes_to_gb(mem_limit_total),
                     "memory_working_set/memory_limit",
                 ),
                 raw_series=mem_container_s / BYTES_PER_GIB,
@@ -512,9 +516,9 @@ def _fetch_target(
             mem_request_container_metric, mem_request_container_norm = _normalize_scoped_series(
                 (
                     _series_bytes_to_gb(mem_container_s)
-                    if _container_value(mem_request_by_container.get(key, {}), container)
+                    if mem_request_total
                     else None,
-                    _bytes_to_gb(_container_value(mem_request_by_container.get(key, {}), container)),
+                    _bytes_to_gb(mem_request_total),
                     "memory_working_set/memory_request",
                 ),
                 raw_series=mem_container_s / BYTES_PER_GIB,
@@ -939,6 +943,17 @@ def _container_value(container_values: Dict[str, Dict[str, Any]], container: str
     if total is None or not isinstance(pods, set) or not pods:
         return None
     return float(total) / max(1, len(pods))
+
+
+def _container_total_value(container_values: Dict[str, Dict[str, Any]], container: str) -> Optional[float]:
+    item = container_values.get(container)
+    if not isinstance(item, dict):
+        return None
+    total = item.get("total")
+    pods = item.get("pods")
+    if total is None or not isinstance(pods, set) or not pods:
+        return None
+    return float(total)
 
 
 def _container_specs(

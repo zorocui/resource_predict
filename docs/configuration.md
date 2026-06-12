@@ -214,7 +214,7 @@ outputs/
 ### `summary_index.json`
 
 资源列表摘要，包含扩缩容建议、紧急度、预测方法选择和 anomaly_score。前端列表页直接读取此文件。
-每个资源还包含轻量 `observed_stats`，按指标保存历史观测窗口的 `avg`、`p95`、`peak`，风险队列和详情抽屉统一读取该字段展示历史统计。
+每个资源还包含轻量 `observed_stats`，按指标保存历史观测窗口的 `avg`、`p95`、`peak`，风险队列和详情抽屉统一读取该字段展示历史统计。`history_coverage` 记录各指标历史覆盖时长，包含 `span_hours`、`span_days`、`threshold_days=5`、`is_short` 等字段；当历史不足 5 天且建议不是 `hold` 时，系统会将建议置信度降级到执行阈值以下，前端也会显示“历史不足 5 天”提示。
 
 ### `manifest.json`
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -9,6 +9,8 @@ from resource_predict.settings import settings
 from resource_predict.utils import compute_metric_stats, resolve_policy_tier
 
 _VM_TIER_FIELDS = ("project", "tenant", "environment", "cluster", "owner_name", "service", "app", "env")
+_MIN_HISTORY_COVERAGE_HOURS = 5 * 24
+_SHORT_HISTORY_CONFIDENCE_CAP = 71.0
 
 
 def _normalize_spec(spec: Dict[str, object]) -> Dict[str, int]:
@@ -533,9 +535,25 @@ def _overall_confidence(
     return {"label": label, "score": round(score, 2), "metric_scores": metric_scores}
 
 
+def _short_history_note(history_coverage: Optional[Dict[str, Any]], action: str) -> str:
+    if action == "hold" or not isinstance(history_coverage, dict):
+        return ""
+    try:
+        span_hours = float(history_coverage.get("span_hours", 0.0))
+    except Exception:
+        span_hours = 0.0
+    threshold_hours = float(history_coverage.get("threshold_hours") or _MIN_HISTORY_COVERAGE_HOURS)
+    if span_hours >= threshold_hours:
+        return ""
+    span_days = span_hours / 24.0
+    threshold_days = threshold_hours / 24.0
+    return f"历史覆盖不足 {threshold_days:.0f} 天（当前约 {span_days:.1f} 天），置信度降级"
+
+
 def build_scaling_advice(
     metric_future_values: Dict[str, np.ndarray],
     current_spec: Dict[str, object] | None = None,
+    history_coverage: Dict[str, Any] | None = None,
 ) -> Dict[str, object]:
     """
     根据未来窗口负载预测生成扩缩容建议。
@@ -643,6 +661,11 @@ def build_scaling_advice(
     )
     confidence = str(confidence_info["label"])
     confidence_score = float(confidence_info["score"])
+    history_note = _short_history_note(history_coverage, action)
+    if history_note:
+        confidence_score = min(confidence_score, _SHORT_HISTORY_CONFIDENCE_CAP)
+        confidence = "medium" if confidence_score >= 45 else "low"
+        reason = f"{reason}；{history_note}"
     risk_profile = _risk_profile(
         action,
         by_metric,
@@ -668,4 +691,6 @@ def build_scaling_advice(
         "target_spec": target_spec,
         "stats": by_metric,
         "has_mixed_signals": has_mixed,
+        "history_coverage": history_coverage or {},
+        "history_warning": history_note,
     }

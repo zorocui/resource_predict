@@ -118,6 +118,7 @@ class _SingleForecastStore:
                     "anomaly_score": 0.0,
                     "detail_ref": {},
                     "scaling_advice": item.get("scaling_advice", {}),
+                    "history_coverage": item.get("history_coverage", {}),
                 }
             )
         return {"meta": {"resources": len(output)}, "resources": output}

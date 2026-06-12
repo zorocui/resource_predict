@@ -498,10 +498,9 @@ h1 {
   font-size: 12px;
   line-height: 1.45;
   max-width: 100%;
-  overflow: hidden;
+  overflow-wrap: anywhere;
   text-align: right;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: pre-line;
 }
 
 .info-tooltip {

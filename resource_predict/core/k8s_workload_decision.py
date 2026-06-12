@@ -15,6 +15,8 @@ from resource_predict.utils import (
 )
 
 _K8S_TIER_FIELDS = ("namespace", "cluster", "owner_name", "workload_name", "pod")
+_MIN_HISTORY_COVERAGE_HOURS = 5 * 24
+_SHORT_HISTORY_CONFIDENCE_CAP = 71.0
 
 
 def _quality_level(resource: Dict[str, Any], metric: str) -> str:
@@ -25,6 +27,21 @@ def _quality_level(resource: Dict[str, Any], metric: str) -> str:
     if not isinstance(block, dict):
         return "unknown"
     return str(block.get("level") or "unknown").lower()
+
+
+def _short_history_note(history_coverage: Any, action: str) -> str:
+    if action == "hold" or not isinstance(history_coverage, dict):
+        return ""
+    try:
+        span_hours = float(history_coverage.get("span_hours", 0.0))
+    except Exception:
+        span_hours = 0.0
+    threshold_hours = float(history_coverage.get("threshold_hours") or _MIN_HISTORY_COVERAGE_HOURS)
+    if span_hours >= threshold_hours:
+        return ""
+    span_days = span_hours / 24.0
+    threshold_days = threshold_hours / 24.0
+    return f"history coverage is below {threshold_days:.0f} days(current={span_days:.1f} days); confidence downgraded"
 
 
 def _sum_container_spec(spec: Dict[str, Any], field: str) -> float | None:
@@ -698,6 +715,11 @@ def build_k8s_workload_advice(
         confidence_score += 4.0
     if baseline_missing and not target_policy.get("ready_for_execution"):
         confidence_score -= 6.0
+    history_coverage = resource.get("history_coverage", {})
+    history_note = _short_history_note(history_coverage, action)
+    if history_note:
+        confidence_score = min(confidence_score, _SHORT_HISTORY_CONFIDENCE_CAP)
+        target_policy.setdefault("notes", []).append(history_note)
     confidence_score = max(0.0, min(100.0, confidence_score))
     confidence = "high" if confidence_score >= 72 else "medium" if confidence_score >= 45 else "low"
 
@@ -745,6 +767,8 @@ def build_k8s_workload_advice(
         "stats": decision_stats,
         "signal_stats": by_metric,
         "data_quality": resource.get("data_quality", {}),
+        "history_coverage": history_coverage if isinstance(history_coverage, dict) else {},
+        "history_warning": history_note,
         "target_spec": target_spec,
         "target_k8s_policy": target_policy,
         "analysis_only": not bool(target_spec),

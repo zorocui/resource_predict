@@ -80,6 +80,7 @@ def worker(
     observed_stats: Dict[str, Dict[str, float]] = {}
     futures_for_advice: Dict[str, np.ndarray] = {}
     forecast_diagnostics: Dict[str, Any] = {}
+    history_coverage = _history_coverage(source, metric_names)
     for metric_name in metrics_to_fit:
         pred, metric_scores, best, future_pred, _timing, diagnostics = computed[metric_name]
         observed_stats[metric_name] = compute_metric_stats(source[metric_name].to_numpy(dtype=float))
@@ -108,13 +109,14 @@ def worker(
     if resource_type == "k8s_workload" and len(futures_for_advice) == len(metric_names):
         advice = build_k8s_workload_advice(
             futures_for_advice,
-            resource=source,
+            resource={**source, "history_coverage": history_coverage},
             container_future_values=container_futures_for_advice,
         )
     elif len(futures_for_advice) == len(METRIC_NAMES):
         advice = build_scaling_advice(
             futures_for_advice,
             current_spec=spec,
+            history_coverage=history_coverage,
         )
     resource_profile = build_resource_profile(
         resource_type=resource_type,
@@ -130,6 +132,7 @@ def worker(
         "best_methods": best_methods,
         "metrics": metrics_out,
         "observed_stats": observed_stats,
+        "history_coverage": history_coverage,
         "charts_forecast": charts_forecast,
         "forecast_diagnostics": forecast_diagnostics,
         "resource_profile": resource_profile,
@@ -147,6 +150,34 @@ def worker(
     if advice is not None:
         item["scaling_advice"] = advice
     return item
+
+
+def _history_coverage(source: Dict[str, Any], metric_names: tuple[str, ...]) -> Dict[str, Any]:
+    spans: Dict[str, float] = {}
+    for metric_name in metric_names:
+        series = source.get(metric_name)
+        index = getattr(series, "index", None)
+        if index is None or len(index) < 2:
+            spans[metric_name] = 0.0
+            continue
+        try:
+            span_hours = float((index.max() - index.min()).total_seconds()) / 3600.0
+        except Exception:
+            span_hours = 0.0
+        spans[metric_name] = max(0.0, span_hours)
+    min_span = min(spans.values()) if spans else 0.0
+    max_span = max(spans.values()) if spans else 0.0
+    threshold_hours = 5 * 24
+    return {
+        "span_hours": round(min_span, 2),
+        "span_days": round(min_span / 24.0, 2),
+        "max_span_hours": round(max_span, 2),
+        "max_span_days": round(max_span / 24.0, 2),
+        "threshold_hours": threshold_hours,
+        "threshold_days": 5,
+        "is_short": min_span < threshold_hours,
+        "metric_spans_hours": {key: round(value, 2) for key, value in spans.items()},
+    }
 
 
 def _fit_container_metrics(

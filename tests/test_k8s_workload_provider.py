@@ -427,6 +427,13 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["memory_limit"]["values"][1], 0.08)
         self.assertAlmostEqual(metrics["memory_request"]["values"][0], 0.05)
         self.assertAlmostEqual(metrics["memory_request"]["values"][1], 0.1)
+        container_metrics = items[0]["container_metrics"]
+        self.assertAlmostEqual(container_metrics["config-reloader"]["cpu_limit"]["values"][0], 0.1)
+        self.assertAlmostEqual(container_metrics["config-reloader"]["cpu_limit"]["values"][1], 0.2)
+        self.assertAlmostEqual(container_metrics["config-reloader"]["memory_limit"]["values"][0], 0.04)
+        self.assertAlmostEqual(container_metrics["config-reloader"]["memory_limit"]["values"][1], 0.08)
+        self.assertAlmostEqual(container_metrics["alertmanager"]["memory_request"]["values"][0], 0.05)
+        self.assertAlmostEqual(container_metrics["alertmanager"]["memory_request"]["values"][1], 0.1)
 
     def test_data_quality_uses_seconds_for_gap_threshold(self):
         idx = pd.date_range("2026-01-01", periods=24, freq="300s")

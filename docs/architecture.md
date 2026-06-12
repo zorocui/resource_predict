@@ -295,7 +295,7 @@ sequenceDiagram
 - **策略分级**：conservative / balanced / aggressive，阈值和确认轮次差异化
 - **风险画像**：每个资源生成 `risk_profile`，包含 `saturation_risk`（饱和风险分）、`idle_opportunity`（空闲机会分）、`risk_score`（综合风险分）、当前生效阈值和冷却时间
 - **置信度评分**：多指标加权（P95 强度 42 + 峰值强度 20 + 均值强度 14 + 持续性 16 + 趋势 8）
-- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需确认轮次。扩容默认需要 `scale_out_confirmations=2` 轮，缩容默认需要 `scale_in_confirmations=3` 轮；conservative 缩容 +1 轮、aggressive 缩容 -1 轮，conservative 扩容可少 1 轮。当前实现未持久化跨预测轮次计数，因此需要多轮确认的建议会保持 `observe`，除非通过人工复核路径执行；进入 `execute` 前还会强制校验 `confidence`、`data_quality`、`cooldown` 和 `policy_tier`
+- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需确认轮次。扩容默认需要 `scale_out_confirmations=2` 轮，缩容默认需要 `scale_in_confirmations=3` 轮；conservative 缩容 +1 轮、aggressive 缩容 -1 轮，conservative 扩容可少 1 轮。当前实现未持久化跨预测轮次计数，因此需要多轮确认的建议会保持 `observe`，除非通过人工复核路径执行；进入 `execute` 前还会强制校验 `confidence`、`data_quality`、`cooldown` 和 `policy_tier`。资源历史覆盖不足 5 天时，非 `hold` 建议会记录 `history_warning` 并将置信度降到执行阈值以下。
 
 ### K8S Workload 决策引擎（`core/k8s_workload_decision.py`）
 
