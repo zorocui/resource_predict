@@ -248,6 +248,48 @@
       || entries[0];
   }
 
+  function selectedContainerName(resource, metricKey) {
+    return selectedContainerEntry(resource, metricKey)?.name || "";
+  }
+
+  function containerMetricMode(resource, containerName, metricKey) {
+    if (!containerName) return "";
+    const modes = resource?.container_metric_modes;
+    if (!modes || typeof modes !== "object" || Array.isArray(modes)) return "";
+    const byMetric = modes[containerName];
+    if (!byMetric || typeof byMetric !== "object" || Array.isArray(byMetric)) return "";
+    return String(byMetric[metricKey] || "");
+  }
+
+  function metricModeForChart(resource, metricKey, containerName = "") {
+    return containerMetricMode(resource, containerName || selectedContainerName(resource, metricKey), metricKey)
+      || String(resource?.spec?.[`${metricKey}_metric_mode`] || "");
+  }
+
+  function isRawMetricMode(metricKey, mode) {
+    const value = String(mode || "").toLowerCase();
+    if (String(metricKey).startsWith("cpu_")) return value.includes("cpu_usage_cores") || value === "raw";
+    if (String(metricKey).startsWith("memory_")) return value.includes("memory_working_set_gb") || value === "raw";
+    return false;
+  }
+
+  function displayUnitForChart(resource, metricKey, containerName = "") {
+    const mode = metricModeForChart(resource, metricKey, containerName);
+    if (isRawMetricMode(metricKey, mode)) {
+      return String(metricKey).startsWith("cpu_") ? "cores" : "gib";
+    }
+    return list.resolveDisplayUnit(resource, metricKey);
+  }
+
+  function metricTitleForChart(resource, metricKey, containerName = "") {
+    const mode = metricModeForChart(resource, metricKey, containerName);
+    if (isRawMetricMode(metricKey, mode)) {
+      if (String(metricKey).startsWith("cpu_")) return "CPU 使用量";
+      if (String(metricKey).startsWith("memory_")) return "内存使用量";
+    }
+    return list.metricTitleFor(resource, metricKey);
+  }
+
   function activeChartData(resource, metricKey, fallbackChartData) {
     const containerEntry = selectedContainerEntry(resource, metricKey);
     return containerEntry?.chart || fallbackChartData;
@@ -378,7 +420,7 @@
       backgroundColor: "transparent",
       animation: false,
       title: {
-        text: `${list.metricTitleFor(resource, metricKey)} 预测 · ${modeLabel}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
+        text: `${metricTitleForChart(resource, metricKey)} 预测 · ${modeLabel}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
         subtext: containerScope,
         left: "center",
         top: 6,
@@ -531,7 +573,7 @@
   function metricButtonsMarkup(resource, activeMetric, modal = false) {
     const attr = modal ? "data-modal-metric-key" : "data-metric-key";
     return list.metricKeysFor(resource).map((key) => (
-      `<button type="button" class="${key === activeMetric ? "active" : ""}" ${attr}="${list.escapeHtml(key)}">${list.escapeHtml(list.metricTitleFor(resource, key))}</button>`
+      `<button type="button" class="${key === activeMetric ? "active" : ""}" ${attr}="${list.escapeHtml(key)}">${list.escapeHtml(metricTitleForChart(resource, key))}</button>`
     )).join("");
   }
 
@@ -669,9 +711,9 @@
           const observed = list.containerMetricObservedStatsFor(resource, key, containerName)
             || list.metricObservedStatsFor(resource, key);
           const mAction = list.metricActionFor(resource, key);
-          const unit = list.resolveDisplayUnit(resource, key);
+          const unit = displayUnitForChart(resource, key, containerName);
           const st = observed || {};
-          const metricTitle = `${list.metricTitleFor(resource, key)}${containerName ? ` · ${containerName}` : ""}`;
+          const metricTitle = `${metricTitleForChart(resource, key, containerName)}${containerName ? ` · ${containerName}` : ""}`;
           const statScope = list.isK8s(resource) ? (containerName ? "Container" : "Workload") : "Resource";
           return `<div class="reason-item">
             <span class="reason-metric">${list.escapeHtml(metricTitle)}</span>
@@ -708,14 +750,14 @@
     const fallbackData = app.chartDataByKey.get(key);
     const data = activeChartData(resource, metricKey, fallbackData);
     if (!data) {
-      app.els.detailChart.innerHTML = `<div class="chart-state">暂无 ${list.escapeHtml(list.metricTitleFor(resource, metricKey))} 图表数据</div>`;
+      app.els.detailChart.innerHTML = `<div class="chart-state">暂无 ${list.escapeHtml(metricTitleForChart(resource, metricKey))} 图表数据</div>`;
       return;
     }
     if (typeof echarts === "undefined") {
       app.els.detailChart.innerHTML = `<div class="chart-state is-error">ECharts 未加载</div>`;
       return;
     }
-    const displayUnit = list.resolveDisplayUnit(resource, metricKey);
+    const displayUnit = displayUnitForChart(resource, metricKey);
     app.detailChartInstance = echarts.init(app.els.detailChart, null, { renderer: app.ECHARTS_RENDERER });
     app.detailChartInstance.setOption(buildChartOption(data, metricKey, displayUnit, resource), { notMerge: true, lazyUpdate: false });
     requestAnimationFrame(() => app.detailChartInstance?.resize());
@@ -734,14 +776,14 @@
     if (!data || typeof echarts === "undefined" || !app.els.chartModal || !app.els.chartModalChart) return;
     disposeModalChart();
     app.els.chartModal.hidden = false;
-    const metricName = list.metricTitleFor(resource, activeMetric);
+    const metricName = metricTitleForChart(resource, activeMetric);
     app.els.chartModalTitle.textContent = `${metricName} 指标预测`;
     app.els.chartModalSubtitle.textContent = app.state.selectedResourceId;
     renderMetricTabs(resource, activeMetric);
     renderModalMetricTabs(resource, activeMetric);
     app.els.chartModalChart.innerHTML = "";
     app.modalChartInstance = echarts.init(app.els.chartModalChart, null, { renderer: app.ECHARTS_RENDERER });
-    const displayUnit = list.resolveDisplayUnit(resource, activeMetric);
+    const displayUnit = displayUnitForChart(resource, activeMetric);
     app.modalChartInstance.setOption(buildChartOption(data, activeMetric, displayUnit, resource), { notMerge: true, lazyUpdate: false });
     renderChart(app.state.selectedResourceId, activeMetric, resource);
     requestAnimationFrame(() => app.modalChartInstance?.resize());
