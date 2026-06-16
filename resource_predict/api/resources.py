@@ -6,7 +6,7 @@ from flask import Flask, jsonify, request
 
 from resource_predict.resource_types import resource_type_of
 from resource_predict.settings import settings
-from resource_predict.services.urgency import compute_urgency_score
+from resource_predict.services.urgency import compute_urgency_breakdown
 
 
 def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) -> None:
@@ -53,10 +53,17 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                     )
                     and not bool((x.get("scaling_advice", {}) or {}).get("has_mixed_signals"))
                 ]
-        rows = [
-            {**x, "urgency_score": compute_urgency_score(x, settings.decision)}
-            for x in rows
-        ]
+        enriched_rows = []
+        for x in rows:
+            urgency = compute_urgency_breakdown(x, settings.decision)
+            enriched_rows.append(
+                {
+                    **x,
+                    "urgency_score": urgency.get("score", 0.0),
+                    "urgency_breakdown": urgency,
+                }
+            )
+        rows = enriched_rows
 
         if sort_by == "resource_id":
             rows.sort(key=lambda x: str(x.get("resource_id", "")))

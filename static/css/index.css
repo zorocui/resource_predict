@@ -362,7 +362,7 @@ h1 {
 .risk-row {
   position: relative;
   display: grid;
-  grid-template-columns: 4px minmax(0, 1fr) minmax(230px, 280px);
+  grid-template-columns: 4px minmax(0, 1fr) minmax(420px, max-content);
   gap: 12px;
   width: 100%;
   min-width: 0;
@@ -498,9 +498,11 @@ h1 {
   font-size: 12px;
   line-height: 1.45;
   max-width: 100%;
-  overflow-wrap: anywhere;
+  overflow: visible;
+  overflow-wrap: normal;
   text-align: right;
-  white-space: pre-line;
+  white-space: pre;
+  word-break: normal;
 }
 
 .info-tooltip {
@@ -1887,6 +1889,10 @@ h1 {
     grid-template-columns: 230px minmax(0, 1fr);
   }
 
+  .risk-row {
+    grid-template-columns: 4px minmax(0, 1fr) minmax(360px, max-content);
+  }
+
   .detail-panel {
     width: min(700px, calc(100vw - 300px));
   }
@@ -1990,9 +1996,9 @@ h1 {
 
   .target-text {
     grid-column: 1 / -1;
-    overflow-wrap: anywhere;
+    overflow-wrap: normal;
     text-align: left;
-    white-space: normal;
+    white-space: pre;
   }
 
   .reason-grid,

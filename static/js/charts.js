@@ -675,6 +675,56 @@
     return raw || "-";
   }
 
+  function confidenceTooltip(resource) {
+    const advice = resource?.scaling_advice || {};
+    const score = Number(advice.confidence_score);
+    if (!Number.isFinite(score)) return list.CONFIDENCE_HELP;
+    const metricScores = advice.confidence_metric_scores && typeof advice.confidence_metric_scores === "object"
+      ? advice.confidence_metric_scores
+      : {};
+    const values = Object.values(metricScores).map((value) => Number(value)).filter(Number.isFinite);
+    if (!values.length) return `置信度${list.formatNumber(score, 1)} = 默认中等置信度${list.formatNumber(score, 1)} + 其他调整0`;
+    const primary = Math.max(...values);
+    const avg = values.reduce((acc, value) => acc + value, 0) / values.length;
+    const multiMetricBonus = values.length >= 2 ? 4 : 0;
+    const mixedSignalPenalty = advice.has_mixed_signals ? -8 : 0;
+    const executionReadyBonus = list.isK8s(resource) && advice.target_k8s_policy?.ready_for_execution ? 4 : 0;
+    const components = [
+      { label: "最高指标得分", rawValue: primary, multiplier: 0.65, value: 0.65 * primary },
+      { label: "平均指标得分", rawValue: avg, multiplier: 0.35, value: 0.35 * avg },
+      { label: "多指标加成", value: multiMetricBonus },
+      { label: "混合信号扣分", value: mixedSignalPenalty },
+    ];
+    if (list.isK8s(resource)) {
+      components.push({ label: "执行就绪加成", value: executionReadyBonus });
+    }
+    const subtotal = components.reduce((acc, part) => acc + Number(part.value || 0), 0);
+    const residual = score - subtotal;
+    components.push({ label: "其他调整/封顶", value: residual });
+    const formula = `置信度${list.formatNumber(score, 1)} = ${components.map((part, index) => formulaTerm(part, index)).join(" ")}`;
+    const lines = [formula, "指标得分:"];
+    Object.keys(metricScores).sort().forEach((metric) => {
+      const value = Number(metricScores[metric]);
+      if (!Number.isFinite(value)) return;
+      const action = advice.metric_actions?.[metric] || "";
+      const label = app.metricTitleMap[metric] || metric;
+      const actionText = action ? ` ${list.actionLabel(action)}` : "";
+      lines.push(`  ${label}${actionText}: ${list.formatNumber(value, 1)}`);
+    });
+    return lines.join("\n");
+  }
+
+  function formulaTerm(part, index) {
+    const value = Number(part.value);
+    const rawValue = Number(part.rawValue);
+    const multiplier = Number(part.multiplier);
+    const text = Number.isFinite(rawValue) && Number.isFinite(multiplier)
+      ? `${part.label}${list.formatNumber(rawValue, 1)} * ${list.formatNumber(multiplier, 2)}`
+      : `${part.label}${list.formatNumber(Math.abs(value), 1)}`;
+    if (index === 0) return value < 0 ? `-${text}` : text;
+    return `${value < 0 ? "-" : "+"} ${text}`;
+  }
+
   function renderAdvice(resource) {
     const advice = resource?.scaling_advice || {};
     const action = list.actionOf(resource);
@@ -689,7 +739,7 @@
           </ul>
         </div>` : "";
     const historyLabel = list.historyCoverageLabel(resource);
-    app.els.detailConfidence.innerHTML = `置信度 ${list.escapeHtml(list.CONFIDENCE_LABELS[confidence] || confidence)}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""}${historyLabel ? ` · ${list.escapeHtml(historyLabel)}` : ""} ${list.infoTooltip(list.CONFIDENCE_HELP, "置信度计算说明")}`;
+    app.els.detailConfidence.innerHTML = `置信度 ${list.escapeHtml(list.CONFIDENCE_LABELS[confidence] || confidence)}${advice.confidence_score ? ` · ${list.formatNumber(advice.confidence_score, 1)}分` : ""}${historyLabel ? ` · ${list.escapeHtml(historyLabel)}` : ""} ${list.infoTooltip(confidenceTooltip(resource), "置信度计算说明")}`;
     app.els.detailConfidence.className = `confidence-chip is-${confidence}`;
     app.els.detailAdvice.innerHTML = `
       <div class="decision-summary is-${list.escapeHtml(action)}">
@@ -710,7 +760,9 @@
           const containerName = selectedContainerEntry(resource, key)?.name || "";
           const observed = list.containerMetricObservedStatsFor(resource, key, containerName)
             || list.metricObservedStatsFor(resource, key);
-          const mAction = list.metricActionFor(resource, key);
+          const mAction = containerName
+            ? list.containerMetricActionFor(resource, key, containerName)
+            : list.metricActionFor(resource, key);
           const unit = displayUnitForChart(resource, key, containerName);
           const st = observed || {};
           const metricTitle = `${metricTitleForChart(resource, key, containerName)}${containerName ? ` · ${containerName}` : ""}`;

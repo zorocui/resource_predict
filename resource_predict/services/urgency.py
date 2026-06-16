@@ -9,15 +9,20 @@ from resource_predict.utils import parse_float_or_none
 
 def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
     """Compute list sorting urgency from scaling advice and target spec changes."""
+    return float(compute_urgency_breakdown(item, cfg).get("score", 0.0))
+
+
+def compute_urgency_breakdown(item: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
+    """Compute urgency score with displayable additive components."""
     advice = item.get("scaling_advice", {}) if isinstance(item, dict) else {}
     if not isinstance(advice, dict):
-        return 0.0
+        return {"score": 0.0, "components": []}
     action = str(advice.get("action", "hold")).lower()
     confidence = str(advice.get("confidence", "medium")).lower()
     if action == "hold":
-        return 0.0
+        return {"score": 0.0, "components": [{"label": "保持动作", "value": 0.0}]}
     if action == "insufficient_data":
-        return 1.0
+        return {"score": 1.0, "components": [{"label": "数据不足", "value": 1.0}]}
     stats = advice.get("stats", {})
     if not isinstance(stats, dict):
         stats = {}
@@ -87,12 +92,14 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
         "low": 1.0,
     }.get(confidence, 2.0)
 
-    metric_scores: List[float] = []
+    metric_scores: List[Dict[str, Any]] = []
     for metric in ("cpu", "memory", "disk"):
         st = stats.get(metric, {})
         if not isinstance(st, dict):
             continue
         metric_action = str(metric_actions.get(metric, action)).lower()
+        if metric_action not in {"scale_out", "scale_out_candidate", "scale_in", "scale_in_candidate"}:
+            continue
         avg = parse_float_or_none(st.get("avg")) or 0.0
         p95 = parse_float_or_none(st.get("p95")) or 0.0
         peak = parse_float_or_none(st.get("peak")) or 0.0
@@ -106,43 +113,87 @@ def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
                 trend_pressure += min(1.0, slope / max(float(cfg.uptrend_slope_threshold), 0.0001))
             if delta > 0:
                 trend_pressure += min(1.0, delta / max(float(cfg.window_mean_delta_threshold), 0.0001))
-            metric_scores.append(
+            value = (
                 32.0 * _above(p95, float(cfg.scale_out_threshold))
                 + 22.0 * _above(peak, float(cfg.peak_guard_threshold))
                 + 12.0 * _above(avg, float(cfg.scale_out_threshold))
                 + 6.0 * trend_pressure
                 + 4.0 * min(1.0, gap / max(float(cfg.peak_valley_gap_threshold), 0.0001))
             )
+            metric_scores.append({"metric": metric, "action": metric_action, "value": value})
         elif metric_action in {"scale_in", "scale_in_candidate"}:
             trend_pressure = 0.0
             if slope < 0:
                 trend_pressure += min(1.0, abs(slope) / max(abs(float(cfg.downtrend_slope_threshold)), 0.0001))
             if delta < 0:
                 trend_pressure += min(1.0, abs(delta) / max(float(cfg.window_mean_delta_threshold), 0.0001))
-            metric_scores.append(
+            value = (
                 20.0 * _below(avg, float(cfg.scale_in_threshold))
                 + 16.0 * _below(p95, float(cfg.scale_in_p95_guard))
                 + 5.0 * trend_pressure
                 + 4.0 * (1.0 - min(1.0, gap / 0.5))
             )
+            metric_scores.append({"metric": metric, "action": metric_action, "value": value})
 
     if not metric_scores:
-        return confidence_bonus
+        return {
+            "score": round(confidence_bonus, 3),
+            "components": [{"label": "置信度加成", "value": round(confidence_bonus, 3)}],
+        }
 
+    base_score = 35.0 if action in {"scale_out", "scale_out_candidate"} else 18.0
+    risk_score = min(20.0, 0.2 * (parse_float_or_none(risk_profile.get("risk_score")) or 0.0))
+    metric_values = sorted((float(x["value"]) for x in metric_scores), reverse=True)
+    primary_metric_score = max(metric_values)
+    secondary_metric_score = 0.25 * sum(metric_values[1:])
+    multi_metric_bonus = 4.0 * max(0, len(metric_values) - 1)
+    mixed_signal_bonus = 4.0 if bool(advice.get("has_mixed_signals")) else 0.0
+    target_change = _target_change_score()
     score = (
-        (35.0 if action in {"scale_out", "scale_out_candidate"} else 18.0)
+        base_score
         + confidence_bonus
-        + min(20.0, 0.2 * (parse_float_or_none(risk_profile.get("risk_score")) or 0.0))
-        + max(metric_scores)
-        + 0.25 * sum(sorted(metric_scores, reverse=True)[1:])
-        + 4.0 * max(0, len(metric_scores) - 1)
-        + (4.0 if bool(advice.get("has_mixed_signals")) else 0.0)
-        + _target_change_score()
+        + risk_score
+        + primary_metric_score
+        + secondary_metric_score
+        + multi_metric_bonus
+        + mixed_signal_bonus
+        + target_change
     )
+    components = [
+        {"label": "基础动作分", "value": base_score},
+        {"label": "置信度加成", "value": confidence_bonus},
+        {"label": "风险分贡献", "value": risk_score},
+        {"label": "最强指标贡献", "value": primary_metric_score},
+    ]
+    if secondary_metric_score:
+        components.append({"label": "其他指标贡献", "value": secondary_metric_score})
+    if multi_metric_bonus:
+        components.append({"label": "多指标加成", "value": multi_metric_bonus})
+    if mixed_signal_bonus:
+        components.append({"label": "混合信号加成", "value": mixed_signal_bonus})
+    if target_change:
+        components.append({"label": "目标变化分", "value": target_change})
     if _is_k8s_analysis_only(advice, item):
         cap = 35.0 if action in {"scale_out", "scale_out_candidate"} else 25.0
+        raw_score = score
         score = min(cap, score * 0.35)
-    return round(score, 3)
+        components.append({"label": "仅分析封顶/折扣", "value": score - raw_score})
+    return {
+        "score": round(score, 3),
+        "components": [
+            {"label": str(x["label"]), "value": round(float(x["value"]), 3)}
+            for x in components
+            if abs(float(x["value"])) > 0.0005 or str(x["label"]) in {"基础动作分", "置信度加成"}
+        ],
+        "metric_scores": [
+            {
+                "metric": str(x["metric"]),
+                "action": str(x["action"]),
+                "value": round(float(x["value"]), 3),
+            }
+            for x in metric_scores
+        ],
+    }
 
 
 def _is_k8s_analysis_only(advice: Dict[str, Any], item: Dict[str, Any]) -> bool:

@@ -42,6 +42,38 @@
     return `<span class="info-tooltip" role="img" aria-label="${escapeHtml(label)}">i<span class="tooltip-bubble" aria-hidden="true">${escapeHtml(text)}</span></span>`;
   }
 
+  function urgencyTooltip(item) {
+    const breakdown = item?.urgency_breakdown;
+    if (!breakdown || typeof breakdown !== "object") return URGENCY_HELP;
+    const components = Array.isArray(breakdown.components) ? breakdown.components : [];
+    const parts = components
+      .filter((part) => part && typeof part === "object" && Number.isFinite(Number(part.value)))
+      .map((part) => ({ label: String(part.label || ""), value: Number(part.value) }));
+    const score = Number(breakdown.score ?? item?.urgency_score ?? 0);
+    const formulaTerms = parts.map((part, index) => {
+      const value = Math.abs(part.value);
+      const signedText = `${part.label}${formatNumber(value, 1)}`;
+      if (index === 0) return part.value < 0 ? `-${signedText}` : signedText;
+      return `${part.value < 0 ? "-" : "+"} ${signedText}`;
+    });
+    const formula = formulaTerms.length
+      ? `紧急度${formatNumber(score, 1)} = ${formulaTerms.join(" ")}`
+      : `紧急度${formatNumber(score, 1)}`;
+    const lines = [formula];
+    const metricScores = Array.isArray(breakdown.metric_scores) ? breakdown.metric_scores : [];
+    if (metricScores.length) {
+      lines.push("指标贡献:");
+      metricScores.forEach((part) => {
+        if (!part || typeof part !== "object") return;
+        const value = Number(part.value);
+        if (!Number.isFinite(value)) return;
+        const metric = app.metricTitleMap[part.metric] || part.metric;
+        lines.push(`  ${metric} ${actionLabel(part.action)}: +${formatNumber(value, 1)}`);
+      });
+    }
+    return lines.join("\n");
+  }
+
   function resourceTypeOf(item) {
     const raw = String(item?.resource_type || "").toLowerCase().replaceAll("-", "_");
     if (raw === "openstack_vm" || raw === "openstack" || raw === "vm") return "openstack_vm";
@@ -233,6 +265,46 @@
     return String(metricActions[metricKey] || metricActions[baseKey] || "hold");
   }
 
+  function containerMetricActionFor(item, metricKey, containerName = "") {
+    if (!isK8s(item) || !containerName) return metricActionFor(item, metricKey);
+    const explicit = item?.scaling_advice?.container_metric_actions?.[containerName];
+    const baseKey = baseMetricKey(metricKey);
+    if (explicit && typeof explicit === "object") {
+      const action = explicit[metricKey] || explicit[baseKey];
+      if (action) return String(action);
+    }
+    const target = item?.scaling_advice?.target_spec?.containers?.[containerName];
+    const current = item?.spec?.containers?.[containerName];
+    if (!target || typeof target !== "object" || !current || typeof current !== "object") {
+      return metricActionFor(item, metricKey);
+    }
+    const fields = metricTargetFields(metricKey);
+    let hasIncrease = false;
+    let hasDecrease = false;
+    fields.forEach((field) => {
+      if (target[field] === undefined || target[field] === null || current[field] === undefined || current[field] === null) return;
+      const targetValue = Number(target[field]);
+      const currentValue = Number(current[field]);
+      if (!Number.isFinite(targetValue) || !Number.isFinite(currentValue)) return;
+      const epsilon = Math.max(Math.abs(currentValue) * 0.0001, 0.000001);
+      if (targetValue > currentValue + epsilon) hasIncrease = true;
+      if (targetValue < currentValue - epsilon) hasDecrease = true;
+    });
+    if (hasIncrease) return "scale_out_candidate";
+    if (hasDecrease) return "scale_in_candidate";
+    return "hold";
+  }
+
+  function metricTargetFields(metricKey) {
+    if (metricKey === "cpu_limit") return ["cpu_limit_cores"];
+    if (metricKey === "cpu_request") return ["cpu_request_cores"];
+    if (metricKey === "memory_limit") return ["memory_limit_gb"];
+    if (metricKey === "memory_request") return ["memory_request_gb"];
+    if (baseMetricKey(metricKey) === "cpu") return ["cpu_request_cores", "cpu_limit_cores"];
+    if (baseMetricKey(metricKey) === "memory") return ["memory_request_gb", "memory_limit_gb"];
+    return [];
+  }
+
   function metricActionLabel(item, metricKey, action) {
     return actionLabel(action);
   }
@@ -388,6 +460,19 @@
     if (hasMem) parts.push(`${formatNumber(target.memory_gb, 0)}GB`);
     if (hasDisk) parts.push(`${formatNumber(target.disk_gb, 0)}GB`);
     return `目标规格 ${parts.join(" / ")}`;
+  }
+
+  function targetSpecListText(item) {
+    const advice = item?.scaling_advice || {};
+    const target = advice.target_spec || {};
+    if (isK8s(item) && target.containers && typeof target.containers === "object" && !Array.isArray(target.containers)) {
+      const lines = formatTargetContainers(target.containers);
+      if (target.replicas != null) {
+        lines.push(`副本 ${formatNumber(target.replicas, 0)}`);
+      }
+      if (lines.length) return lines.join("\n");
+    }
+    return targetSpecText(item);
   }
 
   function targetSpecRows(item) {
@@ -801,11 +886,11 @@
         </span>
         <span class="row-side">
           <span class="score-block">
-            <span class="score-label">紧急度 ${infoTooltip(URGENCY_HELP, "紧急度计算说明")}</span>
+            <span class="score-label">紧急度 ${infoTooltip(urgencyTooltip(item), "紧急度计算说明")}</span>
             <span class="score">${formatNumber(item.urgency_score || 0, 1)}</span>
           </span>
           <span class="confidence-chip is-${escapeHtml(confidence)}">${escapeHtml(CONFIDENCE_LABELS[confidence] || confidence)}</span>
-          <span class="target-text" title="${escapeHtml(targetSpecText(item))}">${escapeHtml(targetSpecText(item))}</span>
+          <span class="target-text" title="${escapeHtml(targetSpecText(item))}">${escapeHtml(targetSpecListText(item))}</span>
         </span>`;
       root.appendChild(node);
     }
@@ -879,6 +964,7 @@
     isK8s,
     analysisOnlyReasons,
     metricActionFor,
+    containerMetricActionFor,
     metricKeysFor,
     metricTitleFor,
     metricObservedStatsFor,

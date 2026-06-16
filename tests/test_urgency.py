@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from resource_predict.services.urgency import compute_urgency_score
+from resource_predict.services.urgency import compute_urgency_breakdown, compute_urgency_score
 from resource_predict.settings import settings
 
 
@@ -52,6 +52,19 @@ class UrgencyScoreTest(unittest.TestCase):
             compute_urgency_score(executable, settings.decision),
             compute_urgency_score(analysis_only, settings.decision),
         )
+
+    def test_breakdown_score_matches_urgency_score(self):
+        item = self._k8s_scale_in_item(
+            analysis_only=False,
+            ready_for_execution=True,
+            target_spec={"replicas": 1},
+        )
+
+        breakdown = compute_urgency_breakdown(item, settings.decision)
+
+        self.assertEqual(breakdown["score"], compute_urgency_score(item, settings.decision))
+        self.assertTrue(breakdown["components"])
+        self.assertTrue(breakdown["metric_scores"])
 
 
 if __name__ == "__main__":
