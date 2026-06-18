@@ -147,6 +147,8 @@ class DecisionConfig:
     # 执行非保持动作前需要连续观察到多少轮一致建议。
     scale_out_confirmations: int = 2
     scale_in_confirmations: int = 3
+    # 连续轮次确认状态的保留天数；过期资源重新从第 1 轮开始累计。
+    action_gate_state_retention_days: int = 30
     # 给运维人员或未来执行器使用的最小冷却时间建议。
     scale_out_cooldown_minutes: int = 60
     scale_in_cooldown_minutes: int = 360

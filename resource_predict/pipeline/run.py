@@ -10,6 +10,11 @@ import pandas as pd
 
 from resource_predict.settings import settings
 from resource_predict.data.io import read_raw_dataset, write_raw_dataset
+from resource_predict.pipeline.action_gate_state import (
+    apply_action_gate_confirmations,
+    load_action_gate_state,
+    write_action_gate_state,
+)
 from resource_predict.pipeline._types import WorkerContext
 from resource_predict.pipeline.constants import MANIFEST_FILENAME, RAW_DATA_FILENAME
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
@@ -249,6 +254,11 @@ def generate_forecasts(
         item.pop("_slot", None)
 
     predicted_count = len(resources_items)
+    predicted_resource_ids = {
+        str(item.get("resource_id"))
+        for item in resources_items
+        if item.get("resource_id") is not None
+    }
     if predict_only and partial_resource_ids:
         existing_items = existing_items_for_partial or load_existing_forecast_items(out_base)
         if existing_items:
@@ -264,6 +274,13 @@ def generate_forecasts(
             )
         else:
             logger.warning("[progress] 未找到既有预测产物，本次仅输出已重算资源")
+
+    action_gate_state = apply_action_gate_confirmations(
+        resources_items,
+        eligible_resource_ids=predicted_resource_ids,
+        prior_state=load_action_gate_state(out_base),
+        retention_days=int(settings.decision.action_gate_state_retention_days),
+    )
 
     total_elapsed = time.perf_counter() - t_start
     manifest_items = write_prediction_outputs(
@@ -290,6 +307,10 @@ def generate_forecasts(
         metric_partial_enabled=metric_partial_enabled,
         total_elapsed=total_elapsed,
     )
+    try:
+        write_action_gate_state(out_base, action_gate_state)
+    except Exception as exc:
+        logger.warning("[action_gate] 预测产物已写出，但确认状态账本提交失败: %s", exc)
 
     logger.info(
         "[progress] 全部完成：%d/%d，总耗时 %.1fs，输出: %s",

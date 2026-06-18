@@ -18,6 +18,18 @@ from resource_predict.services.update_tasks import run_update_task_sync, start_u
 logger = logging.getLogger(__name__)
 
 
+def _update_busy_payload(status: dict[str, Any]) -> dict[str, Any]:
+    phase = status.get("phase") or "unknown"
+    message = status.get("message") or status.get("last_error") or ""
+    details = f"当前阶段：{phase}"
+    if message:
+        details += f"；状态消息：{message}"
+    return {
+        "error": f"已有更新任务正在运行，请稍后再试。{details}",
+        "status": status,
+    }
+
+
 def register_update_routes(app: Flask) -> None:
     @app.get("/api/update-status")
     def api_update_status():
@@ -33,8 +45,9 @@ def register_update_routes(app: Flask) -> None:
         )
 
         if "busy" in holder:
+            status = get_update_status()
             return (
-                jsonify({"error": holder["busy"], "status": get_update_status()}),
+                jsonify(_update_busy_payload(status)),
                 409,
             )
         if "fatal" in holder:
@@ -69,7 +82,7 @@ def register_update_routes(app: Flask) -> None:
         current_status = get_update_status()
         if current_status.get("running"):
             return (
-                jsonify({"error": "another update task is already running", "status": current_status}),
+                jsonify(_update_busy_payload(current_status)),
                 409,
             )
 
@@ -110,7 +123,7 @@ def register_update_routes(app: Flask) -> None:
         current_status = get_update_status()
         if current_status.get("running"):
             return (
-                jsonify({"error": "another update task is already running", "status": current_status}),
+                jsonify(_update_busy_payload(current_status)),
                 409,
             )
 

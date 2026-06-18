@@ -142,6 +142,8 @@ _update_status: Dict[str, Any] = {
     "last_result": None,
     "total_updates": 0,
     "total_new_points": 0,
+    "task_source": "",
+    "fetch_window_label": "",
 }
 
 _stop_event = threading.Event()
@@ -157,7 +159,11 @@ def get_update_status() -> Dict[str, Any]:
         return dict(_update_status)
 
 
-def mark_external_update_started(phase: str, message: str = "") -> None:
+def mark_external_update_started(
+    phase: str,
+    message: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
     """Mark a non-standard update task, such as K8S Prometheus fetch, as running."""
     now = time.time()
     with _lock:
@@ -167,8 +173,15 @@ def mark_external_update_started(phase: str, message: str = "") -> None:
         _update_status["last_finished_at"] = None
         _update_status["last_error"] = None
         _update_status["last_result"] = None
+        _update_status["task_source"] = ""
+        _update_status["fetch_window_label"] = ""
         if message:
             _update_status["message"] = message
+        if isinstance(metadata, dict):
+            for key in ("task_source", "fetch_window_label"):
+                value = metadata.get(key)
+                if value is not None:
+                    _update_status[key] = str(value)
 
 
 def mark_external_update_failed(error: str, phase: str = "error") -> None:

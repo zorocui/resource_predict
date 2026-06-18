@@ -183,6 +183,8 @@
     const running = Boolean(status?.running);
     app.els.updateRunning.textContent = running ? "运行中" : "空闲";
     app.els.updatePhase.textContent = status?.phase || status?.step || "-";
+    if (app.els.updateSource) app.els.updateSource.textContent = status?.task_source || "-";
+    if (app.els.updateWindow) app.els.updateWindow.textContent = status?.fetch_window_label || "-";
     app.els.updateStarted.textContent = formatDateTime(status?.started_at || status?.start_time || status?.last_started_at);
     app.els.updateFinished.textContent = formatDateTime(status?.finished_at || status?.end_time || status?.last_success_at || status?.last_finished_at);
     const message = status?.last_error || status?.error || status?.message || "";
@@ -199,6 +201,8 @@
     } catch (e) {
       app.els.updateRunning.textContent = "读取失败";
       app.els.updatePhase.textContent = "-";
+      if (app.els.updateSource) app.els.updateSource.textContent = "-";
+      if (app.els.updateWindow) app.els.updateWindow.textContent = "-";
       app.els.updateMessage.textContent = String(e.message || e);
       return null;
     }
@@ -384,6 +388,40 @@
     app.els.clusterConfigMessage.classList.toggle("is-error", Boolean(isError));
   }
 
+  function describeUpdateStatus(status) {
+    if (!status || typeof status !== "object") return "";
+    const phase = status.phase || status.step || "-";
+    const message = status.message || status.last_error || status.error || "";
+    const source = status.task_source || "";
+    const windowLabel = status.fetch_window_label || "";
+    const started = formatDateTime(status.last_started_at || status.started_at || status.start_time);
+    const parts = [`当前阶段：${phase}`];
+    if (source) parts.push(`任务来源：${source}`);
+    if (windowLabel) parts.push(`拉取窗口：${windowLabel}`);
+    if (message) parts.push(`状态消息：${message}`);
+    if (started && started !== "-") parts.push(`开始时间：${started}`);
+    return parts.join("\n");
+  }
+
+  function renderK8sScheduleHint(schedule) {
+    if (!app.els.k8sScheduleHint) return;
+    const enabled = Boolean(schedule?.scheduled_update_enabled);
+    if (!enabled) {
+      app.els.k8sScheduleHint.textContent = "K8S 后台定时拉取未启用；启动 app.py 后不会自动拉取，可通过页面按钮手动触发。";
+      return;
+    }
+    const interval = Number(schedule?.scheduled_update_interval_minutes || 0);
+    const overlap = Number(schedule?.incremental_overlap_minutes || 0);
+    const historyDays = Number(schedule?.history_days || 7);
+    const incrementalHours = Math.max(1, (interval + overlap) / 60);
+    const incrementalLabel = Number.isInteger(incrementalHours)
+      ? String(incrementalHours)
+      : incrementalHours.toFixed(1);
+    app.els.k8sScheduleHint.textContent =
+      `K8S 后台定时拉取已启用：app.py 启动后会立即执行首次拉取；有本地基线时拉取最近 ${incrementalLabel} 小时，` +
+      `无本地基线或全量刷新时拉取最近 ${historyDays} 天，之后每 ${interval} 分钟执行一次。`;
+  }
+
   async function refreshClusterConfigs() {
     if (!app.els.vmClusterList || !app.els.k8sClusterList) return;
     app.els.vmClusterList.innerHTML = `<div class="empty-list is-compact">正在读取 VM 调配集群...</div>`;
@@ -399,6 +437,7 @@
       app.state.clusterConfigPayload = payload;
       app.state.forecastConfigPayload = forecastPayload;
       renderVmClusterRows(payload.vm_scaling_clusters || {});
+      renderK8sScheduleHint(payload.k8s_prometheus_schedule || {});
       renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
       renderForecastModelRows(forecastPayload);
       setConfigMessage("配置已加载。");
@@ -406,6 +445,7 @@
       const msg = String(e.message || e);
       app.els.vmClusterList.innerHTML = `<div class="empty-list is-compact">读取失败：${list.escapeHtml(msg)}</div>`;
       app.els.k8sClusterList.innerHTML = "";
+      if (app.els.k8sScheduleHint) app.els.k8sScheduleHint.textContent = "";
       if (app.els.forecastModelList) app.els.forecastModelList.innerHTML = "";
       setConfigMessage(msg, true);
     }
@@ -527,6 +567,14 @@
       setView("updates");
       startUpdatePolling();
     } catch (e) {
+      if (e.status === 409 && e.updateStatus) {
+        const detail = describeUpdateStatus(e.updateStatus);
+        setConfigMessage(`${String(e.message || e)}\n${detail}`.trim(), true);
+        updateStatusText(e.updateStatus);
+        setView("updates");
+        startUpdatePolling();
+        return;
+      }
       setConfigMessage(String(e.message || e), true);
     }
   }

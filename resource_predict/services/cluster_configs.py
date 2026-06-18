@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from resource_predict.utils import parse_positive_int
+from resource_predict.settings import settings
 
 
 VM_SCALING_CONFIG_PATH = Path("deploy") / "clusters.json"
@@ -100,9 +101,17 @@ def normalize_k8s_prometheus_clusters(clusters: Any) -> List[Dict[str, Any]]:
 
 
 def read_cluster_config_payload() -> Dict[str, Any]:
+    k8s_cfg = settings.k8s_prometheus
     return {
         "vm_scaling_clusters": read_vm_scaling_clusters(),
         "k8s_prometheus_clusters": read_k8s_prometheus_clusters(),
+        "k8s_prometheus_schedule": {
+            "scheduled_update_enabled": bool(k8s_cfg.scheduled_update_enabled),
+            "scheduled_update_interval_minutes": int(k8s_cfg.scheduled_update_interval_minutes),
+            "incremental_overlap_minutes": int(k8s_cfg.incremental_overlap_minutes),
+            "history_days": int(k8s_cfg.history_days),
+            "startup_fetch_enabled": bool(k8s_cfg.scheduled_update_enabled),
+        },
         "paths": {
             "vm_scaling_clusters": str(VM_SCALING_CONFIG_PATH),
             "k8s_prometheus_clusters": str(K8S_PROMETHEUS_CONFIG_PATH),

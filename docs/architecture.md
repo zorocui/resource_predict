@@ -295,7 +295,7 @@ sequenceDiagram
 - **策略分级**：conservative / balanced / aggressive，阈值和确认轮次差异化
 - **风险画像**：每个资源生成 `risk_profile`，包含 `saturation_risk`（饱和风险分）、`idle_opportunity`（空闲机会分）、`risk_score`（综合风险分）、当前生效阈值和冷却时间
 - **置信度评分**：每个触发扩缩容的指标先计算单项置信度，再汇总为资源级置信度；前端详情抽屉的“置信度 i”会按公式展示当前资源的分数组成
-- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需确认轮次。扩容默认需要 `scale_out_confirmations=2` 轮，缩容默认需要 `scale_in_confirmations=3` 轮；conservative 缩容 +1 轮、aggressive 缩容 -1 轮，conservative 扩容可少 1 轮。当前实现未持久化跨预测轮次计数，因此需要多轮确认的建议会保持 `observe`，除非通过人工复核路径执行；进入 `execute` 前还会强制校验 `confidence`、`data_quality`、`cooldown` 和 `policy_tier`。资源历史覆盖不足 5 天时，非 `hold` 建议会记录 `history_warning` 并将置信度降到执行阈值以下。
+- **执行门控**：`action_gate` 输出 `ready` / `observe`，含所需及已确认轮次。扩容默认需要 `scale_out_confirmations=2` 轮，缩容默认需要 `scale_in_confirmations=3` 轮；conservative 缩容 +1 轮、aggressive 缩容 -1 轮，conservative 扩容可少 1 轮。系统通过各输出目录下的 `action_gate_state.json` 按资源持久化同方向建议的连续轮次，目标规格变化不会重置计数，动作反向或变为保持/混合/数据不足时重新计数或清零；进入 `execute` 前还会强制校验 `confidence`、`data_quality`、`cooldown` 和 `policy_tier`。资源历史覆盖不足 5 天时，非 `hold` 建议会记录 `history_warning` 并将置信度降到执行阈值以下。
 
 ### K8S Workload 决策引擎（`core/k8s_workload_decision.py`）
 

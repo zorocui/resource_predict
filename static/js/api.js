@@ -21,13 +21,23 @@
       try {
         const r = await fetch(url);
         if (r.ok) return r.json();
-        lastErr = new Error(`请求失败: ${r.status}`);
+        const payload = await r.json().catch(() => ({}));
+        lastErr = buildHttpError(r, payload);
         if (r.status < 500) break;
       } catch (e) {
         lastErr = e;
       }
     }
     throw lastErr;
+  }
+
+  function buildHttpError(response, payload) {
+    const message = payload?.error || `请求失败: ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.payload = payload || {};
+    error.updateStatus = payload?.status || null;
+    return error;
   }
 
   async function postJson(url, body, method = "POST") {
@@ -38,7 +48,7 @@
     });
     const payload = await r.json().catch(() => ({}));
     if (!r.ok) {
-      throw new Error(payload.error || `请求失败: ${r.status}`);
+      throw buildHttpError(r, payload);
     }
     return payload;
   }

@@ -53,16 +53,26 @@ def run_k8s_prometheus_upsert(
     clusters: Optional[Iterable[str]] = None,
     fail_if_busy: bool = False,
     full_refresh: bool = False,
+    trigger_source: str = "manual",
 ) -> Dict[str, Any]:
     """Fetch K8S Workload metrics from Prometheus and merge them into outputs."""
     cluster_list = list(clusters) if clusters is not None else None
-    mark_external_update_started("fetching_k8s_prometheus", "正在从 K8S Prometheus 拉取 Workload 指标")
     try:
         out_dir = scoped_out_dir("k8s", settings.app.out_dir)
         history_hours = _history_hours_for_fetch(
             out_dir=out_dir,
             clusters=cluster_list,
             full_refresh=full_refresh,
+        )
+        window_label = _fetch_window_label(history_hours)
+        source_label = _trigger_source_label(trigger_source)
+        mark_external_update_started(
+            "fetching_k8s_prometheus",
+            f"{source_label}：正在从 K8S Prometheus 拉取 Workload 指标（{window_label}）",
+            metadata={
+                "task_source": source_label,
+                "fetch_window_label": window_label,
+            },
         )
         fetch_started_at = _utc_timestamp()
         fetch_started_perf = time.perf_counter()
@@ -111,6 +121,23 @@ def _history_hours_for_fetch(
     return max(1.0, minutes / 60.0)
 
 
+def _fetch_window_label(history_hours: Optional[float]) -> str:
+    if history_hours is None:
+        days = int(getattr(settings.k8s_prometheus, "history_days", 7))
+        return f"全量历史窗口：最近 {days} 天"
+    if float(history_hours).is_integer():
+        return f"增量窗口：最近 {int(history_hours)} 小时"
+    return f"增量窗口：最近 {float(history_hours):.1f} 小时"
+
+
+def _trigger_source_label(trigger_source: str) -> str:
+    if trigger_source == "scheduled_startup":
+        return "K8S 后台定时拉取（启动后首次拉取）"
+    if trigger_source == "scheduled":
+        return "K8S 后台定时拉取"
+    return "页面手动拉取"
+
+
 def _has_existing_k8s_raw_data(out_dir: Path, clusters: Optional[Iterable[str]]) -> bool:
     raw_path = out_dir / "raw_data.json"
     if not raw_path.exists():
@@ -146,9 +173,14 @@ def _k8s_scheduler_loop(interval_seconds: float) -> None:
         interval_seconds,
         interval_seconds / 60.0,
     )
+    first_run = True
     while not _k8s_stop_event.is_set():
         try:
-            run_k8s_prometheus_upsert(fail_if_busy=False)
+            run_k8s_prometheus_upsert(
+                fail_if_busy=False,
+                trigger_source="scheduled_startup" if first_run else "scheduled",
+            )
+            first_run = False
         except Exception as exc:
             logger.error("[k8s_ingest] 调度循环异常: %s", exc)
 

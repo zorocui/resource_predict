@@ -373,7 +373,8 @@
     const analysisOnly = Boolean(options.analysisOnly);
     const resource = options.resource || {};
     const suggestedBlocker = suggestedTargetBlocker(options.resource || {});
-    const gateState = String(resource?.scaling_advice?.action_gate?.state || "").toLowerCase();
+    const actionGate = resource?.scaling_advice?.action_gate || {};
+    const gateState = String(actionGate.state || "").toLowerCase();
     const baseDisabled = Boolean(suggestedBlocker) || analysisOnly || action === "hold" || action === "insufficient_data";
     const suggestedExecuteDisabled = baseDisabled || action === "mixed" || gateState === "observe";
     const confirmedEnabled = !baseDisabled && (action === "mixed" || gateState === "observe");
@@ -381,7 +382,8 @@
     const dryRunDisabledAttr = baseDisabled ? " disabled" : "";
     const suggestedExecuteDisabledAttr = suggestedExecuteDisabled ? " disabled" : "";
     const disabledText = suggestedBlocker
-      || suggestedDisabledText(action, analysisOnly, gateState);
+      || suggestedDisabledText(action, analysisOnly, actionGate);
+    const readyText = suggestedReadyText(actionGate);
     const manualControls = options.resourceType === "k8s_workload"
       ? buildManualK8sControls(options.resource || {}, resourceId, options.resourceType)
       : "";
@@ -390,7 +392,7 @@
       : "";
     const suggestedStatus = (baseDisabled || suggestedExecuteDisabled)
       ? `<span class="scaling-status" data-role="scaling-status">${disabledText}</span>`
-      : `<span class="scaling-status" data-role="scaling-status"></span>`;
+      : `<span class="scaling-status" data-role="scaling-status">${readyText}</span>`;
     return `
       <div class="scaling-choice" data-scaling-choice-root>
         <button type="button" class="scale-btn scale-primary" data-scaling-choice-toggle aria-expanded="false">调配</button>
@@ -409,12 +411,29 @@
       </div>`;
   }
 
-  function suggestedDisabledText(action, analysisOnly, gateState) {
+  function suggestedDisabledText(action, analysisOnly, actionGate) {
+    const gateState = String(actionGate?.state || "").toLowerCase();
     if (analysisOnly) return "当前建议缺少可执行目标，不能按建议调配";
     if (action === "mixed") return "当前建议存在混合信号，需人工确认后再调配";
-    if (gateState === "observe") return "当前建议需要人工确认或后续轮次复核后再调配";
+    if (gateState === "observe") {
+      const observed = Number(actionGate?.observed_consistent_rounds);
+      const required = Number(actionGate?.required_consistent_rounds);
+      if (Number.isFinite(observed) && Number.isFinite(required) && required > 0) {
+        return `建议方向已连续确认 ${observed}/${required} 轮，需继续复核或人工确认后调配`;
+      }
+      return "当前建议需要人工确认或后续轮次复核后再调配";
+    }
     if (action === "insufficient_data") return "当前数据不足，不能按建议调配";
     return "当前建议无需执行调配";
+  }
+
+  function suggestedReadyText(actionGate) {
+    const observed = Number(actionGate?.observed_consistent_rounds);
+    const required = Number(actionGate?.required_consistent_rounds);
+    if (String(actionGate?.state || "").toLowerCase() !== "ready"
+      || !Number.isFinite(observed) || !Number.isFinite(required)
+      || required <= 0 || observed < required) return "";
+    return `建议方向已连续确认 ${observed}/${required} 轮，轮次门控已通过`;
   }
 
   function suggestedTargetBlocker(resource) {

@@ -20,6 +20,18 @@ from resource_predict.services.update_tasks import start_update_task_async
 logger = logging.getLogger(__name__)
 
 
+def _update_busy_payload(status: dict[str, Any]) -> dict[str, Any]:
+    phase = status.get("phase") or "unknown"
+    message = status.get("message") or status.get("last_error") or ""
+    details = f"当前阶段：{phase}"
+    if message:
+        details += f"；状态消息：{message}"
+    return {
+        "error": f"已有更新任务正在运行，请稍后再试。{details}",
+        "status": status,
+    }
+
+
 def register_cluster_config_routes(app: Flask) -> None:
     @app.get("/api/cluster-configs")
     def api_get_cluster_configs():
@@ -68,7 +80,7 @@ def register_cluster_config_routes(app: Flask) -> None:
         current_status = get_update_status()
         if current_status.get("running"):
             return (
-                jsonify({"error": "another update task is already running", "status": current_status}),
+                jsonify(_update_busy_payload(current_status)),
                 409,
             )
         start_update_task_async(
