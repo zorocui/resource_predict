@@ -3,7 +3,7 @@
 
 请从子模块显式导入，避免 `import resource_predict.data` 时拉起 updater 等重依赖：
 
-    from resource_predict.data.io import read_raw_dataset, write_raw_dataset
+    from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
     from resource_predict.data.updater import start_background_updater, run_update_with_data
 """
 

@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
-from resource_predict.data.io import coerce_metric_series, write_raw_dataset
+from resource_predict.data.io import coerce_metric_series
 from resource_predict.resource_types import metric_names_for_resource
 
 logger = logging.getLogger(__name__)
@@ -65,7 +64,6 @@ def build_prepared_data(
     base_seed: int,
     data_provider: Optional[ExternalProvider],
     cfg: Any,
-    raw_checkpoint_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """构建 resource_id / spec / cpu|memory|disk(Series) 列表。"""
     if data_provider is not None:
@@ -122,10 +120,6 @@ def build_prepared_data(
                     )
 
                 prepared_data.append(prepared_item)
-                if raw_checkpoint_path is not None:
-                    write_every = 10
-                    if len(prepared_data) % write_every == 0 or idx == len(raw_items) - 1:
-                        write_raw_dataset(raw_checkpoint_path, prepared_data, freq=freq)
             except Exception as e:
                 msg = (
                     "[data_provider] 跳过异常数据: "

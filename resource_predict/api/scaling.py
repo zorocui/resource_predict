@@ -17,7 +17,7 @@ def register_scaling_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) 
 
     @app.post("/api/resources/<resource_id>/scale")
     def api_resource_scale(resource_id: str):
-        detail = get_resource_detail(resource_id)
+        detail = get_resource_detail(resource_id, include_charts=False)
         if detail is None:
             return jsonify({"error": "resource not found"}), 404
 

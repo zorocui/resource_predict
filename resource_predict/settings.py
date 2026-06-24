@@ -28,8 +28,8 @@ class AppConfig:
 
 @dataclass(frozen=True)
 class GenerationConfig:
-    # 演示数据默认生成的 VM 资源数量。
-    resources: int = 15
+    # 演示数据默认生成的 VM + K8S Workload 资源总数。
+    resources: int = 45
     # 每个资源每个指标的历史时间点数量。
     n: int = 240
     # 未设置资源族专用窗口时使用的兜底测试点数。
@@ -55,8 +55,13 @@ class GenerationConfig:
     # 预测并行工作线程数；None 表示由程序按机器资源自动决定。
     max_workers: Optional[int] = None
     # details/ 详情分片大小；资源很多时避免单个详情 JSON 过大。
-    detail_chunk_size: int = 200
-    # 是否保存 scoped raw_data.json；增量更新和详情合并依赖该文件。
+    detail_chunk_size: int = 25
+    # 默认及最大图表训练历史点数；测试窗口和未来预测不裁剪。
+    detail_history_points_default: int = 1000
+    detail_history_points_max: int = 10000
+    # 单资源 raw 读取的进程内 LRU 条目上限。
+    raw_resource_cache_items: int = 100
+    # 是否保存 scoped raw 资源分片；增量更新和详情合并依赖该索引。
     save_raw_dataset: bool = True
     # 列表接口未显式指定 top_n 时的默认返回 TopN 数量。
     top_n_default: int = 20
@@ -160,12 +165,12 @@ class UpdateConfig:
     enabled: bool = False
     # 定时拉取更新间隔，单位分钟。
     interval_minutes: int = 60
+    # 应用启动后首次自动更新的延迟秒数；手动更新不受影响。
+    startup_delay_seconds: int = 60
     # 每次调用增量数据提供器期望追加的时间点数量。
     points_per_update: int = 1
     # 是否在增量更新后保持滑动窗口长度，避免历史序列无限增长。
     sliding_window: bool = False
-    # 前端详情展示窗口点数；0 表示展示全部，不裁剪训练数据。
-    display_window_points: int = 0
     # 自定义增量数据提供器路径，格式为 "module:function"；为空时使用默认模拟数据提供器。
     incremental_provider_path: str = ""
 
@@ -207,6 +212,8 @@ class K8SPrometheusConfig:
     scheduled_update_enabled: bool = False
     # K8S Prometheus 定时拉取间隔，单位分钟。
     scheduled_update_interval_minutes: int = 360
+    # 应用启动后首次 K8S 自动拉取的延迟秒数；手动拉取不受影响。
+    scheduled_update_startup_delay_seconds: int = 60
 
 
 @dataclass(frozen=True)

@@ -6,13 +6,13 @@ from typing import Any, Dict, List, Set
 
 import numpy as np
 
-from resource_predict.data.io import atomic_write_json, index_prepared_by_id, merge_manifest_resources
+from resource_predict.data.io import atomic_write_json
 from resource_predict.pipeline.constants import (
     DETAILS_DIRNAME,
     FORECAST_ERROR_REPORT_FILENAME,
     GENERATION_STATS_FILENAME,
     MANIFEST_FILENAME,
-    RAW_DATA_FILENAME,
+    RAW_INDEX_FILENAME,
     SUMMARY_INDEX_FILENAME,
 )
 from resource_predict.resource_types import metric_names_for_resource, resource_type_of
@@ -22,8 +22,6 @@ def write_prediction_outputs(
     *,
     out_base: Path,
     resources_items: List[Dict[str, Any]],
-    prepared_data: List[Dict[str, Any]],
-    raw_prepared_data: List[Dict[str, Any]] | None,
     active_methods: List[str],
     test_size: int,
     future_steps: int,
@@ -34,6 +32,7 @@ def write_prediction_outputs(
     metric_filter_by_id: Dict[str, Set[str]],
     metric_partial_enabled: bool,
     total_elapsed: float,
+    raw_stats: Dict[str, int],
 ) -> List[Dict[str, Any]]:
     details_dir = out_base / DETAILS_DIRNAME
     details_dir.mkdir(parents=True, exist_ok=True)
@@ -103,7 +102,7 @@ def write_prediction_outputs(
             "detail_chunk_size": detail_chunk_size,
             "details_dir": DETAILS_DIRNAME,
             "details_files": details_files,
-            "raw_data_file": RAW_DATA_FILENAME,
+            "raw_index_file": RAW_INDEX_FILENAME,
         },
         "resources": summary_resources,
     }
@@ -114,8 +113,7 @@ def write_prediction_outputs(
         separators=(",", ":"),
     )
 
-    raw_by_id = index_prepared_by_id(raw_prepared_data or prepared_data)
-    manifest_items = merge_manifest_resources(resources_items, raw_by_id, test_size=test_size)
+    manifest_items = [dict(item) for item in resources_items]
     atomic_write_json(
         out_base / MANIFEST_FILENAME,
         {"resources": manifest_items},
@@ -166,6 +164,7 @@ def write_prediction_outputs(
         "total_elapsed_seconds": total_elapsed,
         "total_output_bytes": total_bytes,
         "forecast_error_report_file": FORECAST_ERROR_REPORT_FILENAME,
+        "raw": dict(raw_stats),
     }
     atomic_write_json(
         out_base / GENERATION_STATS_FILENAME,

@@ -39,6 +39,7 @@ def create_app() -> Flask:
         "matches_query": matches_query,
         "get_summary": store.get_summary,
         "get_resource_detail": store.get_resource_detail,
+        "get_resource_charts": store.get_resource_charts,
         "prediction_pending_for": prediction_pending_for,
     }
     register_page_routes(app, route_helpers)

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from resource_predict.data.io import read_raw_dataset, write_raw_dataset
+from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.data.updater import run_upsert_with_data
 from resource_predict.pipeline.constants import FORECAST_ERROR_REPORT_FILENAME
 from resource_predict.pipeline.run import generate_forecasts
@@ -156,7 +156,7 @@ class ForecastWindowingTest(unittest.TestCase):
                 result = run_upsert_with_data([k8s_item], out_dir=base, fail_if_busy=True)
 
             self.assertTrue(result["success"], result)
-            _prepared, meta = read_raw_dataset(base / "raw_data.json")
+            meta = RawResourceStore(base).metadata()
             self.assertEqual(meta.get("freq"), "5min")
 
     def test_k8s_upsert_merges_container_metrics_for_existing_resource(self):
@@ -190,7 +190,7 @@ class ForecastWindowingTest(unittest.TestCase):
                     }
                 },
             }
-            write_raw_dataset(base / "raw_data.json", [existing], freq="5min")
+            write_raw_resource_dataset(base, [existing], freq="5min")
 
             new_idx = pd.date_range(idx[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min")
             timestamps = (new_idx.view("int64") // 1_000_000).tolist()
@@ -216,7 +216,7 @@ class ForecastWindowingTest(unittest.TestCase):
                 result = run_upsert_with_data([incoming], out_dir=base, fail_if_busy=True)
 
             self.assertTrue(result["success"], result)
-            prepared, _meta = read_raw_dataset(base / "raw_data.json")
+            prepared = RawResourceStore(base).read_many()
             loaded = prepared[0]
             self.assertAlmostEqual(loaded["container_metrics"]["app"]["cpu_limit"].iloc[-1], 0.8)
             self.assertEqual(len(loaded["container_metrics"]["app"]["cpu_limit"]), len(idx) + 2)
@@ -253,7 +253,7 @@ class ForecastWindowingTest(unittest.TestCase):
                 },
                 **{metric: pd.Series([0.2] * len(idx), index=idx) for metric in K8S_METRICS},
             }
-            write_raw_dataset(base / "raw_data.json", [existing], freq="5min")
+            write_raw_resource_dataset(base, [existing], freq="5min")
 
             new_idx = pd.date_range(idx[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min")
             timestamps = (new_idx.view("int64") // 1_000_000).tolist()
@@ -278,7 +278,7 @@ class ForecastWindowingTest(unittest.TestCase):
                 result = run_upsert_with_data([incoming], out_dir=base, fail_if_busy=True)
 
             self.assertTrue(result["success"], result)
-            prepared, _meta = read_raw_dataset(base / "raw_data.json")
+            prepared = RawResourceStore(base).read_many()
             containers = prepared[0]["spec"]["containers"]
             self.assertEqual(containers["app"]["cpu_request_cores"], 0.8)
             self.assertEqual(containers["app"]["cpu_limit_cores"], 1.0)
@@ -323,7 +323,7 @@ class ForecastWindowingTest(unittest.TestCase):
                     save_raw=True,
                 )
 
-            _prepared, meta = read_raw_dataset(base / "raw_data.json")
+            meta = RawResourceStore(base).metadata()
             self.assertEqual(meta.get("freq"), "5min")
             stats = __import__("json").loads((base / "generation_stats.json").read_text(encoding="utf-8"))
             self.assertEqual(stats["test_size"], 288)

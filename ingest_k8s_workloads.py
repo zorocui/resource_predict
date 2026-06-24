@@ -16,7 +16,7 @@ from resource_predict.providers.k8s_prometheus import (
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch K8S workload metrics from Prometheus and merge them into raw_data.json."
+        description="Fetch K8S workload metrics from Prometheus and merge them into raw resource shards."
     )
     parser.add_argument(
         "--cluster",

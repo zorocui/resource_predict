@@ -13,7 +13,8 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/resources` | 资源列表（支持分页、筛选、搜索） |
-| GET | `/api/resources/<id>` | 资源详情（含 charts） |
+| GET | `/api/resources/<id>` | 资源元数据详情；可选返回 charts |
+| GET | `/api/resources/<id>/charts` | 按指标、容器和时间范围加载目标资源图表 |
 | GET | `/api/resources/details?ids=a,b` | 批量详情（最多 100 个） |
 | GET | `/api/resources/advice-summary` | 建议统计（action/confidence 计数） |
 | GET | `/api/resources/<id>/scaling-history` | 资源调配历史 |
@@ -34,14 +35,30 @@
 
 当资源正在等待预测完成时，详情接口返回 HTTP 202 并包含 `prediction_pending: true` 标记。批量详情接口同样处理。
 
+详情元数据与图表拆分加载：
+
+| 接口 | 参数 | 说明 |
+| --- | --- | --- |
+| `/api/resources/<id>` | `include_charts` | 默认 `true`；前端弹窗首屏传 `false`，只读取摘要和预测详情分片 |
+| `/api/resources/<id>` | `history_points` | 图表历史点数，默认 1000，最大 10000 |
+| `/api/resources/<id>/charts` | `metric` | 必填，只返回目标指标 |
+| `/api/resources/<id>/charts` | `container` | 可选，只返回目标容器的该指标 |
+| `/api/resources/<id>/charts` | `history_points` | 历史点数上限，默认 1000，最大 10000 |
+| `/api/resources/<id>/charts` | `start_ms` / `end_ms` | 可选毫秒时间范围；范围过滤后仍受 `history_points` 上限保护 |
+
+弹窗应先请求 `include_charts=false` 并立即展示规格、建议和门控状态，再按可见指标异步请求 `/charts`。每个图表请求只会读取该资源对应的一个 raw 分片，不扫描其他资源。
+
 ## 数据更新
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/update-status` | 查询更新任务状态 |
+| GET | `/api/update-history?limit=20` | 查询最近更新历史，`limit` 为 1–100 |
 | POST | `/api/update-trigger` | 触发 pull 型增量更新（同步） |
 | POST | `/api/update-data` | 推送增量数据，仅更新已有资源（异步） |
 | POST | `/api/upsert-data` | 推送数据，更新或新增资源（异步） |
+
+更新任务成功或失败后都会写入 `outputs/update_history.json`，应用重启后仍可查询。系统按完成时间从新到旧保留最近 100 条；历史文件读取或写入异常只记录日志，不影响数据更新主流程。历史记录包含任务来源、拉取窗口、开始/结束时间、耗时、资源和数据点统计以及错误信息。
 
 ### 更新触发（同步）
 

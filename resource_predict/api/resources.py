@@ -16,6 +16,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
     action_priority = helpers["action_priority"]
     prediction_pending_for = helpers["prediction_pending_for"]
     get_resource_detail = helpers["get_resource_detail"]
+    get_resource_charts = helpers["get_resource_charts"]
 
     @app.get("/api/resources")
     def api_resources():
@@ -175,10 +176,41 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                     "status": pending_status,
                 }
             ), 202
-        detail = get_resource_detail(resource_id)
+        try:
+            include_charts = _parse_bool(request.args.get("include_charts"), default=True)
+            history_points = _optional_positive_int(request.args.get("history_points"))
+            detail = get_resource_detail(
+                resource_id,
+                include_charts=include_charts,
+                history_points=history_points,
+                start_ms=_optional_int(request.args.get("start_ms"), "start_ms"),
+                end_ms=_optional_int(request.args.get("end_ms"), "end_ms"),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if detail is None:
             return jsonify({"error": "resource not found"}), 404
         return jsonify({"resource": detail})
+
+    @app.get("/api/resources/<resource_id>/charts")
+    def api_resource_charts(resource_id: str):
+        pending_status = prediction_pending_for(resource_id)
+        if pending_status is not None:
+            return jsonify({"resource_id": resource_id, "prediction_pending": True, "status": pending_status}), 202
+        try:
+            charts = get_resource_charts(
+                resource_id,
+                history_points=_optional_positive_int(request.args.get("history_points")),
+                metric=(request.args.get("metric") or "").strip() or None,
+                container=(request.args.get("container") or "").strip() or None,
+                start_ms=_optional_int(request.args.get("start_ms"), "start_ms"),
+                end_ms=_optional_int(request.args.get("end_ms"), "end_ms"),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if charts is None:
+            return jsonify({"error": "resource not found"}), 404
+        return jsonify(charts)
 
     @app.get("/api/resources/details")
     def api_resource_details():
@@ -187,6 +219,11 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         if not resource_ids:
             return jsonify({"resources": []})
 
+        try:
+            include_charts = _parse_bool(request.args.get("include_charts"), default=True)
+            history_points = _optional_positive_int(request.args.get("history_points"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         items: List[Dict[str, Any]] = []
         for resource_id in resource_ids[:100]:
             pending_status = prediction_pending_for(resource_id)
@@ -198,7 +235,11 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                     }
                 )
                 continue
-            detail = get_resource_detail(resource_id)
+            detail = get_resource_detail(
+                resource_id,
+                include_charts=include_charts,
+                history_points=history_points,
+            )
             if detail is not None:
                 items.append(detail)
         return jsonify({"resources": items})
@@ -209,6 +250,38 @@ def _normalize_resource_type_filter(value: Any) -> str:
     if not raw:
         return ""
     return resource_type_of({"resource_type": raw})
+
+
+def _parse_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("boolean query parameter must be true or false")
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError("history_points must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError("history_points must be a positive integer")
+    return parsed
+
+
+def _optional_int(value: Any, name: str) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
 def _normalize_confidence_filter(value: Any) -> str:

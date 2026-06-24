@@ -1335,6 +1335,136 @@ h1 {
   text-align: center;
 }
 
+.update-history-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: end;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid rgba(15, 23, 42, .09);
+  text-align: left;
+}
+
+.update-history-head h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.update-history-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.update-history {
+  display: grid;
+  gap: 9px;
+  margin-top: 12px;
+  text-align: left;
+}
+
+.update-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  align-items: center;
+  border: 1px solid rgba(15, 23, 42, .08);
+  border-left: 3px solid #16a34a;
+  border-radius: 9px;
+  padding: 12px 14px;
+  background: #fff;
+  box-shadow: 0 5px 18px rgba(15, 23, 42, .035);
+}
+
+.update-history-item.is-failed {
+  border-left-color: #dc2626;
+}
+
+.update-history-title,
+.update-history-meta,
+.update-history-counts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.update-history-title {
+  gap: 7px;
+}
+
+.update-history-title strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.update-history-title > span:last-child,
+.update-history-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.update-history-status {
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: #ecfdf5;
+  color: #047857;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.is-failed .update-history-status {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.update-history-meta {
+  gap: 5px 14px;
+  margin-top: 5px;
+}
+
+.update-history-main p {
+  margin: 7px 0 0;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.update-history-counts {
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 270px;
+}
+
+.update-history-counts span {
+  min-width: 58px;
+  border: 1px solid rgba(15, 23, 42, .07);
+  border-radius: 7px;
+  padding: 5px 7px;
+  background: #f8fafc;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.update-history-counts b {
+  display: block;
+  color: #0f172a;
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  .update-history-item {
+    grid-template-columns: 1fr;
+  }
+
+  .update-history-counts {
+    justify-content: flex-start;
+    max-width: none;
+  }
+}
+
 .reason-item .reason-action.is-scale_out,
 .reason-item .reason-action.is-scale_out_candidate {
   border-color: rgba(220, 38, 38, .22);

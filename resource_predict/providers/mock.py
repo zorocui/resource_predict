@@ -6,7 +6,7 @@ from __future__ import annotations
 给 pipeline / generate_forecasts 的 data_provider 接口用的示例：
 - 返回值格式与 pipeline.prepare 中 data_provider 约定一致
 - cpu/memory/disk 的 values 为使用率小数，范围 [0, 1]
-- 默认模拟 5 个 resources
+- 默认由 GenerationConfig 生成 45 个 resources
 - 序列长度 n 默认按调用传入（示例在 __main__ 里固定为 240）
 """
 
@@ -162,6 +162,16 @@ def _simulate_metric_by_mode(*, n: int, rng: np.random.Generator, mode: str, fre
         slope = rng.uniform(-0.03, 0.01)  # 低位缓降或近乎持平
         amp = rng.uniform(1.0, 2.8)
         noise_sigma = rng.uniform(0.5, 1.0)
+    elif mode == "spike":
+        base = rng.uniform(36, 44)
+        slope = rng.uniform(-0.01, 0.02)
+        amp = rng.uniform(2.0, 4.0)
+        noise_sigma = rng.uniform(0.8, 1.4)
+    elif mode == "recovering":
+        base = rng.uniform(78, 86)
+        slope = rng.uniform(-0.20, -0.14)
+        amp = rng.uniform(3.0, 5.0)
+        noise_sigma = rng.uniform(0.8, 1.5)
     else:  # hold
         base = rng.uniform(32, 48)
         slope = rng.uniform(-0.02, 0.03)
@@ -176,6 +186,10 @@ def _simulate_metric_by_mode(*, n: int, rng: np.random.Generator, mode: str, fre
     daily = amp * np.sin(2 * np.pi * t / steps_per_day + rng.uniform(0, 2 * np.pi))
     noise = rng.normal(0, noise_sigma, size=n)
     y = base + slope * t + daily + noise
+    if mode == "spike" and n:
+        spike_points = max(1, n // 10)
+        spike_indices = np.linspace(max(0, n // 3), n - 1, num=spike_points, dtype=int)
+        y[spike_indices] = rng.uniform(88, 100, size=spike_points)
     # 归一化到 [0, 1]（与主流程指标刻度一致，非 0~100 百分比）
     return np.clip(y / 100.0, 0.0, 1.0)
 
@@ -219,15 +233,30 @@ def _mock_vm_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]
         {"cpu_cores": 8, "memory_gb": 32, "disk_gb": 200},
     ]
     clusters = ["cluster-a", "cluster-b", "cluster-c"]
+    metric_scenarios = [
+        ("scale_out", "scale_out", "scale_out"),
+        ("scale_in", "scale_in", "scale_in"),
+        ("hold", "hold", "hold"),
+        ("scale_out", "hold", "hold"),
+        ("hold", "scale_out", "hold"),
+        ("hold", "hold", "scale_out"),
+        ("scale_in", "hold", "hold"),
+        ("hold", "scale_in", "hold"),
+        ("hold", "hold", "scale_in"),
+        ("scale_out", "scale_in", "hold"),
+        ("scale_in", "scale_out", "hold"),
+        ("spike", "hold", "hold"),
+        ("recovering", "hold", "hold"),
+    ]
     for i in range(resources):
         rid = f"vm-{i+1:03d}"
-        mode = ["scale_out", "scale_in", "hold"][i % 3]
+        cpu_mode, memory_mode, disk_mode = metric_scenarios[i % len(metric_scenarios)]
         rng_cpu = np.random.default_rng(base_seed + i * 3 + 0)
         rng_mem = np.random.default_rng(base_seed + i * 3 + 1)
         rng_disk = np.random.default_rng(base_seed + i * 3 + 2)
-        cpu = _simulate_metric_by_mode(n=n, rng=rng_cpu, mode=mode, freq=freq)
-        memory = _simulate_metric_by_mode(n=n, rng=rng_mem, mode=mode, freq=freq)
-        disk = _simulate_metric_by_mode(n=n, rng=rng_disk, mode=mode, freq=freq)
+        cpu = _simulate_metric_by_mode(n=n, rng=rng_cpu, mode=cpu_mode, freq=freq)
+        memory = _simulate_metric_by_mode(n=n, rng=rng_mem, mode=memory_mode, freq=freq)
+        disk = _simulate_metric_by_mode(n=n, rng=rng_disk, mode=disk_mode, freq=freq)
 
         spec = specs[i % len(specs)]
         ip_octet_3 = 10 + ((i // 200) % 200)
@@ -260,59 +289,108 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
     base_seed = 7000 + n
     idx = pd.date_range("2025-01-01", periods=n, freq=freq)
     idx_list = idx.tolist()
-    clusters = ["cluster-k8s-a", "cluster-k8s-b"]
-    namespaces = ["payments", "orders", "platform", "monitoring"]
-    owners = [
-        ("Deployment", "api-server"),
-        ("Deployment", "worker"),
-        ("StatefulSet", "redis"),
-        ("Deployment", "collector"),
+    clusters = ["cluster-k8s-a", "cluster-k8s-b", "cluster-k8s-c"]
+    namespaces = ["payments", "orders", "platform", "monitoring", "data", "security"]
+    node_names = ["worker-01", "worker-02", "worker-03", "worker-04"]
+    container_names = ["app", "sidecar", "exporter"]
+    role_specs = {
+        "app": (0.5, 1.0, 1.0, 2.0),
+        "sidecar": (0.1, 0.25, 0.125, 0.25),
+        "exporter": (0.05, 0.1, 0.0625, 0.125),
+    }
+    scenarios = [
+        ("Deployment", "api-server", 2, "full", "scale_out", "scale_out", 4, ()),
+        ("StatefulSet", "database", 1, "full", "scale_in", "scale_in", 3, ()),
+        ("DaemonSet", "node-agent", 1, "full", "hold", "hold", 4, ()),
+        ("ReplicaSet", "worker", 3, "full", "scale_out", "scale_in", 5, ()),
+        ("Deployment", "web", 2, "request_only", "scale_in", "hold", 6, ()),
+        ("StatefulSet", "cache", 1, "limit_only", "scale_out", "hold", 3, ()),
+        ("DaemonSet", "log-agent", 2, "none", "hold", "hold", 4, ()),
+        ("Deployment", "queue", 3, "full", "spike", "hold", 8, ()),
+        ("StatefulSet", "search", 2, "full", "hold", "scale_out", 3, ()),
+        ("ReplicaSet", "batch", 1, "full", "hold", "scale_in", 2, ()),
+        ("Deployment", "metrics", 2, "full", "hold", "hold", 3, ("cpu", "memory")),
+        ("DaemonSet", "security-agent", 3, "request_only", "scale_in", "scale_in", 4, ()),
+        ("StatefulSet", "broker", 3, "limit_only", "scale_out", "scale_out", 5, ()),
+        ("ReplicaSet", "canary", 2, "full", "recovering", "hold", 2, ()),
+        ("Deployment", "gateway", 1, "full", "hold", "hold", 4, ()),
     ]
-    node_names = ["worker-01", "worker-02", "worker-03"]
-    cpu_requests = [0.25, 0.5, 1.0, None, 0.2]
-    cpu_limits = [1.0, 2.0, None, 0.8, None]
-    memory_requests = [0.5, 1.0, 2.0, None, 0.25]
-    memory_limits = [1.0, 2.0, None, 1.5, None]
+
+    def container_spec(name: str, profile: str) -> Dict[str, float | None]:
+        cpu_request, cpu_limit, memory_request, memory_limit = role_specs[name]
+        if profile == "request_only":
+            cpu_limit = None
+            memory_limit = None
+        elif profile == "limit_only":
+            cpu_request = None
+            memory_request = None
+        elif profile == "none":
+            cpu_request = cpu_limit = memory_request = memory_limit = None
+        return {
+            "cpu_request_cores": cpu_request,
+            "cpu_limit_cores": cpu_limit,
+            "memory_request_gb": memory_request,
+            "memory_limit_gb": memory_limit,
+        }
+
+    def usage_base(spec: Dict[str, float | None], metric: str, mode: str) -> float:
+        prefix = "cpu" if metric == "cpu" else "memory"
+        preferred = "limit" if mode in {"scale_out", "spike"} else "request"
+        fallback = "request" if preferred == "limit" else "limit"
+        return (
+            _positive_float(spec.get(f"{prefix}_{preferred}_{'cores' if prefix == 'cpu' else 'gb'}"))
+            or _positive_float(spec.get(f"{prefix}_{fallback}_{'cores' if prefix == 'cpu' else 'gb'}"))
+            or 1.0
+        )
+
+    def quality_payload(level: str) -> Dict[str, Any]:
+        poor = level == "poor"
+        return {
+            "level": level,
+            "missing_ratio": 0.35 if poor else 0.0,
+            "max_gap_points": max(2, n // 5) if poor else 1,
+            "valid_points": max(0, int(n * 0.65)) if poor else n,
+        }
 
     out: List[Dict[str, Any]] = []
     for i in range(resources):
+        owner_kind, owner_name, container_count, baseline_profile, cpu_mode, memory_mode, replicas, poor_metrics = scenarios[
+            i % len(scenarios)
+        ]
         namespace = namespaces[i % len(namespaces)]
-        owner_kind, owner_name = owners[i % len(owners)]
-        workload_name = f"{owner_name}-{i % 3}"
-        pods = [f"{workload_name}-{1000 + i * 3 + j:04d}" for j in range(3)]
-        containers = ["app", "sidecar"] if i % 4 == 0 else ["app"]
-        mode = ["scale_out", "scale_in", "hold", "scale_out", "hold"][i % 5]
-        rng_cpu = np.random.default_rng(base_seed + i * 5 + 0)
-        rng_mem = np.random.default_rng(base_seed + i * 5 + 1)
-        cpu = _simulate_metric_by_mode(n=n, rng=rng_cpu, mode=mode, freq=freq)
-        memory = _simulate_metric_by_mode(n=n, rng=rng_mem, mode=mode, freq=freq)
-        cpu_request = cpu_requests[i % len(cpu_requests)]
-        cpu_limit = cpu_limits[i % len(cpu_limits)]
-        memory_request = memory_requests[i % len(memory_requests)]
-        memory_limit = memory_limits[i % len(memory_limits)]
-        total_cpu_base = _sum_positive([cpu_limit, cpu_request]) or 1.0
-        total_memory_base = _sum_positive([memory_limit, memory_request]) or 1.0
-        container_specs = {
-            name: {
-                "cpu_request_cores": cpu_request,
-                "cpu_limit_cores": cpu_limit,
-                "memory_request_gb": memory_request,
-                "memory_limit_gb": memory_limit,
-            }
-            for name in containers
-        }
+        workload_name = f"{owner_name}-{i + 1:02d}"
+        pods = [f"{workload_name}-{1000 + i * 10 + j:04d}" for j in range(replicas)]
+        containers = container_names[:container_count]
+        container_specs = {name: container_spec(name, baseline_profile) for name in containers}
         container_metrics: Dict[str, Dict[str, Any]] = {}
         container_data_quality: Dict[str, Dict[str, Any]] = {}
         container_metric_modes: Dict[str, Dict[str, str]] = {}
         raw_cpu_by_container: Dict[str, np.ndarray] = {}
         raw_memory_by_container: Dict[str, np.ndarray] = {}
         for pos, name in enumerate(containers):
-            weight = 0.82 if name == "app" else 0.18
-            jitter = np.random.default_rng(base_seed + i * 17 + pos).normal(0, 0.015, size=n)
-            c_cpu_raw = np.clip(cpu * total_cpu_base * weight + jitter, 0.0, None)
-            c_memory_raw = np.clip(memory * total_memory_base * weight + jitter, 0.0, None)
+            spec = container_specs[name]
+            c_cpu_usage = _simulate_metric_by_mode(
+                n=n,
+                rng=np.random.default_rng(base_seed + i * 31 + pos * 2),
+                mode=cpu_mode,
+                freq=freq,
+            )
+            c_memory_usage = _simulate_metric_by_mode(
+                n=n,
+                rng=np.random.default_rng(base_seed + i * 31 + pos * 2 + 1),
+                mode=memory_mode,
+                freq=freq,
+            )
+            cpu_base = usage_base(spec, "cpu", cpu_mode)
+            memory_base = usage_base(spec, "memory", memory_mode)
+            c_cpu_raw = np.clip(c_cpu_usage * cpu_base, 0.0, None)
+            c_memory_raw = np.clip(c_memory_usage * memory_base, 0.0, None)
             raw_cpu_by_container[name] = c_cpu_raw
             raw_memory_by_container[name] = c_memory_raw
+            cpu_request = spec["cpu_request_cores"]
+            cpu_limit = spec["cpu_limit_cores"]
+            memory_request = spec["memory_request_gb"]
+            memory_limit = spec["memory_limit_gb"]
             container_metrics[name] = {
                 "cpu_limit": {"timestamps": idx_list, "values": _normalize_usage(c_cpu_raw, cpu_limit).astype(float).tolist()},
                 "cpu_request": {"timestamps": idx_list, "values": _normalize_usage(c_cpu_raw, cpu_request).astype(float).tolist()},
@@ -320,10 +398,10 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
                 "memory_request": {"timestamps": idx_list, "values": _normalize_usage(c_memory_raw, memory_request).astype(float).tolist()},
             }
             container_data_quality[name] = {
-                "cpu_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
-                "cpu_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
-                "memory_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
-                "memory_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                "cpu_limit": quality_payload("poor" if "cpu" in poor_metrics else "good"),
+                "cpu_request": quality_payload("poor" if "cpu" in poor_metrics else "good"),
+                "memory_limit": quality_payload("poor" if "memory" in poor_metrics else "good"),
+                "memory_request": quality_payload("poor" if "memory" in poor_metrics else "good"),
             }
             container_metric_modes[name] = {
                 "cpu_limit": "cpu_usage/cpu_limit" if cpu_limit else "cpu_usage_cores",
@@ -347,6 +425,10 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
             raw_memory_by_container,
             {name: container_specs[name]["memory_request_gb"] for name in containers},
         )
+        has_cpu_limit = any(_positive_float(spec["cpu_limit_cores"]) for spec in container_specs.values())
+        has_cpu_request = any(_positive_float(spec["cpu_request_cores"]) for spec in container_specs.values())
+        has_memory_limit = any(_positive_float(spec["memory_limit_gb"]) for spec in container_specs.values())
+        has_memory_request = any(_positive_float(spec["memory_request_gb"]) for spec in container_specs.values())
         out.append(
             {
                 "resource_id": f"k8s:{clusters[i % len(clusters)]}:{namespace}:{owner_kind.lower()}:{workload_name}",
@@ -360,13 +442,13 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
                     "workload_name": workload_name,
                     "pods_observed": pods,
                     "containers_observed": containers,
-                    "replicas_observed": len(pods),
+                    "replicas_observed": replicas,
                     "node": node_names[i % len(node_names)],
                     "containers": container_specs,
-                    "cpu_limit_metric_mode": "cpu_usage/cpu_limit" if cpu_limit else "cpu_usage_cores",
-                    "cpu_request_metric_mode": "cpu_usage/cpu_request" if cpu_request else "cpu_usage_cores",
-                    "memory_limit_metric_mode": "memory_working_set/memory_limit" if memory_limit else "memory_working_set_gb",
-                    "memory_request_metric_mode": "memory_working_set/memory_request" if memory_request else "memory_working_set_gb",
+                    "cpu_limit_metric_mode": "cpu_usage/cpu_limit" if has_cpu_limit else "cpu_usage_cores",
+                    "cpu_request_metric_mode": "cpu_usage/cpu_request" if has_cpu_request else "cpu_usage_cores",
+                    "memory_limit_metric_mode": "memory_working_set/memory_limit" if has_memory_limit else "memory_working_set_gb",
+                    "memory_request_metric_mode": "memory_working_set/memory_request" if has_memory_request else "memory_working_set_gb",
                 },
                 "metrics": {
                     "cpu_limit": {"timestamps": idx_list, "values": cpu_limit_values.astype(float).tolist()},
@@ -375,10 +457,10 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
                     "memory_request": {"timestamps": idx_list, "values": memory_request_values.astype(float).tolist()},
                 },
                 "data_quality": {
-                    "cpu_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
-                    "cpu_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
-                    "memory_limit": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
-                    "memory_request": {"level": "good", "missing_ratio": 0.0, "max_gap_points": 1, "valid_points": n},
+                    "cpu_limit": quality_payload("poor" if "cpu" in poor_metrics else "good"),
+                    "cpu_request": quality_payload("poor" if "cpu" in poor_metrics else "good"),
+                    "memory_limit": quality_payload("poor" if "memory" in poor_metrics else "good"),
+                    "memory_request": quality_payload("poor" if "memory" in poor_metrics else "good"),
                 },
                 "container_metrics": container_metrics,
                 "container_data_quality": container_data_quality,
@@ -391,8 +473,8 @@ def _mock_k8s_workload_provider(resources: int, n: int, freq: str) -> List[Dict[
 def mock_provider(resources: int, n: int, freq: str) -> List[Dict[str, Any]]:
     if resources <= 1:
         return _mock_vm_provider(resources=resources, n=n, freq=freq)
-    workload_count = max(1, resources // 3)
-    vm_count = max(1, resources - workload_count)
+    workload_count = min(resources - 1, max(1, round(resources * 0.6)))
+    vm_count = resources - workload_count
     return [
         *_mock_vm_provider(resources=vm_count, n=n, freq=freq),
         *_mock_k8s_workload_provider(resources=workload_count, n=n, freq=freq),

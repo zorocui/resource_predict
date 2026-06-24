@@ -1,10 +1,10 @@
 """
-定时/手动数据更新与 raw 文件合并。
+定时/手动数据更新与资源级 raw 分片合并。
 
 功能：
-- 按配置间隔（或 API）拉取/推送各资源最新监控数据并合并到 raw_data.json
+- 按配置间隔（或 API）拉取/推送各资源最新监控数据并写入 raw_index.json + raw/
 - 默认全量保留历史；可选 sliding_window 在写盘前按净增量裁掉最旧数据
-- 前端展示窗口由 display_window_points 控制（仅影响图表，不写回 raw）
+- 前端图表窗口由详情 API 的 history_points 控制（仅影响响应，不写回 raw）
 - 合并完成后调用 generate_predictions_only() 重算预测
 - 后台调度使用 daemon 线程
 
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import shutil
 import threading
 import time
 from pathlib import Path
@@ -27,37 +26,23 @@ import pandas as pd
 import numpy as np
 
 from resource_predict.settings import settings
-from resource_predict.data.io import coerce_metric_series, read_raw_dataset, write_raw_dataset
-from resource_predict.pipeline.constants import RAW_DATA_FILENAME
+from resource_predict.data.io import coerce_metric_series
+from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.pipeline.output_paths import scoped_out_dir, split_items_by_scope
 from resource_predict.pipeline.windowing import infer_series_freq
 from resource_predict.providers.mock import mock_incremental_provider
 from resource_predict.resource_types import metric_names_for_resource
+from resource_predict.services.update_history import append_update_history
 
 logger = logging.getLogger(__name__)
 
-
-def backup_raw_dataset(raw_path: Path) -> Optional[Path]:
-    """Back up raw_data.json before an in-place merge/write."""
-    if not raw_path.exists():
-        return None
-    backup_dir = raw_path.parent / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup_path = backup_dir / f"{raw_path.stem}.{stamp}.json"
-    suffix = 1
-    while backup_path.exists():
-        backup_path = backup_dir / f"{raw_path.stem}.{stamp}-{suffix}.json"
-        suffix += 1
-    shutil.copy2(raw_path, backup_path)
-    return backup_path
 
 # ---------------------------------------------------------------------------
 # 可插拔增量数据源接口
 # ---------------------------------------------------------------------------
 # 函数签名为：
 #   (prepared_resources: List[Dict], points_to_add: int) -> List[Dict]
-# 其中 prepared_resources 结构与 read_raw_dataset 返回一致：
+# 其中 prepared_resources 结构与 RawResourceStore.read_many() 返回一致：
 #   [{"resource_id": str, "spec": {...}, "cpu": Series, "memory": Series, "disk": Series}, ...]
 # 返回值结构需与 data_provider 格式一致：
 #   [{"resource_id": str, "metrics": {"cpu": {"timestamps":[], "values":[]}, ...}}, ...]
@@ -151,6 +136,7 @@ _scheduler_thread: Optional[threading.Thread] = None
 _lock = threading.Lock()
 # 保护「读 raw → 合并 → 写 raw → 重预测」全过程，与 HTTP / 调度器互斥
 _update_exclusive = threading.Lock()
+_last_history_started_at: Optional[float] = None
 
 
 def get_update_status() -> Dict[str, Any]:
@@ -191,6 +177,7 @@ def mark_external_update_failed(error: str, phase: str = "error") -> None:
         _update_status["last_error"] = error
         _update_status["last_finished_at"] = time.time()
         _update_status["message"] = error
+    _record_current_update_history(error=error)
 
 
 def mark_external_update_finished(result: Dict[str, Any]) -> None:
@@ -207,6 +194,43 @@ def mark_external_update_finished(result: Dict[str, Any]) -> None:
         _update_status["total_updates"] += 1
         _update_status["total_new_points"] += int(result.get("total_new_points") or 0)
         _update_status["message"] = "K8S Prometheus 数据拉取完成"
+    _record_current_update_history(result=result)
+
+
+def _record_current_update_history(
+    *,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    out_dir: Optional[Union[str, Path]] = None,
+) -> None:
+    """Persist one terminal record for the current update without changing its result."""
+    global _last_history_started_at
+    with _lock:
+        status = dict(_update_status)
+        started_at = status.get("last_started_at")
+        if started_at is None or started_at == _last_history_started_at:
+            return
+    result_data = result if isinstance(result, dict) else {}
+    error_text = str(error or result_data.get("error") or status.get("last_error") or "")
+    success = bool(result_data.get("success")) and not error_text
+    record = {
+        "status": "success" if success else "failed",
+        "phase": status.get("phase"),
+        "task_source": status.get("task_source"),
+        "fetch_window_label": status.get("fetch_window_label"),
+        "started_at": started_at,
+        "finished_at": status.get("last_finished_at") or time.time(),
+        "elapsed_seconds": result_data.get("elapsed_seconds"),
+        "resources_updated": result_data.get("resources_updated", status.get("resources_updated")),
+        "resources_created": result_data.get("resources_created", status.get("resources_created")),
+        "predicted_resources": result_data.get("predicted_resources", status.get("predicted_resources")),
+        "total_new_points": result_data.get("total_new_points", 0),
+        "message": status.get("message") or ("数据更新完成" if success else error_text),
+        "error": error_text or None,
+    }
+    if append_update_history(record, out_dir=out_dir):
+        with _lock:
+            _last_history_started_at = started_at
 
 
 def _normalize_one_timestamp_ms(t: Any) -> int:
@@ -365,7 +389,7 @@ def _merge_incremental_into_series(
 
 
 def _build_new_resource_from_upsert(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a prepared resource from an upsert item that is not yet in raw_data.json."""
+    """Create a prepared resource from an upsert item that is not yet in raw_index.json."""
     rid = str(item.get("resource_id", "")).strip()
     if not rid:
         raise ValueError("新增资源缺少 resource_id")
@@ -561,7 +585,12 @@ def run_update_with_data(
     Dict : {"success": bool, "resources_updated": int, "total_new_points": int, ...}
     """
     logger.info("[updater] 收到 push 更新数据：%d 个资源", len(new_data_list) if isinstance(new_data_list, list) else 0)
-    return _do_update(new_data_list=new_data_list, fail_if_busy=fail_if_busy, out_dir=out_dir)
+    return _do_update(
+        new_data_list=new_data_list,
+        fail_if_busy=fail_if_busy,
+        out_dir=out_dir,
+        task_source="推送增量更新",
+    )
 
 
 def run_upsert_with_data(
@@ -569,6 +598,7 @@ def run_upsert_with_data(
     *,
     fail_if_busy: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    task_source: str = "推送 Upsert 更新",
 ) -> Dict[str, Any]:
     """
     使用外部传入数据进行显式 upsert：已有资源更新，不存在的资源插入。
@@ -580,11 +610,18 @@ def run_upsert_with_data(
         "[updater] 收到 push upsert 数据：%d 个资源",
         len(new_data_list) if isinstance(new_data_list, list) else 0,
     )
+    with _lock:
+        inherited_external_source = bool(
+            _update_status.get("running") and _update_status.get("task_source")
+        )
+    effective_source = "" if inherited_external_source else task_source
     return _do_update(
         new_data_list=new_data_list,
         fail_if_busy=fail_if_busy,
         allow_create=True,
         out_dir=out_dir,
+        task_source=effective_source,
+        record_history=not inherited_external_source,
     )
 
 
@@ -593,7 +630,12 @@ def run_scoped_update_with_data(
     *,
     fail_if_busy: bool = False,
 ) -> Dict[str, Any]:
-    return _run_scoped_data_update(new_data_list, allow_create=False, fail_if_busy=fail_if_busy)
+    return _run_scoped_data_update(
+        new_data_list,
+        allow_create=False,
+        fail_if_busy=fail_if_busy,
+        task_source="API 推送增量更新",
+    )
 
 
 def run_scoped_upsert_with_data(
@@ -601,7 +643,12 @@ def run_scoped_upsert_with_data(
     *,
     fail_if_busy: bool = False,
 ) -> Dict[str, Any]:
-    return _run_scoped_data_update(new_data_list, allow_create=True, fail_if_busy=fail_if_busy)
+    return _run_scoped_data_update(
+        new_data_list,
+        allow_create=True,
+        fail_if_busy=fail_if_busy,
+        task_source="API 推送 Upsert 更新",
+    )
 
 
 def run_update(
@@ -609,6 +656,7 @@ def run_update(
     incremental_provider: Optional[IncrementalProvider] = None,
     points_per_update: Optional[int] = None,
     fail_if_busy: bool = False,
+    task_source: str = "页面手动 Pull 更新",
 ) -> Dict[str, Any]:
     """
     执行一次完整的数据更新 + 预测重算流程（pull 模式，调用增量数据源拉取数据）。
@@ -621,23 +669,33 @@ def run_update(
     cfg = settings.update
     points = points_per_update if points_per_update is not None else int(cfg.points_per_update)
 
-    provider = incremental_provider or _resolve_provider()
-    out_dir = scoped_out_dir("vm")
-    raw_path = out_dir / RAW_DATA_FILENAME
+    if not _update_exclusive.acquire(blocking=not fail_if_busy):
+        raise UpdateBusyError("已有更新任务正在运行中")
+    try:
+        provider = incremental_provider or _resolve_provider()
+        out_dir = scoped_out_dir("vm")
+        raw_store = RawResourceStore(
+            out_dir,
+            max_cache_items=int(settings.generation.raw_resource_cache_items),
+        )
 
-    logger.info("[updater] 开始读取 raw_data.json …")
-    prepared, meta = read_raw_dataset(raw_path)
-    freq = str(meta.get("freq", settings.generation.freq))
-    logger.info("[updater] 已读取 %d 个资源，freq=%s", len(prepared), freq)
+        logger.info("[updater] 开始读取 raw 资源索引 …")
+        prepared = raw_store.read_many()
+        meta = raw_store.metadata()
+        freq = str(meta.get("freq", settings.generation.freq))
+        logger.info("[updater] 已读取 %d 个资源，freq=%s", len(prepared), freq)
 
-    logger.info("[updater] 调用增量数据源，请求 %d 个新数据点 …", points)
-    new_data_list = provider(prepared, points)
+        logger.info("[updater] 调用增量数据源，请求 %d 个新数据点 …", points)
+        new_data_list = provider(prepared, points)
 
-    return _do_update(
-        new_data_list=new_data_list,
-        prepared_cache=(prepared, meta, freq),
-        fail_if_busy=fail_if_busy,
-    )
+        return _do_update(
+            new_data_list=new_data_list,
+            prepared_cache=(prepared, meta, freq),
+            _exclusive_already_acquired=True,
+            task_source=task_source,
+        )
+    finally:
+        _update_exclusive.release()
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +709,9 @@ def _do_update(
     fail_if_busy: bool = False,
     allow_create: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
+    _exclusive_already_acquired: bool = False,
+    task_source: str = "",
+    record_history: bool = True,
 ) -> Dict[str, Any]:
     """
     更新流程核心：run_update / run_update_with_data 复用。
@@ -661,8 +722,8 @@ def _do_update(
         为 True 且无法立即取得排他锁时抛出 UpdateBusyError（由 API 映射为 409）。
     """
     output_dir = Path(out_dir) if out_dir is not None else Path(settings.app.out_dir)
-    raw_path = output_dir / RAW_DATA_FILENAME
-
+    configured_out_dir = Path(settings.app.out_dir)
+    history_out_dir = configured_out_dir if output_dir.parent == configured_out_dir else output_dir
     result: Dict[str, Any] = {
         "success": False,
         "resources_updated": 0,
@@ -673,8 +734,11 @@ def _do_update(
         "warnings": [],
     }
 
-    if not _update_exclusive.acquire(blocking=not fail_if_busy):
+    acquired_here = not _exclusive_already_acquired
+    if acquired_here and not _update_exclusive.acquire(blocking=not fail_if_busy):
         raise UpdateBusyError("已有更新任务正在运行中")
+    if _exclusive_already_acquired and not _update_exclusive.locked():
+        raise RuntimeError("内部错误：Pull 更新未持有排他锁")
 
     t_start = time.time()
     try:
@@ -687,9 +751,13 @@ def _do_update(
             _update_status["resources_created"] = 0
             _update_status["created_resource_ids"] = []
             _update_status["predicted_resources"] = 0
-            _update_status["last_started_at"] = t_start
+            if record_history:
+                _update_status["last_started_at"] = t_start
             _update_status["last_error"] = None
             _update_status["last_result"] = None
+            if task_source:
+                _update_status["task_source"] = task_source
+                _update_status["fetch_window_label"] = ""
 
         if not isinstance(new_data_list, list) or not new_data_list:
             raise ValueError("传入的增量数据为空")
@@ -702,13 +770,25 @@ def _do_update(
                 freq,
             )
         else:
-            logger.info("[updater] 开始读取 raw_data.json …")
-            if allow_create and not raw_path.exists():
+            logger.info("[updater] 开始读取 raw 资源索引 …")
+            raw_store = RawResourceStore(
+                output_dir,
+                max_cache_items=int(settings.generation.raw_resource_cache_items),
+            )
+            if allow_create and not raw_store.exists():
                 prepared = []
                 freq = settings.generation.freq
-                logger.info("[updater] 目标 raw_data.json 不存在，将通过 upsert 初始化: %s", raw_path)
+                logger.info("[updater] 目标 raw_index.json 不存在，将通过 upsert 初始化: %s", output_dir)
             else:
-                prepared, meta = read_raw_dataset(raw_path)
+                requested_ids = {
+                    str(item.get("resource_id") or "")
+                    for item in new_data_list
+                    if isinstance(item, dict) and item.get("resource_id")
+                }
+                # Push/update 与 upsert 都只读取请求涉及的资源。不存在的 ID 在
+                # update 模式下保持“不创建”，在 upsert 模式下由下方显式创建。
+                prepared = raw_store.read_many(requested_ids)
+                meta = raw_store.metadata()
                 freq = str(meta.get("freq", settings.generation.freq))
             logger.info("[updater] 已读取 %d 个资源，freq=%s", len(prepared), freq)
 
@@ -844,10 +924,7 @@ def _do_update(
                 "没有任何资源被更新（新数据与现有资源 ID 不匹配，或所有指标均为空）"
             )
 
-        backup_path = backup_raw_dataset(raw_path)
-        if backup_path is not None:
-            logger.info("[updater] raw_data.json 备份: %s", backup_path)
-        logger.info("[updater] 写回 raw_data.json （%d 个资源）…", len(prepared))
+        logger.info("[updater] 写回 raw 资源分片（本次 %d 个资源）…", len(updated_resource_ids))
         with _lock:
             _update_status["phase"] = "writing_raw"
             _update_status["current_resource_ids"] = list(updated_resource_ids)
@@ -861,7 +938,19 @@ def _do_update(
                 freq = infer_series_freq(prepared[0][first_metric].index)
             except Exception:
                 pass
-        write_raw_dataset(raw_path, prepared, freq=freq)
+        raw_stats = write_raw_resource_dataset(
+            output_dir,
+            prepared,
+            freq=freq,
+            changed_resource_ids=updated_resource_ids,
+        )
+        logger.info(
+            "[updater] raw 分片提交：resources=%d written=%d reused=%d removed=%d",
+            raw_stats["resources"],
+            raw_stats["files_written"],
+            raw_stats["files_reused"],
+            raw_stats["files_removed"],
+        )
 
         logger.info("[updater] 开始重新预测 …")
         with _lock:
@@ -895,6 +984,9 @@ def _do_update(
             _update_status["total_updates"] += 1
             _update_status["total_new_points"] += total_new_pts
 
+        if record_history:
+            _record_current_update_history(result=result, out_dir=history_out_dir)
+
         logger.info(
             "[updater] ✅ 更新完成：%d 更新，%d 新增，净增 %d 数据点，耗时 %.1fs",
             updated_count,
@@ -913,6 +1005,8 @@ def _do_update(
             _update_status["last_error"] = str(exc)
             _update_status["last_finished_at"] = time.time()
             _update_status["phase"] = "error"
+        if record_history:
+            _record_current_update_history(result=result, error=str(exc), out_dir=history_out_dir)
 
     finally:
         with _lock:
@@ -922,7 +1016,8 @@ def _do_update(
             _update_status["current_resource_ids"] = []
             _update_status["current_metrics_by_resource"] = {}
             _update_status["created_resource_ids"] = []
-        _update_exclusive.release()
+        if acquired_here:
+            _update_exclusive.release()
 
     return result
 
@@ -932,7 +1027,18 @@ def _run_scoped_data_update(
     *,
     allow_create: bool,
     fail_if_busy: bool,
+    task_source: str,
 ) -> Dict[str, Any]:
+    task_started_at = time.time()
+    with _lock:
+        _update_status["running"] = True
+        _update_status["phase"] = "merging"
+        _update_status["last_started_at"] = task_started_at
+        _update_status["last_finished_at"] = None
+        _update_status["last_error"] = None
+        _update_status["last_result"] = None
+        _update_status["task_source"] = task_source
+        _update_status["fetch_window_label"] = ""
     split = split_items_by_scope(new_data_list)
     results: Dict[str, Any] = {
         "success": True,
@@ -956,6 +1062,8 @@ def _run_scoped_data_update(
             fail_if_busy=fail_if_busy,
             allow_create=allow_create,
             out_dir=scoped_out_dir(scope),
+            task_source=task_source,
+            record_history=False,
         )
         results["results_by_scope"][scope] = result
         if not result.get("success"):
@@ -976,6 +1084,18 @@ def _run_scoped_data_update(
         metrics_by_resource = result.get("updated_metrics_by_resource") or {}
         if isinstance(metrics_by_resource, dict):
             results["updated_metrics_by_resource"].update(metrics_by_resource)
+    results["elapsed_seconds"] = round(time.time() - task_started_at, 2)
+    with _lock:
+        _update_status["last_started_at"] = task_started_at
+        _update_status["last_finished_at"] = time.time()
+        _update_status["last_result"] = dict(results)
+        _update_status["last_error"] = results.get("error")
+        _update_status["phase"] = "idle" if results.get("success") else "error"
+        _update_status["task_source"] = task_source
+        _update_status["resources_updated"] = results["resources_updated"]
+        _update_status["resources_created"] = results["resources_created"]
+        _update_status["predicted_resources"] = results["predicted_resources"]
+    _record_current_update_history(result=results, error=results.get("error"))
     return results
 
 
@@ -988,6 +1108,7 @@ def _scheduler_loop(
     interval_seconds: float,
     incremental_provider: Optional[IncrementalProvider],
     points_per_update: int,
+    startup_delay_seconds: float,
 ) -> None:
     """后台线程主循环：按间隔定时触发 run_update。"""
     logger.info(
@@ -995,20 +1116,22 @@ def _scheduler_loop(
         interval_seconds,
         interval_seconds / 60.0,
     )
+    if startup_delay_seconds > 0:
+        logger.info("[updater] 首次自动更新将在 %.0f 秒后执行", startup_delay_seconds)
+        if _stop_event.wait(startup_delay_seconds):
+            logger.info("[updater] 后台调度器在首次更新前停止")
+            return
     while not _stop_event.is_set():
         try:
             run_update(
                 incremental_provider=incremental_provider,
                 points_per_update=points_per_update,
+                task_source="后台定时 Pull 更新",
             )
         except Exception as exc:
             logger.error("[updater] 调度循环异常: %s", exc)
 
-        # 分段等待，以便及时响应停止信号
-        waited = 0.0
-        while waited < interval_seconds and not _stop_event.is_set():
-            time.sleep(1.0)
-            waited += 1.0
+        _stop_event.wait(interval_seconds)
 
     logger.info("[updater] 后台调度器已停止")
 
@@ -1031,6 +1154,7 @@ def start_background_updater(
     cfg = settings.update
     interval = interval_minutes if interval_minutes is not None else int(cfg.interval_minutes)
     points = points_per_update if points_per_update is not None else int(cfg.points_per_update)
+    startup_delay = max(0, int(cfg.startup_delay_seconds))
 
     if not bool(cfg.enabled):
         logger.info("[updater] 配置中 enabled=False，跳过后台自动更新（可通过 POST /api/update-trigger 手动触发）")
@@ -1044,7 +1168,7 @@ def start_background_updater(
     _stop_event.clear()
     _scheduler_thread = threading.Thread(
         target=_scheduler_loop,
-        args=(interval * 60.0, incremental_provider, points),
+        args=(interval * 60.0, incremental_provider, points, float(startup_delay)),
         daemon=True,
         name="data-updater",
     )

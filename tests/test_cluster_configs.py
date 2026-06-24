@@ -110,10 +110,18 @@ class ClusterConfigsTest(unittest.TestCase):
             }
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            raw_path = Path(tmp) / "k8s" / "raw_data.json"
-            raw_path.parent.mkdir(parents=True)
-            raw_path.write_text(
-                json.dumps({"resources": [{"resource_id": "rid", "spec": {"cluster": "cluster-a"}}]}),
+            raw_index_path = Path(tmp) / "k8s" / "raw_index.json"
+            raw_index_path.parent.mkdir(parents=True)
+            raw_index_path.write_text(
+                json.dumps({
+                    "schema_version": 2,
+                    "resources": {
+                        "k8s:cluster-a:ns:deployment:api": {
+                            "file": "raw/00/unused.json",
+                            "resource_type": "k8s_workload",
+                        }
+                    },
+                }),
                 encoding="utf-8",
             )
             fake_settings = SimpleNamespace(

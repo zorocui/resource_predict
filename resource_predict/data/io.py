@@ -1,7 +1,7 @@
 """
-原始监控数据与预测产物的读写、合并。
+监控数据序列化与预测产物合并。
 
-- raw_data.json：仅保存观测序列（resource_id / spec / metrics），可长期固定。
+- raw_index.json + raw/：由 data/raw_store.py 保存资源级观测分片。
 - details 分片：保存 charts_forecast（无 y_train/y_test），重新预测时只覆盖这部分。
 - API 层将二者合并为前端所需的完整 charts。
 """
@@ -18,8 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from resource_predict.resource_types import metric_names_for_resource, resource_type_of
-
-RAW_SCHEMA_VERSION = 1
 
 logger = logging.getLogger(__name__)
 
@@ -177,65 +175,40 @@ def _serialize_container_metric_series(value: Any) -> Dict[str, Dict[str, Dict[s
     return out
 
 
-def write_raw_dataset(path: Path, prepared_resources: List[Dict[str, Any]], *, freq: str) -> None:
-    payload = {
-        "meta": {
-            "schema_version": RAW_SCHEMA_VERSION,
-            "saved_at_epoch_ms": int(time.time() * 1000),
-            "freq": freq,
-        },
-        "resources": [prepared_dict_to_raw_record(p) for p in prepared_resources],
+def raw_record_to_prepared(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """将一个资源级 raw JSON 记录转换为内部 pandas 结构。"""
+    if not isinstance(rec, dict):
+        raise TypeError("raw resource record 必须为 object")
+    rid = str(rec.get("resource_id") or "").strip()
+    if not rid:
+        raise ValueError("raw resource record 缺少 resource_id")
+    metrics = rec.get("metrics", {})
+    if not isinstance(metrics, dict):
+        raise ValueError(f"{rid} 的 metrics 必须为 dict")
+    item: Dict[str, Any] = {
+        "resource_id": rid,
+        "spec": rec.get("spec", {}) if isinstance(rec.get("spec"), dict) else {},
     }
-    atomic_write_json(path, payload, ensure_ascii=False, indent=2)
-
-
-def read_raw_dataset(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    if not path.exists():
-        raise FileNotFoundError(f"未找到原始数据文件: {path}")
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(obj, dict):
-        raise ValueError("raw_data.json 根节点必须为 object")
-    meta = obj.get("meta", {})
-    resources_raw = obj.get("resources", [])
-    if not isinstance(resources_raw, list) or not resources_raw:
-        raise ValueError("raw_data.json 中 resources 必须为非空 list")
-    prepared: List[Dict[str, Any]] = []
-    for idx, rec in enumerate(resources_raw):
-        if not isinstance(rec, dict):
-            continue
-        rid = rec.get("resource_id") or f"resource_{idx+1:02d}"
-        metrics = rec.get("metrics", {})
-        if not isinstance(metrics, dict):
-            raise ValueError(f"{rid} 的 metrics 必须为 dict")
-        item: Dict[str, Any] = {
-            "resource_id": str(rid),
-            "spec": rec.get("spec", {}) if isinstance(rec.get("spec"), dict) else {},
-        }
-        resource_type = str(rec.get("resource_type") or "")
-        if resource_type:
-            item["resource_type"] = resource_type
-        if isinstance(rec.get("data_quality"), dict):
-            item["data_quality"] = rec["data_quality"]
-        for metric in metric_names_for_resource(item):
-            if metric not in metrics:
-                raise ValueError(f"{rid} 缺少 {metric} 指标")
-            item[metric] = coerce_metric_series(metrics.get(metric), metric)
-        container_metrics = _coerce_container_metric_series(
-            rec.get("container_metrics"),
-            metric_names_for_resource(item),
-        )
-        if container_metrics:
-            item["container_metrics"] = container_metrics
-        if isinstance(rec.get("container_data_quality"), dict):
-            item["container_data_quality"] = rec["container_data_quality"]
-        if isinstance(rec.get("container_metric_modes"), dict):
-            item["container_metric_modes"] = rec["container_metric_modes"]
-        prepared.append(item)
-    return prepared, meta if isinstance(meta, dict) else {}
-
-
-def index_prepared_by_id(prepared: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {str(p["resource_id"]): p for p in prepared}
+    resource_type = str(rec.get("resource_type") or "")
+    if resource_type:
+        item["resource_type"] = resource_type
+    if isinstance(rec.get("data_quality"), dict):
+        item["data_quality"] = rec["data_quality"]
+    for metric in metric_names_for_resource(item):
+        if metric not in metrics:
+            raise ValueError(f"{rid} 缺少 {metric} 指标")
+        item[metric] = coerce_metric_series(metrics.get(metric), metric)
+    container_metrics = _coerce_container_metric_series(
+        rec.get("container_metrics"),
+        metric_names_for_resource(item),
+    )
+    if container_metrics:
+        item["container_metrics"] = container_metrics
+    if isinstance(rec.get("container_data_quality"), dict):
+        item["container_data_quality"] = rec["container_data_quality"]
+    if isinstance(rec.get("container_metric_modes"), dict):
+        item["container_metric_modes"] = rec["container_metric_modes"]
+    return item
 
 
 def _coerce_container_metric_series(value: Any, metric_names: Tuple[str, ...]) -> Dict[str, Dict[str, pd.Series]]:
@@ -261,17 +234,16 @@ def merge_charts_into_detail(
     raw_by_id: Dict[str, Dict[str, Any]],
     *,
     test_size: int,
+    history_points: Optional[int] = None,
+    metric_filter: Optional[str] = None,
+    container_filter: Optional[str] = None,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     将仅含 charts_forecast 的详情记录与原始序列合并为完整 charts。
     若已含完整 charts（含 y_train），则原样返回。
     """
-    charts = detail.get("charts")
-    if isinstance(charts, dict):
-        cpu = charts.get("cpu")
-        if isinstance(cpu, dict) and cpu.get("y_train") is not None:
-            return detail
-
     cf = detail.get("charts_forecast")
     if not isinstance(cf, dict):
         return detail
@@ -287,12 +259,18 @@ def merge_charts_into_detail(
 
     merged_charts: Dict[str, Any] = {}
     for kind in metric_names_for_resource(raw):
+        if metric_filter and kind != metric_filter:
+            continue
         y_full = raw.get(kind)
         if not isinstance(y_full, pd.Series) or y_full.empty:
             continue
         if len(y_full) <= test_size:
             continue
         y_train, y_test = y_full.iloc[:-test_size], y_full.iloc[-test_size:]
+        y_train = _filter_series_time_range(y_train, start_ms=start_ms, end_ms=end_ms)
+        if history_points is not None:
+            points = max(0, int(history_points))
+            y_train = y_train.iloc[-points:] if points else y_train.iloc[0:0]
         block = cf.get(kind)
         if not isinstance(block, dict):
             continue
@@ -308,7 +286,16 @@ def merge_charts_into_detail(
             "best_method": block.get("best_method", ""),
         }
     out["charts"] = merged_charts
-    container_charts = _merge_container_charts(raw, detail, test_size=test_size)
+    container_charts = _merge_container_charts(
+        raw,
+        detail,
+        test_size=test_size,
+        history_points=history_points,
+        metric_filter=metric_filter,
+        container_filter=container_filter,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
     if container_charts:
         out["container_charts"] = container_charts
     if isinstance(raw.get("container_data_quality"), dict):
@@ -325,6 +312,11 @@ def _merge_container_charts(
     detail: Dict[str, Any],
     *,
     test_size: int,
+    history_points: Optional[int] = None,
+    metric_filter: Optional[str] = None,
+    container_filter: Optional[str] = None,
+    start_ms: Optional[int] = None,
+    end_ms: Optional[int] = None,
 ) -> Dict[str, Dict[str, Any]]:
     raw_container_metrics = raw.get("container_metrics")
     forecast_container_metrics = detail.get("container_charts_forecast")
@@ -332,6 +324,8 @@ def _merge_container_charts(
         return {}
     out: Dict[str, Dict[str, Any]] = {}
     for container, metrics in raw_container_metrics.items():
+        if container_filter and str(container) != container_filter:
+            continue
         if not isinstance(metrics, dict):
             continue
         forecast_metrics = forecast_container_metrics.get(container, {})
@@ -339,12 +333,18 @@ def _merge_container_charts(
             continue
         metric_out: Dict[str, Any] = {}
         for metric, y_full in metrics.items():
+            if metric_filter and str(metric) != metric_filter:
+                continue
             if not isinstance(y_full, pd.Series) or y_full.empty or len(y_full) <= test_size:
                 continue
             block = forecast_metrics.get(metric, {})
             if not isinstance(block, dict):
                 continue
             y_train, y_test = y_full.iloc[:-test_size], y_full.iloc[-test_size:]
+            y_train = _filter_series_time_range(y_train, start_ms=start_ms, end_ms=end_ms)
+            if history_points is not None:
+                points = max(0, int(history_points))
+                y_train = y_train.iloc[-points:] if points else y_train.iloc[0:0]
             metric_out[str(metric)] = {
                 "x_train_ms": _timestamps_ms_from_index(y_train.index),
                 "y_train": _series_to_lists(y_train),
@@ -361,11 +361,16 @@ def _merge_container_charts(
     return out
 
 
-def merge_manifest_resources(
-    resources: List[Dict[str, Any]],
-    raw_by_id: Dict[str, Dict[str, Any]],
+def _filter_series_time_range(
+    series: pd.Series,
     *,
-    test_size: int,
-) -> List[Dict[str, Any]]:
-    return [merge_charts_into_detail(dict(x), raw_by_id, test_size=test_size) for x in resources]
+    start_ms: Optional[int],
+    end_ms: Optional[int],
+) -> pd.Series:
+    result = series
+    if start_ms is not None:
+        result = result[result.index >= pd.Timestamp(int(start_ms), unit="ms")]
+    if end_ms is not None:
+        result = result[result.index <= pd.Timestamp(int(end_ms), unit="ms")]
+    return result
 

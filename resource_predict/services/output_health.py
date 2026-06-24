@@ -5,8 +5,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from resource_predict.pipeline.constants import DETAILS_DIRNAME, RAW_DATA_FILENAME, SUMMARY_INDEX_FILENAME
+import pandas as pd
+
+from resource_predict.data.raw_store import RAW_INDEX_SCHEMA_VERSION, RawResourceStore
+from resource_predict.pipeline.constants import DETAILS_DIRNAME, RAW_INDEX_FILENAME, SUMMARY_INDEX_FILENAME
 from resource_predict.pipeline.output_paths import all_scoped_out_dirs
+from resource_predict.resource_types import resource_type_of
 
 
 VM_METRICS = ("cpu", "memory", "disk")
@@ -18,12 +22,14 @@ def check_outputs(out_dir: Path | str, *, require_both_types: bool = True) -> Di
     scoped_dirs = [
         (scope, path)
         for scope, path in all_scoped_out_dirs(base)
-        if (path / SUMMARY_INDEX_FILENAME).exists() or (path / RAW_DATA_FILENAME).exists()
+        if (path / SUMMARY_INDEX_FILENAME).exists() or (path / RAW_INDEX_FILENAME).exists()
     ]
     if not scoped_dirs:
+        old_files = [path / "raw_data.json" for _scope, path in all_scoped_out_dirs(base) if (path / "raw_data.json").exists()]
+        detail = f"；检测到不支持的旧产物: {', '.join(str(path) for path in old_files)}" if old_files else ""
         return _report(
             False,
-            [f"缺少 scoped 输出目录: {base / 'vm'} 和 {base / 'k8s'}"],
+            [f"缺少当前 scoped 输出目录: {base / 'vm'} 和 {base / 'k8s'}{detail}"],
             [],
             {},
             {},
@@ -46,8 +52,8 @@ def check_outputs(out_dir: Path | str, *, require_both_types: bool = True) -> Di
     if require_both_types:
         _require_type(summary_counts, "openstack_vm", "summary_index", errors)
         _require_type(summary_counts, "k8s_workload", "summary_index", errors)
-        _require_type(raw_counts, "openstack_vm", "raw_data", errors)
-        _require_type(raw_counts, "k8s_workload", "raw_data", errors)
+        _require_type(raw_counts, "openstack_vm", "raw_index", errors)
+        _require_type(raw_counts, "k8s_workload", "raw_index", errors)
 
     return _report(
         not errors,
@@ -66,27 +72,40 @@ def _check_single_output(out_dir: Path | str, *, require_both_types: bool = True
     warnings: List[str] = []
 
     summary_obj = _read_json(base / SUMMARY_INDEX_FILENAME, errors)
-    raw_obj = _read_json(base / RAW_DATA_FILENAME, errors)
-    if summary_obj is None or raw_obj is None:
+    raw_index = _read_json(base / RAW_INDEX_FILENAME, errors)
+    if summary_obj is None or raw_index is None:
         return _report(False, errors, warnings, {}, {}, [])
 
     summary_resources = _resources(summary_obj, SUMMARY_INDEX_FILENAME, errors)
-    raw_resources = _resources(raw_obj, RAW_DATA_FILENAME, errors)
-    if summary_resources is None or raw_resources is None:
+    raw_refs = _resource_refs(raw_index, errors)
+    if summary_resources is None or raw_refs is None:
         return _report(False, errors, warnings, {}, {}, [])
 
     summary_by_type = Counter(_resource_type(item) for item in summary_resources)
-    raw_by_type = Counter(_resource_type(item) for item in raw_resources)
-    raw_by_id = {str(item.get("resource_id")): item for item in raw_resources if isinstance(item, dict)}
+    raw_by_type = Counter(
+        str(ref.get("resource_type") or "")
+        for ref in raw_refs.values()
+        if isinstance(ref, dict)
+    )
+    raw_by_id: Dict[str, Dict[str, Any]] = {}
+    store = RawResourceStore(base)
+    for rid in raw_refs:
+        try:
+            raw = store.get(rid)
+        except Exception as exc:
+            errors.append(f"{rid}: raw 资源文件无效: {exc}")
+            continue
+        if raw is not None:
+            raw_by_id[rid] = raw
 
     if require_both_types:
         _require_type(summary_by_type, "openstack_vm", "summary_index", errors)
         _require_type(summary_by_type, "k8s_workload", "summary_index", errors)
-        _require_type(raw_by_type, "openstack_vm", "raw_data", errors)
-        _require_type(raw_by_type, "k8s_workload", "raw_data", errors)
+        _require_type(raw_by_type, "openstack_vm", "raw_index", errors)
+        _require_type(raw_by_type, "k8s_workload", "raw_index", errors)
 
     _reject_unknown_types(summary_resources, "summary_index", errors)
-    _reject_unknown_types(raw_resources, "raw_data", errors)
+    _reject_unknown_types(raw_by_id.values(), "raw", errors)
 
     details_cache = _load_detail_chunks(base, summary_obj, errors, warnings)
     detail_items = _validate_detail_refs(summary_resources, details_cache, errors)
@@ -99,7 +118,7 @@ def _check_single_output(out_dir: Path | str, *, require_both_types: bool = True
         rid = str(item.get("resource_id") or "")
         raw = raw_by_id.get(rid)
         if raw is None:
-            errors.append(f"{rid}: summary_index 中存在，但 raw_data 中缺失")
+            errors.append(f"{rid}: summary_index 中存在，但 raw_index/raw 中缺失")
             continue
         rtype = _resource_type(item)
         if rtype == "openstack_vm":
@@ -179,9 +198,22 @@ def _resources(obj: Dict[str, Any], label: str, errors: List[str]) -> List[Dict[
     return resources
 
 
+def _resource_refs(obj: Dict[str, Any], errors: List[str]) -> Dict[str, Dict[str, Any]] | None:
+    if int(obj.get("schema_version", 0)) != RAW_INDEX_SCHEMA_VERSION:
+        errors.append(
+            f"{RAW_INDEX_FILENAME}: schema_version 必须为 {RAW_INDEX_SCHEMA_VERSION}，"
+            "请删除旧产物后重新生成"
+        )
+        return None
+    resources = obj.get("resources")
+    if not isinstance(resources, dict) or not resources:
+        errors.append(f"{RAW_INDEX_FILENAME}: resources 必须是非空 object")
+        return None
+    return resources
+
+
 def _resource_type(item: Dict[str, Any]) -> str:
-    raw = str(item.get("resource_type") or "").strip().lower().replace("-", "_")
-    return raw or "openstack_vm"
+    return resource_type_of(item)
 
 
 def _require_type(counts: Counter[str], resource_type: str, label: str, errors: List[str]) -> None:
@@ -276,7 +308,7 @@ def _check_vm_summary(
     warnings: List[str],
 ) -> None:
     rid = str(item.get("resource_id") or "")
-    _check_metrics(raw, VM_METRICS, f"{rid} raw_data", errors)
+    _check_metrics(raw, VM_METRICS, f"{rid} raw", errors)
     spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
     for key in ("cpu_cores", "memory_gb", "disk_gb"):
         if key not in spec:
@@ -300,7 +332,7 @@ def _check_k8s_workload_summary(
     if len(parts) != 5 or parts[0] != "k8s":
         errors.append(f"{rid}: K8S Workload ID 必须形如 k8s:cluster:namespace:kind:name")
 
-    _check_metrics(raw, K8S_WORKLOAD_METRICS, f"{rid} raw_data", errors)
+    _check_metrics(raw, K8S_WORKLOAD_METRICS, f"{rid} raw", errors)
 
     spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
     for key in ("cluster", "namespace", "workload_kind", "workload_name"):
@@ -411,12 +443,13 @@ def _check_metrics(
     label: str,
     errors: List[str],
 ) -> None:
-    metrics = item.get("metrics")
-    if not isinstance(metrics, dict):
-        errors.append(f"{label}: metrics 必须是 object")
-        return
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
     for name in expected_metrics:
         block = metrics.get(name)
+        if isinstance(block, pd.Series):
+            if block.empty:
+                errors.append(f"{label}: {name} 指标不能为空")
+            continue
         if not isinstance(block, dict):
             errors.append(f"{label}: 缺少 {name} 指标")
             continue

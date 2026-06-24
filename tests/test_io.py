@@ -14,9 +14,8 @@ from resource_predict.data.io import (
     atomic_write_text,
     coerce_metric_series,
     merge_charts_into_detail,
-    read_raw_dataset,
-    write_raw_dataset,
 )
+from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 
 
 class CoerceMetricSeriesTest(unittest.TestCase):
@@ -112,7 +111,7 @@ class AtomicWriteTest(unittest.TestCase):
 
 
 class RawDatasetRoundtripTest(unittest.TestCase):
-    """Tests for write_raw_dataset + read_raw_dataset."""
+    """Tests for resource-level raw shards."""
 
     def _make_prepared_resource(self, resource_id="vm-01", n=20):
         idx = pd.date_range("2024-01-01", periods=n, freq="h")
@@ -128,10 +127,10 @@ class RawDatasetRoundtripTest(unittest.TestCase):
     def test_write_then_read_roundtrip(self):
         res = self._make_prepared_resource()
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "raw_data.json"
-            write_raw_dataset(path, [res], freq="h")
-
-            prepared_list, meta = read_raw_dataset(path)
+            base = Path(tmp)
+            write_raw_resource_dataset(base, [res], freq="h")
+            store = RawResourceStore(base)
+            prepared_list, meta = store.read_many(), store.metadata()
 
         self.assertEqual(meta["freq"], "h")
         self.assertEqual(len(prepared_list), 1)
@@ -174,9 +173,9 @@ class RawDatasetRoundtripTest(unittest.TestCase):
             "container_data_quality": {"app": {"cpu_limit": {"level": "good"}}},
         }
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "raw_data.json"
-            write_raw_dataset(path, [res], freq="h")
-            prepared_list, _meta = read_raw_dataset(path)
+            base = Path(tmp)
+            write_raw_resource_dataset(base, [res], freq="h")
+            prepared_list = RawResourceStore(base).read_many()
 
         loaded = prepared_list[0]
         self.assertIn("container_metrics", loaded)
@@ -186,9 +185,8 @@ class RawDatasetRoundtripTest(unittest.TestCase):
 
     def test_read_missing_file_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "nonexistent.json"
             with self.assertRaises(FileNotFoundError):
-                read_raw_dataset(path)
+                RawResourceStore(Path(tmp)).read_many()
 
 
 class MergeChartsIntoDetailTest(unittest.TestCase):

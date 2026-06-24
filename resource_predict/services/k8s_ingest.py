@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -14,6 +13,7 @@ from resource_predict.data.updater import (
     mark_external_update_started,
     run_upsert_with_data,
 )
+from resource_predict.data.raw_store import RawResourceStore
 from resource_predict.pipeline.output_paths import scoped_out_dir
 from resource_predict.providers.k8s_prometheus import k8s_workload_prometheus_provider
 from resource_predict.settings import settings
@@ -139,26 +139,26 @@ def _trigger_source_label(trigger_source: str) -> str:
 
 
 def _has_existing_k8s_raw_data(out_dir: Path, clusters: Optional[Iterable[str]]) -> bool:
-    raw_path = out_dir / "raw_data.json"
-    if not raw_path.exists():
+    generation_cfg = getattr(settings, "generation", None)
+    store = RawResourceStore(
+        out_dir,
+        max_cache_items=int(getattr(generation_cfg, "raw_resource_cache_items", 100)),
+    )
+    if not store.exists():
         return False
     try:
-        payload = json.loads(raw_path.read_text(encoding="utf-8"))
+        resource_ids = store.resource_ids()
     except Exception:
         return False
-    resources = payload.get("resources", []) if isinstance(payload, dict) else []
-    if not isinstance(resources, list) or not resources:
+    if not resource_ids:
         return False
     wanted = {str(x).strip() for x in clusters or [] if str(x).strip()}
     if not wanted:
         return True
-    for item in resources:
-        if not isinstance(item, dict):
-            continue
-        spec = item.get("spec", {}) if isinstance(item.get("spec"), dict) else {}
-        if str(spec.get("cluster") or "").strip() in wanted:
-            return True
-    return False
+    return any(
+        len(parts := resource_id.split(":")) >= 2 and parts[0] == "k8s" and parts[1] in wanted
+        for resource_id in resource_ids
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -166,13 +166,18 @@ def _has_existing_k8s_raw_data(out_dir: Path, clusters: Optional[Iterable[str]])
 # ---------------------------------------------------------------------------
 
 
-def _k8s_scheduler_loop(interval_seconds: float) -> None:
+def _k8s_scheduler_loop(interval_seconds: float, startup_delay_seconds: float) -> None:
     """后台线程主循环：按间隔定时触发 K8S Prometheus 数据拉取 + upsert。"""
     logger.info(
         "[k8s_ingest] K8S Prometheus 后台调度器已启动，间隔 %.0f 秒（%.0f 分钟）",
         interval_seconds,
         interval_seconds / 60.0,
     )
+    if startup_delay_seconds > 0:
+        logger.info("[k8s_ingest] 首次自动拉取将在 %.0f 秒后执行", startup_delay_seconds)
+        if _k8s_stop_event.wait(startup_delay_seconds):
+            logger.info("[k8s_ingest] 后台调度器在首次拉取前停止")
+            return
     first_run = True
     while not _k8s_stop_event.is_set():
         try:
@@ -184,11 +189,7 @@ def _k8s_scheduler_loop(interval_seconds: float) -> None:
         except Exception as exc:
             logger.error("[k8s_ingest] 调度循环异常: %s", exc)
 
-        # 分段等待，以便及时响应停止信号
-        waited = 0.0
-        while waited < interval_seconds and not _k8s_stop_event.is_set():
-            time.sleep(1.0)
-            waited += 1.0
+        _k8s_stop_event.wait(interval_seconds)
 
     logger.info("[k8s_ingest] K8S Prometheus 后台调度器已停止")
 
@@ -210,6 +211,7 @@ def start_k8s_background_updater(
         if interval_minutes is not None
         else int(cfg.scheduled_update_interval_minutes)
     )
+    startup_delay = max(0, int(cfg.scheduled_update_startup_delay_seconds))
 
     if not cfg.scheduled_update_enabled:
         logger.info(
@@ -226,7 +228,7 @@ def start_k8s_background_updater(
     _k8s_stop_event.clear()
     _k8s_scheduler_thread = threading.Thread(
         target=_k8s_scheduler_loop,
-        args=(interval * 60.0,),
+        args=(interval * 60.0, float(startup_delay)),
         daemon=True,
         name="k8s-updater",
     )

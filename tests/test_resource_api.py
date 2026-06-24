@@ -31,7 +31,11 @@ def _app(resources: list[dict], details: dict[str, dict] | None = None) -> Flask
         "action_priority": action_priority,
         "matches_query": matches_query,
         "get_summary": lambda: {"resources": resources},
-        "get_resource_detail": lambda resource_id: details.get(resource_id),
+        "get_resource_detail": lambda resource_id, **_kwargs: details.get(resource_id),
+        "get_resource_charts": lambda resource_id, **_kwargs: (
+            {"resource_id": resource_id, "charts": details.get(resource_id, {}).get("charts", {})}
+            if resource_id in details else None
+        ),
         "prediction_pending_for": lambda _resource_id: None,
     }
     register_resource_routes(app, helpers)
@@ -109,3 +113,67 @@ def test_resources_endpoint_returns_observed_stats_from_summary_item():
     assert stats["avg"] == 2.5
     assert stats["peak"] == 4.0
     assert stats["p95"] == 3.85
+
+
+def test_resource_detail_can_skip_charts():
+    app = _app([], {"vm-1": {"resource_id": "vm-1", "charts": {"cpu": {"y_train": [1]}}}})
+
+    response = app.test_client().get("/api/resources/vm-1?include_charts=false")
+
+    assert response.status_code == 200
+
+
+def test_resource_detail_rejects_invalid_include_charts_value():
+    app = _app([], {"vm-1": {"resource_id": "vm-1"}})
+
+    response = app.test_client().get("/api/resources/vm-1?include_charts=maybe")
+
+    assert response.status_code == 400
+
+
+def test_batch_details_rejects_invalid_include_charts_value():
+    app = _app([], {"vm-1": {"resource_id": "vm-1"}})
+
+    response = app.test_client().get("/api/resources/details?ids=vm-1&include_charts=maybe")
+
+    assert response.status_code == 400
+
+
+def test_resource_charts_endpoint_forwards_filters():
+    calls = []
+    app = Flask(__name__)
+    helpers = {
+        "safe_int": safe_int,
+        "action_priority": action_priority,
+        "matches_query": matches_query,
+        "get_summary": lambda: {"resources": []},
+        "get_resource_detail": lambda _resource_id, **_kwargs: None,
+        "get_resource_charts": lambda resource_id, **kwargs: calls.append((resource_id, kwargs)) or {
+            "resource_id": resource_id,
+            "charts": {"cpu": {}},
+        },
+        "prediction_pending_for": lambda _resource_id: None,
+    }
+    register_resource_routes(app, helpers)
+
+    response = app.test_client().get("/api/resources/vm-1/charts?metric=cpu&history_points=500")
+
+    assert response.status_code == 200
+    assert calls == [(
+        "vm-1",
+        {
+            "history_points": 500,
+            "metric": "cpu",
+            "container": None,
+            "start_ms": None,
+            "end_ms": None,
+        },
+    )]
+
+
+def test_resource_charts_rejects_invalid_history_points():
+    app = _app([], {})
+
+    response = app.test_client().get("/api/resources/vm-1/charts?history_points=0")
+
+    assert response.status_code == 400

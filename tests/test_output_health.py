@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from resource_predict.data.io import raw_record_to_prepared
+from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.services.output_health import check_outputs
 
 
@@ -82,25 +84,30 @@ def valid_artifacts() -> tuple[dict, dict, dict]:
 
 def write_scoped_artifacts(base: Path, summary: dict, raw: dict, details: dict) -> None:
     for scope, resource_type in (("vm", "openstack_vm"), ("k8s", "k8s_workload")):
+        def belongs(item):
+            return item.get("resource_type") == resource_type or (
+                scope == "k8s" and str(item.get("resource_id") or "").startswith("k8s:")
+            )
+
         scoped_summary = {
             "meta": {"details_files": ["part-00000.json"], "details_dir": "details"},
             "resources": [],
         }
-        scoped_raw = {"meta": raw.get("meta", {}), "resources": []}
+        scoped_raw = []
         scoped_details = {"resources": []}
         for item in summary["resources"]:
-            if item.get("resource_type") == resource_type:
+            if belongs(item):
                 scoped = dict(item)
                 scoped["detail_ref"] = {"file": "part-00000.json", "offset": len(scoped_details["resources"])}
                 scoped_summary["resources"].append(scoped)
         for item in raw["resources"]:
-            if item.get("resource_type") == resource_type:
-                scoped_raw["resources"].append(item)
+            if belongs(item):
+                scoped_raw.append(raw_record_to_prepared(item))
         for item in details["resources"]:
-            if item.get("resource_type") == resource_type:
+            if belongs(item):
                 scoped_details["resources"].append(item)
         write_json(base / scope / "summary_index.json", scoped_summary)
-        write_json(base / scope / "raw_data.json", scoped_raw)
+        write_raw_resource_dataset(base / scope, scoped_raw, freq="h")
         write_json(base / scope / "details" / "part-00000.json", scoped_details)
 
 
@@ -133,13 +140,8 @@ class OutputHealthTest(unittest.TestCase):
             base = Path(tmp)
             summary, raw, details = valid_artifacts()
             summary["resources"][1]["resource_type"] = "k8s_pod"
-            raw["resources"][1]["resource_type"] = "k8s_pod"
             details["resources"][1]["resource_type"] = "k8s_pod"
-            write_json(base / "vm" / "summary_index.json", {"meta": {"details_files": []}, "resources": [summary["resources"][0]]})
-            write_json(base / "vm" / "raw_data.json", {"meta": raw.get("meta", {}), "resources": [raw["resources"][0]]})
-            write_json(base / "k8s" / "summary_index.json", {"meta": {"details_files": ["part-00000.json"]}, "resources": [summary["resources"][1]]})
-            write_json(base / "k8s" / "raw_data.json", {"meta": raw.get("meta", {}), "resources": [raw["resources"][1]]})
-            write_json(base / "k8s" / "details" / "part-00000.json", {"resources": [details["resources"][1]]})
+            write_scoped_artifacts(base, summary, raw, details)
 
             report = check_outputs(base)
 
@@ -246,6 +248,34 @@ class OutputHealthTest(unittest.TestCase):
 
         self.assertFalse(report["ok"])
         self.assertTrue(any("scoped 输出目录" in err for err in report["errors"]))
+
+    def test_check_outputs_rejects_tampered_raw_content_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            summary, raw, details = valid_artifacts()
+            write_scoped_artifacts(base, summary, raw, details)
+            k8s_base = base / "k8s"
+            ref = RawResourceStore(k8s_base).raw_ref("k8s:cluster-a:ns:deployment:api")
+            path = k8s_base / Path(*ref["file"].split("/"))
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["spec"]["namespace"] = "tampered"
+            path.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+
+            report = check_outputs(base)
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("哈希不匹配" in err for err in report["errors"]))
+
+    def test_check_outputs_rejects_scoped_old_raw_without_new_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "vm").mkdir(parents=True)
+            write_json(base / "vm" / "raw_data.json", {"resources": []})
+
+            report = check_outputs(base)
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("不支持的旧产物" in err for err in report["errors"]))
 
 
 if __name__ == "__main__":

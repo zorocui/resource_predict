@@ -6,6 +6,10 @@
   const MINUTE_MS = 60 * 1000;
   const HOUR_MS = 60 * MINUTE_MS;
   const DAY_MS = 24 * HOUR_MS;
+  const DEFAULT_HISTORY_POINTS = 1000;
+  const MAX_HISTORY_POINTS = 10000;
+  const MAX_RESOURCE_CACHE_ITEMS = 100;
+  const MAX_CHART_CACHE_ITEMS = 400;
   const CHART_RANGES = [
     { key: "24h", label: "24h", durationMs: DAY_MS },
     { key: "3d", label: "3d", durationMs: 3 * DAY_MS },
@@ -227,29 +231,53 @@
     })).filter((item) => item.chart && typeof item.chart === "object");
   }
 
-  function containerSelectionKey(resource, metricKey) {
-    return `${resource?.resource_id || app.state.selectedResourceId || ""}:${metricKey}`;
+  function availableContainerNames(resource) {
+    if (!list.isK8s(resource)) return [];
+    const names = new Set();
+    const spec = resource?.spec || {};
+    const containers = spec.containers && typeof spec.containers === "object" && !Array.isArray(spec.containers)
+      ? spec.containers
+      : {};
+    Object.keys(containers).forEach((name) => {
+      const value = String(name || "").trim();
+      if (value) names.add(value);
+    });
+    if (Array.isArray(spec.containers_observed)) {
+      spec.containers_observed.forEach((name) => {
+        const value = String(name || "").trim();
+        if (value) names.add(value);
+      });
+    }
+    const loaded = resource?.container_charts;
+    if (loaded && typeof loaded === "object" && !Array.isArray(loaded)) {
+      Object.keys(loaded).forEach((name) => {
+        const value = String(name || "").trim();
+        if (value) names.add(value);
+      });
+    }
+    return Array.from(names).sort();
   }
 
   function resourceContainerSelectionKey(resource) {
-    return `${resource?.resource_id || app.state.selectedResourceId || ""}:*`;
+    return resource?.resource_id || app.state.selectedResourceId || "";
   }
 
   function selectedContainerEntry(resource, metricKey) {
     if (!list.isK8s(resource)) return null;
     const entries = containerChartEntries(resource, metricKey);
     if (!entries.length) return null;
-    const key = containerSelectionKey(resource, metricKey);
-    const selectedName = app.selectedContainerByResourceMetric.get(key)
-      || app.selectedContainerByResourceMetric.get(resourceContainerSelectionKey(resource));
-    const suggestedName = list.representativeContainerName(resource, metricKey);
+    const selectedName = selectedContainerName(resource, metricKey);
     return entries.find((item) => item.name === selectedName)
-      || entries.find((item) => item.name === suggestedName)
       || entries[0];
   }
 
   function selectedContainerName(resource, metricKey) {
-    return selectedContainerEntry(resource, metricKey)?.name || "";
+    if (!list.isK8s(resource)) return "";
+    const names = availableContainerNames(resource);
+    if (!names.length) return "";
+    const selectedName = app.selectedContainerByResource.get(resourceContainerSelectionKey(resource));
+    return names.includes(selectedName) ? selectedName
+      : names[0];
   }
 
   function containerMetricMode(resource, containerName, metricKey) {
@@ -495,17 +523,32 @@
     };
   }
 
-  function cacheResourceChartsFromPayload(payload, fallbackResourceId) {
-    const resource = payload?.resource;
-    if (!resource || resource.prediction_pending) return;
-    const rid = String(resource.resource_id || fallbackResourceId || "");
-    if (!rid) return;
-    app.resourcePayloadCache.set(rid, payload);
-    const charts = resource.charts || {};
-    const metricKeys = list.metricKeysFor(resource);
-    for (const mk of metricKeys) {
-      if (charts[mk]) app.chartDataByKey.set(`${rid}:${mk}`, charts[mk]);
+  function rememberResourcePayload(resourceId, payload) {
+    app.resourcePayloadCache.delete(resourceId);
+    app.resourcePayloadCache.set(resourceId, payload);
+    while (app.resourcePayloadCache.size > MAX_RESOURCE_CACHE_ITEMS) {
+      const oldest = app.resourcePayloadCache.keys().next().value;
+      app.resourcePayloadCache.delete(oldest);
+      for (const key of Array.from(app.loadedChartKeys)) {
+        if (key.startsWith(`${oldest}:`)) app.loadedChartKeys.delete(key);
+      }
     }
+  }
+
+  function rememberChartData(key, data) {
+    app.chartDataByKey.delete(key);
+    app.chartDataByKey.set(key, data);
+    while (app.chartDataByKey.size > MAX_CHART_CACHE_ITEMS) {
+      const oldest = app.chartDataByKey.keys().next().value;
+      app.chartDataByKey.delete(oldest);
+      for (const key of Array.from(app.loadedChartKeys)) {
+        if (key.startsWith(`${oldest}:`)) app.loadedChartKeys.delete(key);
+      }
+    }
+  }
+
+  function summaryResource(resourceId) {
+    return app.state.loadedItems.find((item) => String(item?.resource_id || "") === String(resourceId)) || null;
   }
 
   async function ensureResource(resourceId) {
@@ -513,16 +556,99 @@
     if (cached?.resource) return cached.resource;
     let req = app.pendingDetailRequests.get(resourceId);
     if (!req) {
-      req = api.requestJson(`/api/resources/${encodeURIComponent(resourceId)}`)
+      req = api.requestJson(`/api/resources/${encodeURIComponent(resourceId)}?include_charts=false`)
         .then((payload) => {
-          cacheResourceChartsFromPayload(payload, resourceId);
-          return payload;
+          const resource = { ...(summaryResource(resourceId) || {}), ...(payload?.resource || {}) };
+          const merged = { ...payload, resource };
+          rememberResourcePayload(resourceId, merged);
+          return merged;
         })
         .finally(() => app.pendingDetailRequests.delete(resourceId));
       app.pendingDetailRequests.set(resourceId, req);
     }
     const payload = await req;
     return payload.resource;
+  }
+
+  function chartLoadOptions(resource, metricKey) {
+    const selectedRange = chartRange();
+    const extended = selectedRange.key === "7d" || selectedRange.key === "all";
+    const historyPoints = extended ? MAX_HISTORY_POINTS : DEFAULT_HISTORY_POINTS;
+    if (!selectedRange.durationMs || !extended) {
+      return { historyPoints, startMs: null, endMs: null };
+    }
+    const rid = String(resource?.resource_id || "");
+    const fallback = app.chartDataByKey.get(`${rid}:${metricKey}`);
+    const data = activeChartData(resource, metricKey, fallback);
+    const observed = [];
+    for (const values of [data?.x_test_ms, data?.x_train_ms]) {
+      if (!Array.isArray(values) || !values.length) continue;
+      const value = normalizeTsMs(values[values.length - 1]);
+      if (Number.isFinite(value)) observed.push(value);
+    }
+    const endMs = observed.length ? Math.max(...observed) : null;
+    return {
+      historyPoints,
+      startMs: endMs == null ? null : Math.max(0, endMs - selectedRange.durationMs),
+      endMs,
+    };
+  }
+
+  function chartLoadKey(resource, metricKey) {
+    const rid = String(resource?.resource_id || "");
+    const containerName = selectedContainerName(resource, metricKey) || "workload";
+    const options = chartLoadOptions(resource, metricKey);
+    return `${rid}:${metricKey}:${containerName}:${options.historyPoints}:${options.startMs ?? "recent"}:${options.endMs ?? "latest"}`;
+  }
+
+  function cacheChartPayload(resource, payload, metricKey, requestKey) {
+    if (!resource || !payload) return;
+    resource.charts = { ...(resource.charts || {}), ...(payload.charts || {}) };
+    const incomingContainers = payload.container_charts || {};
+    const mergedContainers = { ...(resource.container_charts || {}) };
+    Object.entries(incomingContainers).forEach(([name, metrics]) => {
+      mergedContainers[name] = { ...(mergedContainers[name] || {}), ...(metrics || {}) };
+    });
+    resource.container_charts = mergedContainers;
+    const chart = resource.charts?.[metricKey];
+    if (chart) rememberChartData(`${resource.resource_id}:${metricKey}`, chart);
+    app.loadedChartKeys.add(requestKey);
+  }
+
+  async function ensureChartData(resource, metricKey) {
+    if (!resource || !metricKey) return resource;
+    const rid = String(resource.resource_id || "");
+    if (!rid) return resource;
+    const containerName = selectedContainerName(resource, metricKey);
+    const loadOptions = chartLoadOptions(resource, metricKey);
+    const requestKey = chartLoadKey(resource, metricKey);
+    if (app.loadedChartKeys.has(requestKey)) return resource;
+    let req = app.pendingChartRequests.get(requestKey);
+    if (!req) {
+      const url = api.buildQuery(`/api/resources/${encodeURIComponent(rid)}/charts`, {
+        metric: metricKey,
+        container: containerName || undefined,
+        history_points: loadOptions.historyPoints,
+        start_ms: loadOptions.startMs,
+        end_ms: loadOptions.endMs,
+      });
+      req = api.requestJson(url)
+        .then((payload) => {
+          cacheChartPayload(resource, payload, metricKey, requestKey);
+          return resource;
+        })
+        .finally(() => app.pendingChartRequests.delete(requestKey));
+      app.pendingChartRequests.set(requestKey, req);
+    }
+    return req;
+  }
+
+  async function ensureAdviceChartData(resource) {
+    if (!resource || !list.isK8s(resource)) return resource;
+    await Promise.allSettled(
+      list.metricKeysFor(resource).map((metricKey) => ensureChartData(resource, metricKey))
+    );
+    return resource;
   }
 
   function disposeDetailChart() {
@@ -544,13 +670,13 @@
 
   function containerSelectorMarkup(resource) {
     const metricKey = app.state.selectedMetricKey;
-    const entries = metricKey ? containerChartEntries(resource, metricKey) : [];
-    if (!entries.length) return "";
-    const activeName = selectedContainerEntry(resource, metricKey)?.name || entries[0].name;
+    const names = metricKey ? availableContainerNames(resource) : [];
+    if (!names.length) return "";
+    const activeName = selectedContainerName(resource, metricKey) || names[0];
     return `
       <div class="chart-control-group chart-container-group" aria-label="容器选择">
-        ${entries.map((item) => `
-          <button type="button" class="${item.name === activeName ? "active" : ""}" data-chart-container="${list.escapeHtml(item.name)}" title="${list.escapeHtml(item.name)}">${list.escapeHtml(item.name)}</button>
+        ${names.map((name) => `
+          <button type="button" class="${name === activeName ? "active" : ""}" data-chart-container="${list.escapeHtml(name)}" title="${list.escapeHtml(name)}">${list.escapeHtml(name)}</button>
         `).join("")}
       </div>
     `;
@@ -757,7 +883,7 @@
       </div>
       <div class="reason-grid">
         ${list.metricKeysFor(resource).map((key) => {
-          const containerName = selectedContainerEntry(resource, key)?.name || "";
+          const containerName = selectedContainerName(resource, key);
           const observed = list.containerMetricObservedStatsFor(resource, key, containerName)
             || list.metricObservedStatsFor(resource, key);
           const mAction = containerName
@@ -797,22 +923,38 @@
 
   async function renderChart(resourceId, metricKey, resource = null) {
     disposeDetailChart();
+    app.els.detailChart.innerHTML = `<div class="chart-state">正在加载图表...</div>`;
+    try {
+      resource = resource || await ensureResource(resourceId);
+      await ensureChartData(resource, metricKey);
+    } catch (e) {
+      if (app.state.selectedResourceId === resourceId) {
+        app.els.detailChart.innerHTML = `
+          <div class="chart-state is-error">
+            图表加载失败：${list.escapeHtml(e.message || e)}
+            <button type="button" class="link-btn" data-chart-retry>重试</button>
+          </div>`;
+      }
+      return false;
+    }
+    if (app.state.selectedResourceId !== resourceId) return;
     app.els.detailChart.innerHTML = "";
     const key = `${resourceId}:${metricKey}`;
     const fallbackData = app.chartDataByKey.get(key);
     const data = activeChartData(resource, metricKey, fallbackData);
     if (!data) {
       app.els.detailChart.innerHTML = `<div class="chart-state">暂无 ${list.escapeHtml(metricTitleForChart(resource, metricKey))} 图表数据</div>`;
-      return;
+      return false;
     }
     if (typeof echarts === "undefined") {
       app.els.detailChart.innerHTML = `<div class="chart-state is-error">ECharts 未加载</div>`;
-      return;
+      return false;
     }
     const displayUnit = displayUnitForChart(resource, metricKey);
     app.detailChartInstance = echarts.init(app.els.detailChart, null, { renderer: app.ECHARTS_RENDERER });
     app.detailChartInstance.setOption(buildChartOption(data, metricKey, displayUnit, resource), { notMerge: true, lazyUpdate: false });
     requestAnimationFrame(() => app.detailChartInstance?.resize());
+    return true;
   }
 
   async function openChartModal(metricKey) {
@@ -822,6 +964,12 @@
     let activeMetric = metricKey || app.state.selectedMetricKey || list.triggerMetric(resource);
     if (!metricKeys.includes(activeMetric)) activeMetric = list.triggerMetric(resource);
     app.state.selectedMetricKey = activeMetric;
+    try {
+      await ensureChartData(resource, activeMetric);
+    } catch (_) {
+      await renderChart(app.state.selectedResourceId, activeMetric, resource);
+      return;
+    }
     const key = `${app.state.selectedResourceId}:${activeMetric}`;
     const fallbackData = app.chartDataByKey.get(key);
     const data = activeChartData(resource, activeMetric, fallbackData);
@@ -853,9 +1001,18 @@
     app.els.detailTitle.textContent = displayDetailTitle(null, resourceId);
     app.els.detailTitle.title = resourceId;
     app.els.detailSubtitle.textContent = "正在加载详情...";
-    app.els.detailAdvice.innerHTML = `<div class="chart-state">正在加载建议和图表...</div>`;
+    app.els.detailAdvice.innerHTML = `<div class="chart-state">正在加载详情...</div>`;
+    const initial = summaryResource(resourceId);
+    if (initial) {
+      app.els.detailType.textContent = list.typeLabel(initial);
+      app.els.detailTitle.textContent = displayDetailTitle(initial, resourceId);
+      app.els.detailSubtitle.textContent = list.subtitleFor(initial);
+      renderAdvice(initial);
+      renderSpec(initial);
+    }
     try {
       const resource = await ensureResource(resourceId);
+      if (app.state.selectedResourceId !== resourceId) return;
       if (!resource || resource.prediction_pending) {
         app.els.detailSubtitle.textContent = "预测更新中";
         app.els.detailAdvice.innerHTML = `<div class="chart-state">该资源正在更新预测，请稍后刷新。</div>`;
@@ -872,10 +1029,16 @@
       renderAdvice(resource);
       renderSpec(resource);
       renderMetricTabs(resource, activeMetric);
-      await renderChart(resource.resource_id || resourceId, activeMetric, resource);
+      const adviceDataPromise = ensureAdviceChartData(resource);
+      const loaded = await renderChart(resource.resource_id || resourceId, activeMetric, resource);
+      if (loaded && app.state.selectedResourceId === resourceId) renderMetricTabs(resource, activeMetric);
+      await adviceDataPromise;
+      if (app.state.selectedResourceId === resourceId) renderAdvice(resource);
     } catch (e) {
-      app.els.detailSubtitle.textContent = "加载失败";
-      app.els.detailAdvice.innerHTML = `<div class="chart-state is-error">详情加载失败：${list.escapeHtml(e.message || e)}</div>`;
+      app.els.detailSubtitle.textContent = initial ? "详情补充信息加载失败" : "加载失败";
+      if (!initial) {
+        app.els.detailAdvice.innerHTML = `<div class="chart-state is-error">详情加载失败：${list.escapeHtml(e.message || e)}</div>`;
+      }
     }
   }
 
@@ -895,7 +1058,17 @@
     const resource = await ensureResource(app.state.selectedResourceId);
     renderAdvice(resource);
     renderMetricTabs(resource, app.state.selectedMetricKey);
-    await renderChart(app.state.selectedResourceId, app.state.selectedMetricKey, resource);
+    const resourceId = app.state.selectedResourceId;
+    const selectedContainer = selectedContainerName(resource, app.state.selectedMetricKey);
+    const adviceDataPromise = ensureAdviceChartData(resource);
+    await renderChart(resourceId, app.state.selectedMetricKey, resource);
+    await adviceDataPromise;
+    if (
+      app.state.selectedResourceId === resourceId
+      && selectedContainerName(resource, app.state.selectedMetricKey) === selectedContainer
+    ) {
+      renderAdvice(resource);
+    }
     if (app.els.chartModal && !app.els.chartModal.hidden) {
       renderModalMetricTabs(resource, app.state.selectedMetricKey);
       await openChartModal(app.state.selectedMetricKey);
@@ -912,12 +1085,8 @@
     if (rangeBtn) app.chartRangeKey = rangeBtn.dataset.chartRange || app.chartRangeKey;
     if (modeBtn) app.chartModeKey = modeBtn.dataset.chartMode || app.chartModeKey;
     if (containerBtn && app.state.selectedMetricKey) {
-      app.selectedContainerByResourceMetric.set(
-        `${app.state.selectedResourceId || ""}:*`,
-        containerBtn.dataset.chartContainer || ""
-      );
-      app.selectedContainerByResourceMetric.set(
-        `${app.state.selectedResourceId || ""}:${app.state.selectedMetricKey}`,
+      app.selectedContainerByResource.set(
+        app.state.selectedResourceId || "",
         containerBtn.dataset.chartContainer || ""
       );
     }
@@ -931,6 +1100,16 @@
   });
 
   app.els.metricTabs?.addEventListener("click", handleChartControlClick);
+
+  app.els.detailChart?.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-chart-retry]")) return;
+    if (app.state.selectedResourceId && app.state.selectedMetricKey) {
+      const payload = app.resourcePayloadCache.get(app.state.selectedResourceId);
+      const resource = payload?.resource;
+      if (resource) app.loadedChartKeys.delete(chartLoadKey(resource, app.state.selectedMetricKey));
+      renderChart(app.state.selectedResourceId, app.state.selectedMetricKey, resource || null);
+    }
+  });
 
   app.els.chartModal?.addEventListener("click", (event) => {
     if (event.target.closest("[data-chart-modal-dismiss]")) closeChartModal();
@@ -948,7 +1127,6 @@
   });
 
   window.ResourceCharts = {
-    cacheResourceChartsFromPayload,
     closeChartModal,
     disposeDetailChart,
     openChartModal,

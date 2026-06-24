@@ -17,6 +17,7 @@ These notes capture project-specific mistakes already encountered in this repo. 
 - Keep K8S Prometheus CPU usage queries aligned with the configured `rate_window`; do not reintroduce hardcoded CPU `rate(...[10m])` windows in fetch or diagnose paths.
 - When prediction output schema changes, update both artifacts and docs. `forecast_error_report.json` is a first-class output and should report errors by resource, metric, model, and window with RMSE/MAE/MAPE/P95 error fields.
 - This repo often has a dirty worktree. Preserve unrelated user changes and do not revert files unless explicitly asked.
+- Treat production deployment scale as the design baseline: assume thousands to tens of thousands of resources in an internal network, with K8S container-level metrics multiplying the forecasting workload. Do not use the 45-resource mock dataset as the basis for architecture, performance, storage, or model-lifecycle decisions.
 - Run project Python commands through the local Windows virtual environment: `.\.venv\Scripts\python.exe ...`; do not use system `python`.
 - After Python logic edits, run relevant checks; for broad/core changes run the full regression suite: compileall + pyflakes + vulture --min-confidence 80 + pytest -q (see README §6 or docs/development.md for exact commands).
 - After commands that create caches, remove project `__pycache__` directories outside `.venv`.

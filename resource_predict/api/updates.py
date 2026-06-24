@@ -13,6 +13,10 @@ from resource_predict.data.updater import (
     run_update,
 )
 from resource_predict.services.update_tasks import run_update_task_sync, start_update_task_async
+from resource_predict.services.update_history import (
+    UPDATE_HISTORY_RETENTION,
+    get_update_history,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,24 @@ def register_update_routes(app: Flask) -> None:
     @app.get("/api/update-status")
     def api_update_status():
         return jsonify(get_update_status())
+
+    @app.get("/api/update-history")
+    def api_update_history():
+        raw_limit = request.args.get("limit", "20")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be an integer between 1 and 100"}), 400
+        if limit < 1 or limit > UPDATE_HISTORY_RETENTION:
+            return jsonify({"error": "limit must be between 1 and 100"}), 400
+        records = get_update_history(limit)
+        return jsonify(
+            {
+                "records": records,
+                "count": len(records),
+                "retention_limit": UPDATE_HISTORY_RETENTION,
+            }
+        )
 
     @app.post("/api/update-trigger")
     def api_update_trigger():

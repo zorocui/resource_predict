@@ -61,6 +61,7 @@
       updateStarted: document.getElementById("update-started"),
       updateFinished: document.getElementById("update-finished"),
       updateMessage: document.getElementById("update-message"),
+      updateHistory: document.getElementById("update-history"),
       clusterConfigSave: document.getElementById("cluster-config-save"),
       clusterConfigMessage: document.getElementById("cluster-config-message"),
       forecastModelList: document.getElementById("forecast-model-list"),
@@ -98,12 +99,14 @@
     chartAuxiliaryVisible: true,
     chartRangeKey: "7d",
     chartModeKey: "trend",
-    selectedContainerByResourceMetric: new Map(),
+    selectedContainerByResource: new Map(),
     detailChartInstance: null,
     modalChartInstance: null,
     chartDataByKey: new Map(),
     resourcePayloadCache: new Map(),
     pendingDetailRequests: new Map(),
+    pendingChartRequests: new Map(),
+    loadedChartKeys: new Set(),
   };
   Object.assign(window.ResourcePredictApp.metricTitleMap, {
     cpu_limit: "CPU Limit",

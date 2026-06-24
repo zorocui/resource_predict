@@ -124,15 +124,17 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | 配置类 | 关键参数 | 默认值 |
 | --- | --- | --- |
 | `AppConfig` | `host` / `port` / `out_dir` / `log_file` / `debug` | `0.0.0.0` / `5000` / `outputs` / `resource_predict.log` / `False` |
-| `GenerationConfig` | `default_test_size` / `default_future_steps` / `freq` | `72` / `24` / `h` |
+| `GenerationConfig` | `default_test_size` / `default_future_steps` / `freq` / `detail_chunk_size` / `detail_history_points_default` / `detail_history_points_max` / `raw_resource_cache_items` | `72` / `24` / `h` / `25` / `1000` / `10000` / `100` |
 | `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `True` / `True` / `auto` / `3.5` |
 | `DecisionConfig` | `scale_out_threshold` / `scale_in_threshold` / `scale_in_max_reduction_ratio` / `scale_out_confirmations` / `scale_in_confirmations` / `action_gate_state_retention_days` | `0.8` / `0.2` / `0.5` / `2` / `3` / `30` |
-| `UpdateConfig` | `enabled` / `interval_minutes` / `sliding_window` / `display_window_points` | `False` / `60` / `False` / `0` |
-| `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` | `7` / `60` / `300` / `5m` / `False` / `360` |
+| `UpdateConfig` | `enabled` / `interval_minutes` / `startup_delay_seconds` / `sliding_window` | `False` / `60` / `60` / `False` |
+| `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` / `scheduled_update_startup_delay_seconds` | `7` / `60` / `300` / `5m` / `False` / `360` / `60` |
 
 `rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值。
 
 K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_refresh=true` 时，会按 `history_days` 拉取全量历史窗口（默认最近 7 天）。已有本地基线后的定时/普通拉取会使用增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认 `360 + 60 = 420` 分钟，即最近 7 小时。
+
+VM 和 K8S 后台调度器在应用启动后分别等待 `startup_delay_seconds` 和 `scheduled_update_startup_delay_seconds` 再执行首轮自动拉取，默认均为 60 秒；手动 API/CLI 拉取不受该延迟影响。
 
 ### 预测窗口配置说明
 
@@ -161,23 +163,23 @@ K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_re
 ```text
 outputs/
 ├── vm/
-│   ├── raw_data.json          # 原始观测数据
+│   ├── raw_index.json         # resource_id -> raw 分片的 O(1) 索引
+│   ├── raw/                   # 按资源、内容寻址的原始观测分片
+│   │   └── ab/<resource-hash>-<content-hash>.json
 │   ├── summary_index.json     # 资源列表摘要（含扩缩容建议）
-│   ├── manifest.json          # 完整预测结果（含 charts）
+│   ├── manifest.json          # 预测产物清单（不复制历史 charts）
 │   ├── forecast_error_report.json # 预测误差报告
 │   ├── generation_stats.json  # 本次生成统计
-│   ├── backups/               # raw_data.json 历史备份
-│   │   └── raw_data.20260530-120000.json
 │   └── details/               # 详情分片
 │       ├── part-00000.json
 │       └── ...
 ├── k8s/
-│   ├── raw_data.json
+│   ├── raw_index.json
+│   ├── raw/
 │   ├── summary_index.json
 │   ├── manifest.json
 │   ├── forecast_error_report.json
 │   ├── generation_stats.json
-│   ├── backups/               # raw_data.json 历史备份
 │   └── details/
 │       └── ...
 └── scaling_tasks.json         # 调配任务记录
@@ -185,31 +187,29 @@ outputs/
 
 ## 各文件说明
 
-### `raw_data.json`
+### `raw_index.json` 与 `raw/`
 
-原始观测数据，是预测的唯一输入。
+原始观测数据是预测的唯一输入。每个资源独立保存为不可变、内容寻址的 JSON 文件；`raw_index.json` 只保存资源到分片的引用。完整更新先写新分片，再原子替换索引；部分更新只重写发生变化的资源。
 
 ```json
 {
   "meta": {
-    "schema_version": 1,
+    "schema_version": 2,
     "saved_at_epoch_ms": 1717000000000,
-    "freq": "h"
+    "resource_count": 1
   },
-  "resources": [
-    {
-      "resource_id": "vm-prod-001",
+  "resources": {
+    "vm-prod-001": {
+      "file": "raw/ab/<resource-hash>-<content-hash>.json",
       "resource_type": "openstack_vm",
-      "spec": {"cluster": "...", "instance_id": "...", "cpu_cores": 4, "memory_gb": 8, "disk_gb": 100},
-      "metrics": {
-        "cpu":    {"timestamps": [1717000000000, ...], "values": [0.45, ...]},
-        "memory": {"timestamps": [...], "values": [...]},
-        "disk":   {"timestamps": [...], "values": [...]}
-      }
+      "points": 2016,
+      "updated_at_epoch_ms": 1717000000000
     }
-  ]
+  }
 }
 ```
+
+目标分片中保存该资源的 `resource_id`、`resource_type`、`spec`、`metrics` 和可选 `container_metrics`。读取时会同时校验资源 ID、索引路径和内容 SHA-256，详情请求不会读取其他资源分片。
 
 ### `summary_index.json`
 
@@ -218,7 +218,7 @@ outputs/
 
 ### `manifest.json`
 
-完整预测结果，包含合并后的 charts（y_train + y_test + 预测值 + 未来预测）。API 详情接口优先读取此文件。
+预测产物清单和运行元数据，不复制原始历史 charts。资源详情通过 `summary_index.json.detail_ref` 定位小型预测分片，并按需从目标 raw 分片合并图表。
 
 ### `details/part-*.json`
 
@@ -232,6 +232,11 @@ outputs/
 
 本次预测的统计信息：资源数、预测模型、窗口参数、耗时、输出大小、误差报告文件名等。
 
-### `backups/`
+### 旧产物升级
 
-增量合并前自动创建的 `raw_data.json` 时间戳备份，格式为 `raw_data.YYYYMMDD-HHMMSS.json`。
+新版本不读取、不迁移旧的单体 raw 产物。升级后应删除旧 scope 目录并重新生成：
+
+```bash
+rm -rf outputs/vm outputs/k8s
+python generate_forecasts.py
+```

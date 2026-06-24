@@ -96,7 +96,7 @@ python generate_forecasts.py
 python generate_forecasts.py predict
 ```
 
-该模式会在预测前后校验 `raw_data.json` 的 SHA-256 摘要，确保原始数据未被篡改。
+该模式会在预测前后校验 `raw_index.json` 的 SHA-256 摘要，确保原始数据索引及资源引用未被篡改。
 
 ### 2.3 检查产物健康状态
 
@@ -155,7 +155,7 @@ flowchart TB
     end
 
     subgraph Forecast["预测与建议"]
-        Raw["raw_data.json"]
+        Raw["raw_index.json + raw/ 资源分片"]
         Pipeline["generate_forecasts 管线"]
         Decision["VM / K8S Workload decision"]
         Artifacts["summary_index / details / manifest"]
@@ -187,7 +187,7 @@ flowchart TB
     API --> Scale
 ```
 
-数据通过 Provider 接入后写入 `raw_data.json`，预测管线运行多模型并生成扩缩容建议，产物通过 ForecastStore 合并后供 Web UI 和调配执行使用。
+数据通过 Provider 接入后按资源写入 `raw/` 内容寻址分片，并由 `raw_index.json` 建立 O(1) 引用；预测管线运行多模型并生成扩缩容建议，详情接口只读取目标资源分片，产物通过 ForecastStore 合并后供 Web UI 和调配执行使用。
 
 ```mermaid
 flowchart LR
@@ -225,10 +225,12 @@ VM 和 K8S 产物完全物理隔离，API 层透明合并。
 | --- | --- | --- |
 | GET | `/` | Web 首页（SPA） |
 | GET | `/api/resources` | 资源列表（分页、筛选、搜索） |
-| GET | `/api/resources/<id>` | 资源详情（含 charts） |
+| GET | `/api/resources/<id>` | 资源详情（可用 `include_charts=false` 仅取元数据） |
+| GET | `/api/resources/<id>/charts` | 按指标、容器和时间窗口加载图表 |
 | GET | `/api/resources/details?ids=a,b` | 批量详情 |
 | GET | `/api/resources/advice-summary` | 建议统计 |
 | GET | `/api/update-status` | 更新任务状态 |
+| GET | `/api/update-history` | 最近更新历史（持久化保留 100 条） |
 | POST | `/api/update-trigger` | 触发 pull 增量更新 |
 | POST | `/api/update-data` | 推送增量数据（仅更新已有） |
 | POST | `/api/upsert-data` | 推送数据（更新或新增） |

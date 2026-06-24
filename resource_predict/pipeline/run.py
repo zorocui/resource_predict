@@ -9,14 +9,14 @@ from typing import Any, Dict, List, Optional, Set
 import pandas as pd
 
 from resource_predict.settings import settings
-from resource_predict.data.io import read_raw_dataset, write_raw_dataset
+from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.pipeline.action_gate_state import (
     apply_action_gate_confirmations,
     load_action_gate_state,
     write_action_gate_state,
 )
 from resource_predict.pipeline._types import WorkerContext
-from resource_predict.pipeline.constants import MANIFEST_FILENAME, RAW_DATA_FILENAME
+from resource_predict.pipeline.constants import MANIFEST_FILENAME
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
 from resource_predict.pipeline.prepare import ExternalProvider, build_prepared_data
@@ -48,8 +48,8 @@ def generate_forecasts(
 ) -> List[Dict[str, Any]]:
     """
     生成云资源预测结果（并行）。
-    输出分离：raw_data.json（观测）、details 分片（预测）、manifest（合并 charts）。
-    predict_only=True 时从 raw_data.json 读取，不覆盖原始数据。
+    输出分离：raw_index.json + raw/（观测）、details 分片（预测）、manifest（预测清单）。
+    predict_only=True 时从资源级 raw 分片读取，不覆盖原始数据。
     """
     cfg = settings.generation
     out_dir = out_dir or settings.app.out_dir
@@ -66,26 +66,34 @@ def generate_forecasts(
         save_raw = bool(cfg.save_raw_dataset)
 
     prepared_data: List[Dict[str, Any]]
-    raw_prepared_data: Optional[List[Dict[str, Any]]] = None
     partial_resource_ids: Set[str] = {str(x) for x in (resource_ids or []) if str(x)}
     metric_filter_by_id = normalize_metric_filter(metric_names_by_resource)
     existing_items_for_partial: List[Dict[str, Any]] = []
     existing_partial_ids: Set[str] = set()
     metric_partial_enabled = False
+    raw_stats: Dict[str, int] = {}
 
     if predict_only:
         if data_provider is not None:
             raise ValueError("predict_only=True 时不应再传入 data_provider")
-        raw_path = out_base / RAW_DATA_FILENAME
-        prepared_data, raw_meta = read_raw_dataset(raw_path)
-        raw_prepared_data = prepared_data
+        raw_store = RawResourceStore(
+            out_base,
+            max_cache_items=int(settings.generation.raw_resource_cache_items),
+        )
+        raw_meta = raw_store.metadata()
+        raw_stats = {
+            "resources": len(raw_store.resource_ids()),
+            "files_total": len(raw_store.resource_ids()),
+            "files_written": 0,
+            "files_reused": 0,
+            "files_removed": 0,
+            "index_bytes": int(raw_store.index_path.stat().st_size),
+        }
+        prepared_data = raw_store.read_many(partial_resource_ids or None)
         if partial_resource_ids:
-            prepared_data = [
-                p for p in prepared_data if str(p.get("resource_id")) in partial_resource_ids
-            ]
             if not prepared_data:
                 raise ValueError(
-                    "resource_ids 没有匹配 raw_data.json 中的任何资源: "
+                    "resource_ids 没有匹配 raw_index.json 中的任何资源: "
                     + ", ".join(sorted(partial_resource_ids))
                 )
         freq = freq or str(raw_meta.get("freq") or cfg.freq)
@@ -103,7 +111,6 @@ def generate_forecasts(
         n = n if n is not None else cfg.n
         base_seed = base_seed if base_seed is not None else cfg.base_seed
         freq = freq or cfg.freq
-        raw_path = out_base / RAW_DATA_FILENAME
         prepared_data = build_prepared_data(
             resources=resources,
             n=n,
@@ -112,7 +119,6 @@ def generate_forecasts(
             base_seed=base_seed,
             data_provider=data_provider,
             cfg=cfg,
-            raw_checkpoint_path=raw_path if (data_provider is not None and save_raw) else None,
         )
         resources_ct = len(prepared_data)
         # 注：raw 写盘延迟到频率推断完成后（下方统一执行），避免用初始频率写入。
@@ -133,7 +139,14 @@ def generate_forecasts(
     except Exception:
         pass
     if not predict_only and save_raw:
-        write_raw_dataset(raw_path, prepared_data, freq=freq)
+        raw_stats = write_raw_resource_dataset(out_base, prepared_data, freq=freq)
+        logger.info(
+            "[raw] 资源分片提交完成：resources=%d written=%d reused=%d removed=%d",
+            raw_stats["resources"],
+            raw_stats["files_written"],
+            raw_stats["files_reused"],
+            raw_stats["files_removed"],
+        )
     skipped_short: List[str] = []
     for p in prepared_data:
         rid = p["resource_id"]
@@ -286,8 +299,6 @@ def generate_forecasts(
     manifest_items = write_prediction_outputs(
         out_base=out_base,
         resources_items=resources_items,
-        prepared_data=prepared_data,
-        raw_prepared_data=raw_prepared_data,
         active_methods=active_methods,
         test_size=test_size,
         future_steps=future_steps,
@@ -306,6 +317,7 @@ def generate_forecasts(
         metric_filter_by_id=metric_filter_by_id,
         metric_partial_enabled=metric_partial_enabled,
         total_elapsed=total_elapsed,
+        raw_stats=raw_stats,
     )
     try:
         write_action_gate_state(out_base, action_gate_state)

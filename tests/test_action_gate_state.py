@@ -1,7 +1,11 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
 
 from resource_predict.pipeline.action_gate_state import (
     ACTION_GATE_STATE_FILENAME,
@@ -9,6 +13,7 @@ from resource_predict.pipeline.action_gate_state import (
     load_action_gate_state,
     write_action_gate_state,
 )
+from resource_predict.pipeline.run import generate_forecasts, generate_predictions_only
 
 
 NOW = datetime(2026, 6, 18, 8, 0, tzinfo=timezone.utc)
@@ -173,6 +178,48 @@ class ActionGateStateTests(unittest.TestCase):
             recovered = load_action_gate_state(out_base)
 
         self.assertEqual(recovered, {"schema_version": 1, "resources": {}})
+
+    def test_prediction_only_round_accumulates_without_rewriting_raw_index(self):
+        index = pd.date_range("2026-01-01", periods=240, freq="h")
+        values = pd.Series([0.95] * len(index), index=index)
+        source = {
+            "resource_id": "vm-hot",
+            "resource_type": "openstack_vm",
+            "spec": {"cpu_cores": 2, "memory_gb": 4, "disk_gb": 40},
+            "metrics": {
+                metric: {
+                    "timestamps": (index.view("int64") // 1_000_000).tolist(),
+                    "values": values.tolist(),
+                }
+                for metric in ("cpu", "memory", "disk")
+            },
+        }
+        forecast_cfg = {"enabled_methods": ["rolling_mean"], "enable_ensemble": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with patch("resource_predict.pipeline.run.read_forecast_config", return_value=forecast_cfg):
+                generate_forecasts(
+                    out_dir=str(base),
+                    data_provider=lambda resources, n, freq: [source],
+                    test_size=12,
+                    future_steps=6,
+                    max_workers=1,
+                )
+                raw_before = (base / "raw_index.json").read_bytes()
+                generate_predictions_only(
+                    out_dir=str(base),
+                    test_size=12,
+                    future_steps=6,
+                    max_workers=1,
+                )
+                raw_after = (base / "raw_index.json").read_bytes()
+
+            summary = json.loads((base / "summary_index.json").read_text(encoding="utf-8"))
+            gate = summary["resources"][0]["scaling_advice"]["action_gate"]
+
+        self.assertEqual(raw_before, raw_after)
+        self.assertEqual(gate["observed_consistent_rounds"], 2)
+        self.assertEqual(gate["state"], "ready")
 
 
 if __name__ == "__main__":

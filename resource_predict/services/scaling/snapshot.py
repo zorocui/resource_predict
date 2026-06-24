@@ -11,10 +11,10 @@ import numpy as np
 from resource_predict.core.decision import build_scaling_advice
 from resource_predict.core.k8s_workload_decision import build_k8s_workload_advice
 from resource_predict.data.io import atomic_write_json
+from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.pipeline.constants import (
     DETAILS_DIRNAME,
     MANIFEST_FILENAME,
-    RAW_DATA_FILENAME,
     SUMMARY_INDEX_FILENAME,
 )
 from resource_predict.pipeline.output_paths import scoped_out_dir
@@ -37,7 +37,6 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
     out_dir = scoped_out_dir("k8s" if resource_type.startswith("k8s") else "vm", settings.app.out_dir)
     summary_path = out_dir / SUMMARY_INDEX_FILENAME
     details_dir = out_dir / DETAILS_DIRNAME
-    raw_path = out_dir / RAW_DATA_FILENAME
     manifest_path = out_dir / MANIFEST_FILENAME
 
     updated: Dict[str, Any] = {
@@ -53,7 +52,7 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
     with _LOCK:
         detail_item = _update_detail(details_dir, summary_path, resource_id, effective_spec, updated)
         _update_summary(summary_path, resource_id, effective_spec, detail_item, updated)
-        _update_raw(raw_path, resource_id, effective_spec, updated)
+        _update_raw(out_dir, resource_id, effective_spec, updated)
         _update_manifest(manifest_path, resource_id, effective_spec, detail_item, updated)
 
     logger.info(
@@ -263,29 +262,29 @@ def _update_summary(
 
 
 def _update_raw(
-    raw_path: Path,
+    out_dir: Path,
     resource_id: str,
     effective_spec: Dict[str, Any],
     updated: Dict[str, Any],
 ) -> None:
-    if not raw_path.exists():
+    store = RawResourceStore(
+        out_dir,
+        max_cache_items=int(settings.generation.raw_resource_cache_items),
+    )
+    if not store.exists():
         return
-    raw = _read_json(raw_path)
-    resources = raw.get("resources", []) if isinstance(raw, dict) else []
-    if not isinstance(resources, list):
+    item = store.get(resource_id)
+    if not isinstance(item, dict):
         return
-    for row in resources:
-        if not isinstance(row, dict) or str(row.get("resource_id")) != resource_id:
-            continue
-        row["spec"] = _merge_spec(row.get("spec", {}), effective_spec)
-        updated["raw_updated"] = True
-        break
-    if updated["raw_updated"]:
-        meta = raw.get("meta", {})
-        if isinstance(meta, dict):
-            meta["updated_at_epoch_ms"] = int(time.time() * 1000)
-            raw["meta"] = meta
-        atomic_write_json(raw_path, raw, ensure_ascii=False, indent=2)
+    item["spec"] = _merge_spec(item.get("spec", {}), effective_spec)
+    freq = str(store.metadata().get("freq") or settings.generation.freq)
+    write_raw_resource_dataset(
+        out_dir,
+        [item],
+        freq=freq,
+        changed_resource_ids={resource_id},
+    )
+    updated["raw_updated"] = True
 
 
 def _update_manifest(

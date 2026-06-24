@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,7 +16,7 @@ from resource_predict.pipeline import (
     generate_forecasts,
     generate_predictions_only,
 )
-from resource_predict.pipeline.constants import RAW_DATA_FILENAME
+from resource_predict.pipeline.constants import RAW_INDEX_FILENAME
 from resource_predict.pipeline.output_paths import scoped_out_dir, split_items_by_scope
 from resource_predict.providers.mock import mock_provider
 
@@ -37,17 +35,6 @@ def _file_sha256(path: Path) -> Optional[str]:
     return h.hexdigest()
 
 
-def _backup_raw_if_exists(raw_path: Path) -> Optional[Path]:
-    if not raw_path.exists():
-        return None
-    backup_dir = raw_path.parent / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = backup_dir / f"raw_data.before-generate_forecasts.{stamp}.json"
-    shutil.copy2(raw_path, backup_path)
-    return backup_path
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate resource prediction outputs.")
     parser.add_argument(
@@ -55,7 +42,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default="all",
         choices=["all", "predict", "predict-only", "predict_only"],
-        help="'predict' reuses raw_data.json and does not collect or overwrite raw data.",
+        help="'predict' reuses raw_index.json + raw/ and does not collect or overwrite raw data.",
     )
     parser.add_argument(
         "--out-dir",
@@ -79,15 +66,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if command in {"predict", "predict-only", "predict_only"}:
         for scope in ("vm", "k8s"):
             out_dir = scope_dirs[scope]
-            raw_path = out_dir / RAW_DATA_FILENAME
-            if not raw_path.exists():
-                print(f"Skipping {scope} predict: {raw_path} not found")
+            raw_index_path = out_dir / RAW_INDEX_FILENAME
+            if not raw_index_path.exists():
+                print(f"Skipping {scope} predict: {raw_index_path} not found")
                 continue
-            raw_before = _file_sha256(raw_path)
+            raw_before = _file_sha256(raw_index_path)
             out = generate_predictions_only(out_dir=str(out_dir))
-            raw_after = _file_sha256(raw_path)
+            raw_after = _file_sha256(raw_index_path)
             if raw_before != raw_after:
-                raise RuntimeError(f"{raw_path} changed during predict-only generation")
+                raise RuntimeError(f"{raw_index_path} changed during predict-only generation")
             print(f"Recalculated {scope} predictions: {len(out)} output resources, dir: {out_dir}")
     else:
         from resource_predict.settings import settings as _settings
@@ -100,14 +87,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"No {scope} resources from mock provider, skipping.")
                 continue
             out_dir = scope_dirs[scope]
-            raw_path = out_dir / RAW_DATA_FILENAME
-            backup_path = _backup_raw_if_exists(raw_path)
             out = generate_forecasts(
                 out_dir=str(out_dir),
                 data_provider=lambda resources, n, freq, _items=scoped: _items,
             )
-            if backup_path is not None:
-                print(f"Backed up existing {scope} raw data before full generation: {backup_path}")
             print(f"Generated {scope} predictions for {len(out)} resources, dir: {out_dir}")
     return 0
 

@@ -17,7 +17,10 @@
       panel.classList.toggle("active", panel.id === `${app.state.activeView}-view`);
     });
     if (app.state.activeView === "tasks") renderTaskPanel();
-    if (app.state.activeView === "updates") refreshUpdateStatus();
+    if (app.state.activeView === "updates") {
+      refreshUpdateStatus();
+      refreshUpdateHistory();
+    }
     if (app.state.activeView === "configs") refreshClusterConfigs();
   }
 
@@ -38,6 +41,9 @@
 
   async function loadQueue({ keepSelection = false } = {}) {
     app.els.summaryText.textContent = "正在加载资源...";
+    app.resourcePayloadCache.clear();
+    app.chartDataByKey.clear();
+    app.loadedChartKeys.clear();
     const [payload, summaryPayload, overviewPayload, forecastPayload] = await Promise.all([
       api.requestJson(api.buildQuery("/api/resources", {
         page: app.state.page,
@@ -208,6 +214,64 @@
     }
   }
 
+  function formatDuration(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return "-";
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = Math.round(seconds % 60);
+    return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
+  }
+
+  function renderUpdateHistory(records) {
+    if (!app.els.updateHistory) return;
+    const items = Array.isArray(records) ? records : [];
+    if (!items.length) {
+      app.els.updateHistory.innerHTML = `<div class="empty-list is-compact">还没有历史更新记录。</div>`;
+      return;
+    }
+    app.els.updateHistory.innerHTML = items.map((record) => {
+      const success = record.status === "success";
+      const statusLabel = success ? "成功" : "失败";
+      const source = record.task_source || "数据更新";
+      const windowLabel = record.fetch_window_label || "未指定拉取窗口";
+      const detail = record.error || record.message || (success ? "更新完成" : "更新失败");
+      return `
+        <article class="update-history-item ${success ? "is-success" : "is-failed"}">
+          <div class="update-history-main">
+            <div class="update-history-title">
+              <span class="update-history-status">${statusLabel}</span>
+              <strong>${list.escapeHtml(source)}</strong>
+              <span>${list.escapeHtml(windowLabel)}</span>
+            </div>
+            <div class="update-history-meta">
+              <span>开始 ${list.escapeHtml(formatDateTime(record.started_at))}</span>
+              <span>结束 ${list.escapeHtml(formatDateTime(record.finished_at))}</span>
+              <span>耗时 ${list.escapeHtml(formatDuration(record.elapsed_seconds))}</span>
+            </div>
+            <p>${list.escapeHtml(detail)}</p>
+          </div>
+          <div class="update-history-counts" aria-label="本次更新统计">
+            <span><b>${Number(record.resources_updated || 0)}</b> 更新</span>
+            <span><b>${Number(record.resources_created || 0)}</b> 新增</span>
+            <span><b>${Number(record.total_new_points || 0)}</b> 数据点</span>
+            <span><b>${Number(record.predicted_resources || 0)}</b> 预测</span>
+          </div>
+        </article>
+      `;
+    }).join("");
+  }
+
+  async function refreshUpdateHistory() {
+    if (!app.els.updateHistory) return;
+    try {
+      const payload = await api.requestJson("/api/update-history?limit=20", 1);
+      renderUpdateHistory(payload.records || []);
+    } catch (e) {
+      app.els.updateHistory.innerHTML = `<div class="empty-list is-compact">历史记录读取失败：${list.escapeHtml(e.message || e)}</div>`;
+    }
+  }
+
   function stopUpdatePolling() {
     if (updatePollTimer !== null) {
       window.clearTimeout(updatePollTimer);
@@ -228,6 +292,7 @@
         return;
       }
       updatePollTimer = null;
+      refreshUpdateHistory();
       if (updatePollWasRunning && !status.last_error) {
         loadQueue({ keepSelection: true }).catch((e) => {
           app.els.summaryText.textContent = `刷新失败：${String(e.message || e)}`;
@@ -413,12 +478,13 @@
     const interval = Number(schedule?.scheduled_update_interval_minutes || 0);
     const overlap = Number(schedule?.incremental_overlap_minutes || 0);
     const historyDays = Number(schedule?.history_days || 7);
+    const startupDelay = Number(schedule?.scheduled_update_startup_delay_seconds || 0);
     const incrementalHours = Math.max(1, (interval + overlap) / 60);
     const incrementalLabel = Number.isInteger(incrementalHours)
       ? String(incrementalHours)
       : incrementalHours.toFixed(1);
     app.els.k8sScheduleHint.textContent =
-      `K8S 后台定时拉取已启用：app.py 启动后会立即执行首次拉取；有本地基线时拉取最近 ${incrementalLabel} 小时，` +
+      `K8S 后台定时拉取已启用：app.py 启动 ${startupDelay} 秒后执行首次拉取；有本地基线时拉取最近 ${incrementalLabel} 小时，` +
       `无本地基线或全量刷新时拉取最近 ${historyDays} 天，之后每 ${interval} 分钟执行一次。`;
   }
 

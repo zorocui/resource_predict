@@ -10,7 +10,7 @@
 | `test_forecast_windowing.py` | 预测窗口解析、频率推断、时长换算 |
 | `test_decision.py` | VM 扩缩容判断、目标规格计算、置信度评分、风险画像 |
 | `test_k8s_workload_decision.py` | K8S 决策、副本数建议、数据质量处理 |
-| `test_io.py` | raw_data.json 读写、时间戳解析、混合格式 |
+| `test_io.py` / `test_raw_store.py` | 时间戳解析、raw 资源分片、索引原子替换与完整性校验 |
 | `test_scaling_executor.py` | 调配计划构建、flavor 选择、命令生成 |
 | `test_scaling_api.py` | 调配 API 端点 |
 | `test_scaling_tasks.py` | 任务生命周期管理 |
@@ -41,17 +41,27 @@ python -m pytest tests/test_forecasting.py::test_function_name -q
 
 ```bash
 # 1. 编译检查（语法错误）
-python -m compileall -q app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict tests
+python -m compileall -q app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict benchmarks tests
 
 # 2. 静态分析（未使用导入等）
-python -m pyflakes app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict tests
+python -m pyflakes app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict benchmarks tests
 
 # 3. 死代码检测
-vulture app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict tests --min-confidence 80
+vulture app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py resource_predict benchmarks tests --min-confidence 80
 
 # 4. 测试
 python -m pytest -q
 ```
+
+## 详情加载性能基准
+
+该基准生成大规模资源分片但跳过模型拟合，测量单资源元数据与单指标图表读取的 P50/P95：
+
+```bash
+python -m benchmarks.resource_detail_benchmark --resources 1000 --points 2016 --samples 50
+```
+
+默认验收阈值为元数据 P95 不高于 200ms、图表 P95 不高于 500ms，并校验训练历史响应不超过 1000 点。
 
 ## 代码组织约定
 
@@ -65,7 +75,7 @@ python -m pytest -q
 
 - 所有配置 dataclass 使用 `frozen=True`，通过替换而非赋值来修改
 - 时间戳：API/payload 层使用毫秒级 Unix int；内部使用 pandas `DatetimeIndex`
-- `predict_only=True` 模式绝不修改 `raw_data.json`
+- `predict_only=True` 模式绝不修改 `raw_index.json` 或 `raw/` 资源分片
 - 不提交 `outputs/`、日志、缓存、`__pycache__`、本地凭据文件
 
 ## 资源类型系统

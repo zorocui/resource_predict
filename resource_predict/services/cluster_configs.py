@@ -108,6 +108,7 @@ def read_cluster_config_payload() -> Dict[str, Any]:
         "k8s_prometheus_schedule": {
             "scheduled_update_enabled": bool(k8s_cfg.scheduled_update_enabled),
             "scheduled_update_interval_minutes": int(k8s_cfg.scheduled_update_interval_minutes),
+            "scheduled_update_startup_delay_seconds": int(k8s_cfg.scheduled_update_startup_delay_seconds),
             "incremental_overlap_minutes": int(k8s_cfg.incremental_overlap_minutes),
             "history_days": int(k8s_cfg.history_days),
             "startup_fetch_enabled": bool(k8s_cfg.scheduled_update_enabled),

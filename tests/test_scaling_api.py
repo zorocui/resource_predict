@@ -20,7 +20,7 @@ class ScalingApiTest(unittest.TestCase):
         register_scaling_routes(
             app,
             {
-                "get_resource_detail": lambda resource_id: resource if resource_id == resource["resource_id"] else None,
+                "get_resource_detail": lambda resource_id, **_kwargs: resource if resource_id == resource["resource_id"] else None,
                 "safe_int": lambda value, default: default,
             },
         )
@@ -59,7 +59,7 @@ class ScalingApiTest(unittest.TestCase):
         register_scaling_routes(
             app,
             {
-                "get_resource_detail": lambda resource_id: resource if resource_id == resource["resource_id"] else None,
+                "get_resource_detail": lambda resource_id, **_kwargs: resource if resource_id == resource["resource_id"] else None,
                 "safe_int": lambda value, default: default,
             },
         )
