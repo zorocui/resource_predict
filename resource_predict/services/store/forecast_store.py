@@ -60,6 +60,7 @@ class _SingleForecastStore:
         container: Optional[str] = None,
         start_ms: Optional[int] = None,
         end_ms: Optional[int] = None,
+        default_history_points: bool = True,
     ) -> Optional[Dict[str, Any]]:
         started = time.perf_counter()
         summary = self._load_summary_index()
@@ -92,7 +93,11 @@ class _SingleForecastStore:
             )
             return result
 
-        points = self._resolve_history_points(history_points)
+        points = (
+            self._resolve_history_points(history_points)
+            if history_points is not None or default_history_points
+            else None
+        )
         raw_started = time.perf_counter()
         raw = self._raw_store.get(resource_id)
         raw_elapsed = time.perf_counter() - raw_started
@@ -132,7 +137,7 @@ class _SingleForecastStore:
         point_count, response_bytes = _chart_payload_stats(result)
         logger.info(
             "[detail] charts resource_id=%s summary_cache=%s detail_cache=%s raw_cache=%s "
-            "detail=%.3fs raw=%.3fs merge=%.3fs total=%.3fs points=%d bytes=%d history_points=%d metric=%s container=%s",
+            "detail=%.3fs raw=%.3fs merge=%.3fs total=%.3fs points=%d bytes=%d history_points=%s metric=%s container=%s",
             resource_id,
             self._last_summary_cache_hit,
             self._last_details_cache_hit,
@@ -143,7 +148,7 @@ class _SingleForecastStore:
             time.perf_counter() - started,
             point_count,
             response_bytes,
-            points,
+            points if points is not None else "all",
             metric or "all",
             container or "workload",
         )
@@ -167,6 +172,7 @@ class _SingleForecastStore:
             container=container,
             start_ms=start_ms,
             end_ms=end_ms,
+            default_history_points=False,
         )
         if detail is None:
             return None

@@ -161,11 +161,11 @@ class DecisionConfig:
 
 @dataclass(frozen=True)
 class UpdateConfig:
-    # 是否启用后台定时拉取增量更新；关闭时仍可手动调用更新 API。
+    # 是否启用显式启动的后台定时拉取；app.py 默认不自动启动。
     enabled: bool = False
-    # 定时拉取更新间隔，单位分钟。
+    # 显式后台拉取更新间隔，单位分钟。
     interval_minutes: int = 60
-    # 应用启动后首次自动更新的延迟秒数；手动更新不受影响。
+    # 显式启动后台调度器后的首次更新延迟秒数；手动更新不受影响。
     startup_delay_seconds: int = 60
     # 每次调用增量数据提供器期望追加的时间点数量。
     points_per_update: int = 1
@@ -208,11 +208,11 @@ class K8SPrometheusConfig:
     request_timeout_seconds: int = 300
     # 多集群拉取时是否遇到任一集群失败就立即中断；False 表示尽量保留成功集群。
     fail_fast: bool = False
-    # 是否启用 K8S Prometheus 后台定时拉取；关闭时仍可手动通过 API 或 CLI 触发。
+    # 是否启用显式启动的 K8S Prometheus 后台拉取；app.py 默认不自动启动。
     scheduled_update_enabled: bool = False
-    # K8S Prometheus 定时拉取间隔，单位分钟。
+    # K8S Prometheus 显式后台拉取间隔，单位分钟。
     scheduled_update_interval_minutes: int = 360
-    # 应用启动后首次 K8S 自动拉取的延迟秒数；手动拉取不受影响。
+    # 显式启动 K8S 后台调度器后的首次拉取延迟秒数；手动拉取不受影响。
     scheduled_update_startup_delay_seconds: int = 60
 
 

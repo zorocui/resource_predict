@@ -6,10 +6,11 @@
   const MINUTE_MS = 60 * 1000;
   const HOUR_MS = 60 * MINUTE_MS;
   const DAY_MS = 24 * HOUR_MS;
-  const DEFAULT_HISTORY_POINTS = 1000;
-  const MAX_HISTORY_POINTS = 10000;
   const MAX_RESOURCE_CACHE_ITEMS = 100;
   const MAX_CHART_CACHE_ITEMS = 400;
+  let detailChartRenderSeq = 0;
+  let modalChartRenderSeq = 0;
+  let chartRefreshSeq = 0;
   const CHART_RANGES = [
     { key: "24h", label: "24h", durationMs: DAY_MS },
     { key: "3d", label: "3d", durationMs: 3 * DAY_MS },
@@ -320,7 +321,56 @@
 
   function activeChartData(resource, metricKey, fallbackChartData) {
     const containerEntry = selectedContainerEntry(resource, metricKey);
-    return containerEntry?.chart || fallbackChartData;
+    return containerEntry?.chart || resource?.charts?.[metricKey] || fallbackChartData;
+  }
+
+  function chartDataMatchesRequest(chartData, requestKey, loadOptions = null) {
+    if (!chartData || !requestKey) return Boolean(chartData);
+    if (chartData.__chart_load_key !== requestKey) return false;
+    if (!loadOptions) return true;
+    return chartData.__chart_history_points === loadOptions.historyPoints
+      && chartData.__chart_start_ms === (loadOptions.startMs ?? null)
+      && chartData.__chart_end_ms === (loadOptions.endMs ?? null);
+  }
+
+  function chartCacheKey(requestKey, containerName = "") {
+    return `${requestKey}:${containerName || "workload"}`;
+  }
+
+  function stampChartData(chartData, requestKey, loadOptions = null) {
+    if (!chartData || typeof chartData !== "object") return chartData;
+    Object.defineProperty(chartData, "__chart_load_key", {
+      value: requestKey,
+      enumerable: false,
+      configurable: true,
+    });
+    Object.defineProperty(chartData, "__chart_history_points", {
+      value: loadOptions?.historyPoints ?? null,
+      enumerable: false,
+      configurable: true,
+    });
+    Object.defineProperty(chartData, "__chart_start_ms", {
+      value: loadOptions?.startMs ?? null,
+      enumerable: false,
+      configurable: true,
+    });
+    Object.defineProperty(chartData, "__chart_end_ms", {
+      value: loadOptions?.endMs ?? null,
+      enumerable: false,
+      configurable: true,
+    });
+    return chartData;
+  }
+
+  function activeChartDataForRequest(resource, metricKey, requestKey, loadOptions = null) {
+    const containerName = selectedContainerName(resource, metricKey);
+    const exactFallback = app.chartDataByKey.get(chartCacheKey(requestKey, containerName));
+    const containerEntry = selectedContainerEntry(resource, metricKey);
+    if (chartDataMatchesRequest(containerEntry?.chart, requestKey, loadOptions)) return containerEntry.chart;
+    const directChart = resource?.charts?.[metricKey];
+    if (chartDataMatchesRequest(directChart, requestKey, loadOptions)) return directChart;
+    if (chartDataMatchesRequest(exactFallback, requestKey, loadOptions)) return exactFallback;
+    return null;
   }
 
   function activeContainerSubtext(resource, metricKey) {
@@ -572,10 +622,8 @@
 
   function chartLoadOptions(resource, metricKey) {
     const selectedRange = chartRange();
-    const extended = selectedRange.key === "7d" || selectedRange.key === "all";
-    const historyPoints = extended ? MAX_HISTORY_POINTS : DEFAULT_HISTORY_POINTS;
-    if (!selectedRange.durationMs || !extended) {
-      return { historyPoints, startMs: null, endMs: null };
+    if (!selectedRange.durationMs) {
+      return { historyPoints: null, startMs: null, endMs: null };
     }
     const rid = String(resource?.resource_id || "");
     const fallback = app.chartDataByKey.get(`${rid}:${metricKey}`);
@@ -588,7 +636,7 @@
     }
     const endMs = observed.length ? Math.max(...observed) : null;
     return {
-      historyPoints,
+      historyPoints: null,
       startMs: endMs == null ? null : Math.max(0, endMs - selectedRange.durationMs),
       endMs,
     };
@@ -601,17 +649,22 @@
     return `${rid}:${metricKey}:${containerName}:${options.historyPoints}:${options.startMs ?? "recent"}:${options.endMs ?? "latest"}`;
   }
 
-  function cacheChartPayload(resource, payload, metricKey, requestKey) {
+  function cacheChartPayload(resource, payload, metricKey, requestKey, loadOptions) {
     if (!resource || !payload) return;
-    resource.charts = { ...(resource.charts || {}), ...(payload.charts || {}) };
+    const incomingCharts = payload.charts || {};
+    Object.values(incomingCharts).forEach((chart) => stampChartData(chart, requestKey, loadOptions));
+    resource.charts = { ...(resource.charts || {}), ...incomingCharts };
     const incomingContainers = payload.container_charts || {};
     const mergedContainers = { ...(resource.container_charts || {}) };
     Object.entries(incomingContainers).forEach(([name, metrics]) => {
+      Object.values(metrics || {}).forEach((chart) => stampChartData(chart, requestKey, loadOptions));
       mergedContainers[name] = { ...(mergedContainers[name] || {}), ...(metrics || {}) };
+      const chart = metrics?.[metricKey];
+      if (chart) rememberChartData(chartCacheKey(requestKey, name), chart);
     });
     resource.container_charts = mergedContainers;
     const chart = resource.charts?.[metricKey];
-    if (chart) rememberChartData(`${resource.resource_id}:${metricKey}`, chart);
+    if (chart) rememberChartData(chartCacheKey(requestKey), chart);
     app.loadedChartKeys.add(requestKey);
   }
 
@@ -622,19 +675,20 @@
     const containerName = selectedContainerName(resource, metricKey);
     const loadOptions = chartLoadOptions(resource, metricKey);
     const requestKey = chartLoadKey(resource, metricKey);
-    if (app.loadedChartKeys.has(requestKey)) return resource;
+    if (app.loadedChartKeys.has(requestKey) && activeChartDataForRequest(resource, metricKey, requestKey, loadOptions)) {
+      return resource;
+    }
     let req = app.pendingChartRequests.get(requestKey);
     if (!req) {
       const url = api.buildQuery(`/api/resources/${encodeURIComponent(rid)}/charts`, {
         metric: metricKey,
         container: containerName || undefined,
-        history_points: loadOptions.historyPoints,
         start_ms: loadOptions.startMs,
         end_ms: loadOptions.endMs,
       });
       req = api.requestJson(url)
         .then((payload) => {
-          cacheChartPayload(resource, payload, metricKey, requestKey);
+          cacheChartPayload(resource, payload, metricKey, requestKey, loadOptions);
           return resource;
         })
         .finally(() => app.pendingChartRequests.delete(requestKey));
@@ -922,10 +976,15 @@
   }
 
   async function renderChart(resourceId, metricKey, resource = null) {
+    const renderSeq = ++detailChartRenderSeq;
     disposeDetailChart();
     app.els.detailChart.innerHTML = `<div class="chart-state">正在加载图表...</div>`;
+    let requestKey = "";
+    let loadOptions = null;
     try {
       resource = resource || await ensureResource(resourceId);
+      loadOptions = chartLoadOptions(resource, metricKey);
+      requestKey = chartLoadKey(resource, metricKey);
       await ensureChartData(resource, metricKey);
     } catch (e) {
       if (app.state.selectedResourceId === resourceId) {
@@ -937,11 +996,9 @@
       }
       return false;
     }
-    if (app.state.selectedResourceId !== resourceId) return;
+    if (renderSeq !== detailChartRenderSeq || app.state.selectedResourceId !== resourceId) return false;
     app.els.detailChart.innerHTML = "";
-    const key = `${resourceId}:${metricKey}`;
-    const fallbackData = app.chartDataByKey.get(key);
-    const data = activeChartData(resource, metricKey, fallbackData);
+    const data = activeChartDataForRequest(resource, metricKey, requestKey, loadOptions);
     if (!data) {
       app.els.detailChart.innerHTML = `<div class="chart-state">暂无 ${list.escapeHtml(metricTitleForChart(resource, metricKey))} 图表数据</div>`;
       return false;
@@ -951,6 +1008,7 @@
       return false;
     }
     const displayUnit = displayUnitForChart(resource, metricKey);
+    if (renderSeq !== detailChartRenderSeq || app.state.selectedResourceId !== resourceId) return false;
     app.detailChartInstance = echarts.init(app.els.detailChart, null, { renderer: app.ECHARTS_RENDERER });
     app.detailChartInstance.setOption(buildChartOption(data, metricKey, displayUnit, resource), { notMerge: true, lazyUpdate: false });
     requestAnimationFrame(() => app.detailChartInstance?.resize());
@@ -958,6 +1016,7 @@
   }
 
   async function openChartModal(metricKey) {
+    const renderSeq = ++modalChartRenderSeq;
     if (!app.state.selectedResourceId || !app.state.selectedMetricKey) return;
     const resource = await ensureResource(app.state.selectedResourceId);
     const metricKeys = list.metricKeysFor(resource);
@@ -970,10 +1029,11 @@
       await renderChart(app.state.selectedResourceId, activeMetric, resource);
       return;
     }
-    const key = `${app.state.selectedResourceId}:${activeMetric}`;
-    const fallbackData = app.chartDataByKey.get(key);
-    const data = activeChartData(resource, activeMetric, fallbackData);
+    const loadOptions = chartLoadOptions(resource, activeMetric);
+    const requestKey = chartLoadKey(resource, activeMetric);
+    const data = activeChartDataForRequest(resource, activeMetric, requestKey, loadOptions);
     if (!data || typeof echarts === "undefined" || !app.els.chartModal || !app.els.chartModalChart) return;
+    if (renderSeq !== modalChartRenderSeq) return;
     disposeModalChart();
     app.els.chartModal.hidden = false;
     const metricName = metricTitleForChart(resource, activeMetric);
@@ -990,6 +1050,7 @@
   }
 
   function closeChartModal() {
+    modalChartRenderSeq += 1;
     disposeModalChart();
     if (app.els.chartModal) app.els.chartModal.hidden = true;
   }
@@ -1054,15 +1115,19 @@
   }
 
   async function refreshChartDisplayControls() {
+    const refreshSeq = ++chartRefreshSeq;
     if (!app.state.selectedResourceId || !app.state.selectedMetricKey) return;
     const resource = await ensureResource(app.state.selectedResourceId);
+    if (refreshSeq !== chartRefreshSeq) return;
     renderAdvice(resource);
     renderMetricTabs(resource, app.state.selectedMetricKey);
     const resourceId = app.state.selectedResourceId;
     const selectedContainer = selectedContainerName(resource, app.state.selectedMetricKey);
     const adviceDataPromise = ensureAdviceChartData(resource);
     await renderChart(resourceId, app.state.selectedMetricKey, resource);
+    if (refreshSeq !== chartRefreshSeq) return;
     await adviceDataPromise;
+    if (refreshSeq !== chartRefreshSeq) return;
     if (
       app.state.selectedResourceId === resourceId
       && selectedContainerName(resource, app.state.selectedMetricKey) === selectedContainer

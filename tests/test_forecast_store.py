@@ -104,6 +104,18 @@ class ForecastStoreTest(unittest.TestCase):
             self.assertEqual(len(detail["charts"]["cpu"]["y_train"]), 2)
             self.assertEqual(len(detail["charts"]["cpu"]["y_test"]), 2)
 
+    def test_chart_endpoint_without_history_points_returns_full_training_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._write_artifacts(base)
+            store = _SingleForecastStore(AppConfig(out_dir=str(base)), GenerationConfig())
+
+            charts = store.get_resource_charts("vm-1", metric="cpu")
+
+            self.assertIsNone(charts["chart_window"]["history_points"])
+            self.assertEqual(len(charts["charts"]["cpu"]["y_train"]), 6)
+            self.assertEqual(len(charts["charts"]["cpu"]["y_test"]), 2)
+
     def test_chart_detail_rejects_reversed_time_range(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

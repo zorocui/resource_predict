@@ -470,22 +470,16 @@
 
   function renderK8sScheduleHint(schedule) {
     if (!app.els.k8sScheduleHint) return;
-    const enabled = Boolean(schedule?.scheduled_update_enabled);
-    if (!enabled) {
-      app.els.k8sScheduleHint.textContent = "K8S 后台定时拉取未启用；启动 app.py 后不会自动拉取，可通过页面按钮手动触发。";
-      return;
-    }
     const interval = Number(schedule?.scheduled_update_interval_minutes || 0);
     const overlap = Number(schedule?.incremental_overlap_minutes || 0);
     const historyDays = Number(schedule?.history_days || 7);
-    const startupDelay = Number(schedule?.scheduled_update_startup_delay_seconds || 0);
     const incrementalHours = Math.max(1, (interval + overlap) / 60);
     const incrementalLabel = Number.isInteger(incrementalHours)
       ? String(incrementalHours)
       : incrementalHours.toFixed(1);
     app.els.k8sScheduleHint.textContent =
-      `K8S 后台定时拉取已启用：app.py 启动 ${startupDelay} 秒后执行首次拉取；有本地基线时拉取最近 ${incrementalLabel} 小时，` +
-      `无本地基线或全量刷新时拉取最近 ${historyDays} 天，之后每 ${interval} 分钟执行一次。`;
+      `app.py 启动后不会自动拉取 K8S 数据，可通过页面按钮手动触发；有本地基线时拉取最近 ${incrementalLabel} 小时，` +
+      `无本地基线或全量刷新时拉取最近 ${historyDays} 天。`;
   }
 
   async function refreshClusterConfigs() {

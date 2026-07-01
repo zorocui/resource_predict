@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from flask import Flask
 
 from resource_predict.api.resources import register_resource_routes
@@ -177,3 +179,36 @@ def test_resource_charts_rejects_invalid_history_points():
     response = app.test_client().get("/api/resources/vm-1/charts?history_points=0")
 
     assert response.status_code == 400
+
+
+def test_resource_charts_omitted_history_points_stays_unbounded():
+    calls = []
+    app = Flask(__name__)
+    helpers = {
+        "settings": SimpleNamespace(generation=SimpleNamespace(api_page_size_default=20, api_page_size_max=200)),
+        "safe_int": safe_int,
+        "action_priority": action_priority,
+        "matches_query": matches_query,
+        "get_summary": lambda: {"resources": []},
+        "get_resource_detail": lambda _resource_id, **_kwargs: None,
+        "get_resource_charts": lambda resource_id, **kwargs: calls.append((resource_id, kwargs)) or {
+            "resource_id": resource_id,
+            "charts": {"cpu": {}},
+        },
+        "prediction_pending_for": lambda _resource_id: None,
+    }
+    register_resource_routes(app, helpers)
+
+    response = app.test_client().get("/api/resources/vm-1/charts?metric=cpu")
+
+    assert response.status_code == 200
+    assert calls == [(
+        "vm-1",
+        {
+            "history_points": None,
+            "metric": "cpu",
+            "container": None,
+            "start_ms": None,
+            "end_ms": None,
+        },
+    )]

@@ -43,8 +43,8 @@
 | `/api/resources/<id>` | `history_points` | 图表历史点数，默认 1000，最大 10000 |
 | `/api/resources/<id>/charts` | `metric` | 必填，只返回目标指标 |
 | `/api/resources/<id>/charts` | `container` | 可选，只返回目标容器的该指标 |
-| `/api/resources/<id>/charts` | `history_points` | 历史点数上限，默认 1000，最大 10000 |
-| `/api/resources/<id>/charts` | `start_ms` / `end_ms` | 可选毫秒时间范围；范围过滤后仍受 `history_points` 上限保护 |
+| `/api/resources/<id>/charts` | `history_points` | 可选兼容参数；传入时限制历史点数，最大 10000；不传时返回时间范围内全部训练历史 |
+| `/api/resources/<id>/charts` | `start_ms` / `end_ms` | 可选毫秒时间范围；前端图表按钮优先使用时间范围过滤 |
 
 弹窗应先请求 `include_charts=false` 并立即展示规格、建议和门控状态，再按可见指标异步请求 `/charts`。每个图表请求只会读取该资源对应的一个 raw 分片，不扫描其他资源。
 

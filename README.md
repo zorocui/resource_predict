@@ -13,7 +13,7 @@
 - 自动最优模型选择（基于 RMSE + 滚动回测）
 - 异常检测与鲁棒路由
 - 策略分级（conservative / balanced / aggressive）与 Namespace-aware 差异化阈值
-- 增量数据接入（pull 定时 / push HTTP）
+- 增量数据接入（pull API / push HTTP）
 - 预测误差报告、紧急度评分、调配执行与结果快照
 
 ---
