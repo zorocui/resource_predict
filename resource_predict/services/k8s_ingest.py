@@ -15,7 +15,7 @@ from resource_predict.data.updater import (
 )
 from resource_predict.data.raw_store import RawResourceStore
 from resource_predict.pipeline.output_paths import scoped_out_dir
-from resource_predict.providers.k8s_prometheus import k8s_workload_prometheus_provider
+from resource_predict.providers.k8s_prometheus import fetch_k8s_workload_prometheus_result
 from resource_predict.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -31,21 +31,31 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def fetch_k8s_prometheus_items(
+def fetch_k8s_prometheus_result(
     clusters: Optional[Iterable[str]] = None,
     *,
     history_hours: Optional[float] = None,
-) -> List[Dict[str, Any]]:
-    items = k8s_workload_prometheus_provider(
+) -> Dict[str, Any]:
+    result = fetch_k8s_workload_prometheus_result(
         resources=0,
         n=0,
         freq="5min",
         clusters=clusters,
         history_hours=history_hours,
     )
-    if not isinstance(items, list) or not items:
-        raise RuntimeError("Prometheus provider returned no K8S workload resources")
-    return items
+    if not isinstance(result, dict):
+        raise RuntimeError("Prometheus provider returned an invalid K8S fetch result")
+    return result
+
+
+def _cluster_terminal_status(cluster_results: List[Dict[str, Any]]) -> str:
+    succeeded = sum(1 for item in cluster_results if item.get("status") == "success")
+    failed = sum(1 for item in cluster_results if item.get("status") == "failed")
+    if succeeded and failed:
+        return "partial_success"
+    if succeeded:
+        return "success"
+    return "failed"
 
 
 def run_k8s_prometheus_upsert(
@@ -57,6 +67,7 @@ def run_k8s_prometheus_upsert(
 ) -> Dict[str, Any]:
     """Fetch K8S Workload metrics from Prometheus and merge them into outputs."""
     cluster_list = list(clusters) if clusters is not None else None
+    cluster_results: List[Dict[str, Any]] = []
     try:
         out_dir = scoped_out_dir("k8s", settings.app.out_dir)
         history_hours = _history_hours_for_fetch(
@@ -84,7 +95,18 @@ def run_k8s_prometheus_upsert(
             full_refresh,
             fetch_started_at,
         )
-        items = fetch_k8s_prometheus_items(cluster_list, history_hours=history_hours)
+        fetch_result = fetch_k8s_prometheus_result(cluster_list, history_hours=history_hours)
+        items = list(fetch_result.get("items") or [])
+        cluster_results = [
+            dict(item)
+            for item in fetch_result.get("cluster_results") or []
+            if isinstance(item, dict)
+        ]
+        cluster_status = _cluster_terminal_status(cluster_results)
+        if not items:
+            errors = [str(item.get("error")) for item in cluster_results if item.get("error")]
+            detail = "；".join(errors) or "Prometheus provider returned no K8S workload resources"
+            raise RuntimeError(f"所有 K8S Prometheus 集群拉取失败: {detail}")
         fetch_finished_at = _utc_timestamp()
         logger.info(
             "[k8s_ingest] K8S Prometheus fetch finished: resources=%d elapsed=%.2fs "
@@ -95,14 +117,20 @@ def run_k8s_prometheus_upsert(
             fetch_finished_at,
         )
 
-        result = run_upsert_with_data(items, fail_if_busy=fail_if_busy, out_dir=out_dir)
+        result = dict(run_upsert_with_data(items, fail_if_busy=fail_if_busy, out_dir=out_dir))
+        result["cluster_results"] = cluster_results
         if not result.get("success"):
-            mark_external_update_failed(str(result.get("error") or "K8S Prometheus 数据拉取失败"))
+            result["status"] = "failed"
+            mark_external_update_failed(
+                str(result.get("error") or "K8S Prometheus 数据拉取失败"),
+                cluster_results=cluster_results,
+            )
         else:
+            result["status"] = cluster_status
             mark_external_update_finished(result)
         return result
     except Exception as exc:
-        mark_external_update_failed(str(exc))
+        mark_external_update_failed(str(exc), cluster_results=cluster_results)
         raise
 
 

@@ -132,7 +132,10 @@ class ClusterConfigsTest(unittest.TestCase):
                 ),
             )
             with patch.object(k8s_ingest, "settings", fake_settings):
-                with patch.object(k8s_ingest, "fetch_k8s_prometheus_items", return_value=items) as fetch:
+                with patch.object(k8s_ingest, "fetch_k8s_prometheus_result", return_value={
+                    "items": items,
+                    "cluster_results": [{"cluster": "cluster-a", "status": "success", "resources_fetched": 1}],
+                }) as fetch:
                     with patch.object(k8s_ingest, "run_upsert_with_data", return_value={"success": True}) as upsert:
                         with patch.object(k8s_ingest, "mark_external_update_finished") as mark_finished:
                             result = k8s_ingest.run_k8s_prometheus_upsert(clusters=["cluster-a"], fail_if_busy=True)
@@ -163,12 +166,72 @@ class ClusterConfigsTest(unittest.TestCase):
                 ),
             )
             with patch.object(k8s_ingest, "settings", fake_settings):
-                with patch.object(k8s_ingest, "fetch_k8s_prometheus_items", return_value=items) as fetch:
+                with patch.object(k8s_ingest, "fetch_k8s_prometheus_result", return_value={
+                    "items": items,
+                    "cluster_results": [{"cluster": "cluster-a", "status": "success", "resources_fetched": 1}],
+                }) as fetch:
                     with patch.object(k8s_ingest, "run_upsert_with_data", return_value={"success": True}):
                         result = k8s_ingest.run_k8s_prometheus_upsert(clusters=["cluster-a"], fail_if_busy=True)
 
         self.assertTrue(result["success"])
         fetch.assert_called_once_with(["cluster-a"], history_hours=None)
+
+    def test_k8s_ingest_preserves_partial_success(self):
+        items = [{"resource_id": "k8s:cluster-a:ns:deployment:api"}]
+        cluster_results = [
+            {"cluster": "cluster-a", "status": "success", "resources_fetched": 1},
+            {"cluster": "cluster-b", "status": "failed", "resources_fetched": 0, "error": "timeout"},
+        ]
+        fake_settings = SimpleNamespace(
+            app=SimpleNamespace(out_dir="outputs"),
+            k8s_prometheus=SimpleNamespace(scheduled_update_interval_minutes=360, incremental_overlap_minutes=60),
+        )
+        with patch.object(k8s_ingest, "settings", fake_settings):
+            with patch.object(k8s_ingest, "_has_existing_k8s_raw_data", return_value=True):
+                with patch.object(k8s_ingest, "fetch_k8s_prometheus_result", return_value={
+                    "items": items, "cluster_results": cluster_results,
+                }):
+                    with patch.object(k8s_ingest, "run_upsert_with_data", return_value={"success": True}):
+                        with patch.object(k8s_ingest, "mark_external_update_finished") as finished:
+                            result = k8s_ingest.run_k8s_prometheus_upsert()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status"], "partial_success")
+        self.assertEqual(result["cluster_results"], cluster_results)
+        finished.assert_called_once_with(result)
+
+    def test_k8s_ingest_all_cluster_failures_skip_upsert_and_are_recorded(self):
+        cluster_results = [
+            {"cluster": "cluster-a", "status": "failed", "resources_fetched": 0, "error": "timeout"}
+        ]
+        with patch.object(k8s_ingest, "fetch_k8s_prometheus_result", return_value={
+            "items": [], "cluster_results": cluster_results,
+        }):
+            with patch.object(k8s_ingest, "run_upsert_with_data") as upsert:
+                with patch.object(k8s_ingest, "mark_external_update_failed") as failed:
+                    with self.assertRaisesRegex(RuntimeError, "所有 K8S Prometheus 集群拉取失败"):
+                        k8s_ingest.run_k8s_prometheus_upsert()
+
+        upsert.assert_not_called()
+        self.assertEqual(failed.call_args.kwargs["cluster_results"], cluster_results)
+
+    def test_k8s_ingest_downstream_failure_overrides_cluster_success(self):
+        cluster_results = [
+            {"cluster": "cluster-a", "status": "success", "resources_fetched": 1}
+        ]
+        with patch.object(k8s_ingest, "fetch_k8s_prometheus_result", return_value={
+            "items": [{"resource_id": "k8s:cluster-a:ns:deployment:api"}],
+            "cluster_results": cluster_results,
+        }):
+            with patch.object(k8s_ingest, "run_upsert_with_data", return_value={
+                "success": False, "error": "raw write failed",
+            }):
+                with patch.object(k8s_ingest, "mark_external_update_failed") as failed:
+                    result = k8s_ingest.run_k8s_prometheus_upsert()
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(failed.call_args.kwargs["cluster_results"], cluster_results)
 
 
 if __name__ == "__main__":
