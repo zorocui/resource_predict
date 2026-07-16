@@ -223,6 +223,38 @@
     return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
   }
 
+  function updateHistoryStatus(record) {
+    if (record.status === "partial_success") {
+      return { label: "部分成功", className: "is-partial" };
+    }
+    if (record.status === "success") {
+      return { label: "成功", className: "is-success" };
+    }
+    return { label: "失败", className: "is-failed" };
+  }
+
+  function renderClusterResults(value) {
+    const clusters = Array.isArray(value) ? value : [];
+    if (!clusters.length) return "";
+    const rows = clusters.map((cluster) => {
+      const success = cluster.status === "success";
+      const status = success ? "成功" : "失败";
+      const count = success ? `${Number(cluster.resources_fetched || 0)} 个 Workload` : "";
+      const duration = cluster.elapsed_seconds == null ? "" : formatDuration(cluster.elapsed_seconds);
+      const detail = success
+        ? [count, duration].filter(Boolean).join(" · ")
+        : [cluster.error || "未知错误", duration].filter(Boolean).join(" · ");
+      return `
+        <li class="${success ? "is-success" : "is-failed"}">
+          <strong>${list.escapeHtml(cluster.cluster || "未命名集群")}</strong>
+          <span>${status}</span>
+          <small>${list.escapeHtml(detail)}</small>
+        </li>
+      `;
+    }).join("");
+    return `<ul class="update-history-clusters" aria-label="逐集群拉取结果">${rows}</ul>`;
+  }
+
   function renderUpdateHistory(records) {
     if (!app.els.updateHistory) return;
     const items = Array.isArray(records) ? records : [];
@@ -231,16 +263,16 @@
       return;
     }
     app.els.updateHistory.innerHTML = items.map((record) => {
-      const success = record.status === "success";
-      const statusLabel = success ? "成功" : "失败";
+      const status = updateHistoryStatus(record);
       const source = record.task_source || "数据更新";
       const windowLabel = record.fetch_window_label || "未指定拉取窗口";
-      const detail = record.error || record.message || (success ? "更新完成" : "更新失败");
+      const detail = record.error || record.message || (record.status === "failed" ? "更新失败" : "更新完成");
+      const clusterResults = renderClusterResults(record.cluster_results);
       return `
-        <article class="update-history-item ${success ? "is-success" : "is-failed"}">
+        <article class="update-history-item ${status.className}">
           <div class="update-history-main">
             <div class="update-history-title">
-              <span class="update-history-status">${statusLabel}</span>
+              <span class="update-history-status">${status.label}</span>
               <strong>${list.escapeHtml(source)}</strong>
               <span>${list.escapeHtml(windowLabel)}</span>
             </div>
@@ -250,6 +282,7 @@
               <span>耗时 ${list.escapeHtml(formatDuration(record.elapsed_seconds))}</span>
             </div>
             <p>${list.escapeHtml(detail)}</p>
+            ${clusterResults}
           </div>
           <div class="update-history-counts" aria-label="本次更新统计">
             <span><b>${Number(record.resources_updated || 0)}</b> 更新</span>

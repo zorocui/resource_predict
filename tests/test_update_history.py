@@ -198,6 +198,13 @@ class UpdateHistoryIntegrationTest(unittest.TestCase):
         self.assertIn('id="update-history"', template)
         self.assertIn("/api/update-history?limit=20", script)
         self.assertIn("refreshUpdateHistory();", script)
+        self.assertIn('record.status === "partial_success"', script)
+        self.assertIn("record.cluster_results", script)
+        self.assertIn("list.escapeHtml(cluster.cluster", script)
+        self.assertIn("update-history-clusters", script)
+        stylesheet = (root / "static" / "css" / "index.css").read_text(encoding="utf-8")
+        self.assertIn(".update-history-item.is-partial", stylesheet)
+        self.assertIn(".update-history-clusters", stylesheet)
 
 
 if __name__ == "__main__":
