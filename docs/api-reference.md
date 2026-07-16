@@ -58,7 +58,35 @@
 | POST | `/api/update-data` | 推送增量数据，仅更新已有资源（异步） |
 | POST | `/api/upsert-data` | 推送数据，更新或新增资源（异步） |
 
-更新任务成功或失败后都会写入 `outputs/update_history.json`，应用重启后仍可查询。系统按完成时间从新到旧保留最近 100 条；历史文件读取或写入异常只记录日志，不影响数据更新主流程。历史记录包含任务来源、拉取窗口、开始/结束时间、耗时、资源和数据点统计以及错误信息。
+更新任务成功、部分成功或失败后都会写入 `outputs/update_history.json`，应用重启后仍可查询。系统按完成时间从新到旧保留最近 100 条；历史文件读取或写入异常只记录日志，不影响数据更新主流程。历史记录包含任务来源、拉取窗口、开始/结束时间、耗时、资源和数据点统计以及错误信息。整体 `status` 可为 `success`、`partial_success` 或 `failed`；K8S Prometheus 更新还通过 `cluster_results` 记录每个集群的 `success` / `failed`、Workload 数、耗时和错误。
+
+```json
+{
+  "records": [
+    {
+      "status": "partial_success",
+      "task_source": "页面手动拉取",
+      "fetch_window_label": "增量窗口：最近 7 小时",
+      "cluster_results": [
+        {
+          "cluster": "cluster-a",
+          "status": "success",
+          "resources_fetched": 32,
+          "elapsed_seconds": 12.4,
+          "error": null
+        },
+        {
+          "cluster": "cluster-b",
+          "status": "failed",
+          "resources_fetched": 0,
+          "elapsed_seconds": 3.1,
+          "error": "Prometheus timeout"
+        }
+      ]
+    }
+  ]
+}
+```
 
 ### 更新触发（同步）
 

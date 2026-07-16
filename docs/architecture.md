@@ -223,7 +223,9 @@ VM 数据写入 `outputs/vm/`，K8S 数据写入 `outputs/k8s/`。两个目录�
 
 所有模式共享同一个排他锁 `_update_exclusive`，保证“按 ID 读取目标 raw -> 合并 -> 写入变化分片 -> 原子替换索引 -> 重预测”序列的完整性。资源分片不可变并采用内容寻址，不再复制整份 raw 备份。
 
-每个更新任务进入成功或失败终态时，`services/update_history.py` 会将摘要原子写入 `outputs/update_history.json`。该文件按完成时间倒序保留最近 100 条，供 `GET /api/update-history` 和“数据更新”页面读取。历史存储与更新结果隔离：文件缺失或损坏时返回空历史，写入失败只记录日志，不改变采集、合并或预测结果。
+每个更新任务进入成功、部分成功或失败终态时，`services/update_history.py` 会将摘要原子写入 `outputs/update_history.json`。该文件按完成时间倒序保留最近 100 条，供 `GET /api/update-history` 和“数据更新”页面读取。历史存储与更新结果隔离：文件缺失或损坏时返回空历史，写入失败只记录日志，不改变采集、合并或预测结果。
+
+K8S Prometheus 更新还保存 `cluster_results`：每个目标集群分别记录成功/失败、Workload 数、耗时和错误。只要成功集群的数据完成 upsert 与预测，多集群混合结果记为 `partial_success`；全部集群失败或后续写入/预测失败时记为 `failed`。部分失败不会丢弃成功集群的数据。
 
 ```text
 Pull:       POST /api/update-trigger -> run_update -> IncrementalProvider -> _do_update
