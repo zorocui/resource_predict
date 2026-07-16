@@ -129,6 +129,7 @@ _update_status: Dict[str, Any] = {
     "total_new_points": 0,
     "task_source": "",
     "fetch_window_label": "",
+    "cluster_results": [],
 }
 
 _stop_event = threading.Event()
@@ -161,6 +162,7 @@ def mark_external_update_started(
         _update_status["last_result"] = None
         _update_status["task_source"] = ""
         _update_status["fetch_window_label"] = ""
+        _update_status["cluster_results"] = []
         if message:
             _update_status["message"] = message
         if isinstance(metadata, dict):
@@ -168,15 +170,29 @@ def mark_external_update_started(
                 value = metadata.get(key)
                 if value is not None:
                     _update_status[key] = str(value)
+            cluster_results = metadata.get("cluster_results")
+            if isinstance(cluster_results, list):
+                _update_status["cluster_results"] = [
+                    dict(item) for item in cluster_results if isinstance(item, dict)
+                ]
 
 
-def mark_external_update_failed(error: str, phase: str = "error") -> None:
+def mark_external_update_failed(
+    error: str,
+    phase: str = "error",
+    *,
+    cluster_results: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     with _lock:
         _update_status["running"] = False
         _update_status["phase"] = phase
         _update_status["last_error"] = error
         _update_status["last_finished_at"] = time.time()
         _update_status["message"] = error
+        if cluster_results is not None:
+            _update_status["cluster_results"] = [
+                dict(item) for item in cluster_results if isinstance(item, dict)
+            ]
     _record_current_update_history(error=error)
 
 
@@ -191,6 +207,9 @@ def mark_external_update_finished(result: Dict[str, Any]) -> None:
         _update_status["resources_created"] = int(result.get("resources_created") or 0)
         _update_status["predicted_resources"] = int(result.get("predicted_resources") or 0)
         _update_status["created_resource_ids"] = list(result.get("created_resource_ids") or [])
+        _update_status["cluster_results"] = [
+            dict(item) for item in result.get("cluster_results") or [] if isinstance(item, dict)
+        ]
         _update_status["total_updates"] += 1
         _update_status["total_new_points"] += int(result.get("total_new_points") or 0)
         _update_status["message"] = "K8S Prometheus 数据拉取完成"
@@ -212,12 +231,19 @@ def _record_current_update_history(
             return
     result_data = result if isinstance(result, dict) else {}
     error_text = str(error or result_data.get("error") or status.get("last_error") or "")
-    success = bool(result_data.get("success")) and not error_text
+    requested_status = str(result_data.get("status") or "")
+    if requested_status not in {"success", "partial_success", "failed"}:
+        requested_status = "success" if bool(result_data.get("success")) and not error_text else "failed"
     record = {
-        "status": "success" if success else "failed",
+        "status": requested_status if not error_text else "failed",
         "phase": status.get("phase"),
         "task_source": status.get("task_source"),
         "fetch_window_label": status.get("fetch_window_label"),
+        "cluster_results": [
+            dict(item)
+            for item in (result_data.get("cluster_results") or status.get("cluster_results") or [])
+            if isinstance(item, dict)
+        ],
         "started_at": started_at,
         "finished_at": status.get("last_finished_at") or time.time(),
         "elapsed_seconds": result_data.get("elapsed_seconds"),

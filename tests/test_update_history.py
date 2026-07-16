@@ -19,6 +19,50 @@ from resource_predict.services.update_history import (
 
 
 class UpdateHistoryStoreTest(unittest.TestCase):
+    def test_partial_success_and_cluster_results_are_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            append_update_history(
+                {
+                    "status": "partial_success",
+                    "finished_at": 20,
+                    "cluster_results": [
+                        {
+                            "cluster": "cluster-a",
+                            "status": "success",
+                            "resources_fetched": "3",
+                            "elapsed_seconds": "1.236",
+                            "prometheus_url": "http://must-not-persist",
+                        },
+                        {
+                            "cluster": "cluster-b",
+                            "status": "failed",
+                            "resources_fetched": -1,
+                            "error": "timeout",
+                        },
+                    ],
+                },
+                out_dir=tmp,
+            )
+            record = get_update_history(out_dir=tmp)[0]
+
+        self.assertEqual(record["status"], "partial_success")
+        self.assertEqual(record["cluster_results"][0]["resources_fetched"], 3)
+        self.assertEqual(record["cluster_results"][0]["elapsed_seconds"], 1.24)
+        self.assertNotIn("prometheus_url", record["cluster_results"][0])
+        self.assertEqual(record["cluster_results"][1]["resources_fetched"], 0)
+
+    def test_old_history_record_gets_empty_cluster_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = update_history_path(tmp)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                "version": 1,
+                "records": [{"id": "legacy-1", "status": "success", "finished_at": 10}],
+            }), encoding="utf-8")
+            record = get_update_history(out_dir=tmp)[0]
+
+        self.assertEqual(record["cluster_results"], [])
+
     def test_history_is_persistent_sorted_and_capped(self):
         with tempfile.TemporaryDirectory() as tmp:
             for idx in range(UPDATE_HISTORY_RETENTION + 5):
@@ -102,6 +146,35 @@ class UpdateHistoryIntegrationTest(unittest.TestCase):
         record = append.call_args.args[0]
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["error"], "Prometheus timeout")
+
+    def test_external_partial_success_writes_cluster_results(self):
+        cluster_results = [
+            {"cluster": "cluster-a", "status": "success", "resources_fetched": 2},
+            {"cluster": "cluster-b", "status": "failed", "resources_fetched": 0, "error": "timeout"},
+        ]
+        with patch.object(updater, "append_update_history", return_value=True) as append:
+            updater.mark_external_update_started("fetching", "正在拉取")
+            updater.mark_external_update_finished({
+                "success": True,
+                "status": "partial_success",
+                "cluster_results": cluster_results,
+            })
+
+        record = append.call_args.args[0]
+        self.assertEqual(record["status"], "partial_success")
+        self.assertEqual(record["cluster_results"], cluster_results)
+
+    def test_external_failure_keeps_cluster_results(self):
+        cluster_results = [
+            {"cluster": "cluster-a", "status": "failed", "resources_fetched": 0, "error": "timeout"}
+        ]
+        with patch.object(updater, "append_update_history", return_value=True) as append:
+            updater.mark_external_update_started("fetching", "正在拉取")
+            updater.mark_external_update_failed("all failed", cluster_results=cluster_results)
+
+        record = append.call_args.args[0]
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["cluster_results"], cluster_results)
 
     def test_history_api_validates_limit_and_returns_records(self):
         app = Flask(__name__)

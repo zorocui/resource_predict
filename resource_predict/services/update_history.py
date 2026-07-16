@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 UPDATE_HISTORY_FILENAME = "update_history.json"
 UPDATE_HISTORY_RETENTION = 100
+_TERMINAL_STATUSES = {"success", "partial_success", "failed"}
 _history_lock = threading.Lock()
 
 
@@ -67,7 +68,7 @@ def _read_records(path: Path) -> List[Dict[str, Any]]:
     if not isinstance(records, list):
         logger.error("[update_history] invalid history payload: %s", path)
         return []
-    valid = [dict(item) for item in records if isinstance(item, dict)]
+    valid = [_normalize_record(item) for item in records if isinstance(item, dict)]
     valid.sort(key=lambda item: float(item.get("finished_at") or 0), reverse=True)
     return valid[:UPDATE_HISTORY_RETENTION]
 
@@ -79,12 +80,16 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     if elapsed is None and started_at is not None:
         elapsed = max(0.0, finished_at - started_at)
     suffix = time.time_ns() % 1_000_000
+    status = str(record.get("status") or "failed")
+    if status not in _TERMINAL_STATUSES:
+        status = "failed"
     return {
         "id": str(record.get("id") or f"update-{int(finished_at * 1000)}-{suffix}"),
-        "status": "success" if record.get("status") == "success" else "failed",
+        "status": status,
         "phase": str(record.get("phase") or "idle"),
         "task_source": str(record.get("task_source") or "数据更新"),
         "fetch_window_label": str(record.get("fetch_window_label") or ""),
+        "cluster_results": _normalize_cluster_results(record.get("cluster_results")),
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_seconds": round(elapsed, 2) if elapsed is not None else None,
@@ -95,6 +100,27 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "message": str(record.get("message") or ""),
         "error": str(record.get("error")) if record.get("error") else None,
     }
+
+
+def _normalize_cluster_results(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    results: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        cluster = str(item.get("cluster") or "").strip()
+        if not cluster:
+            continue
+        elapsed = _optional_float(item.get("elapsed_seconds"))
+        results.append({
+            "cluster": cluster,
+            "status": "success" if item.get("status") == "success" else "failed",
+            "resources_fetched": _non_negative_int(item.get("resources_fetched")),
+            "elapsed_seconds": round(elapsed, 2) if elapsed is not None else None,
+            "error": str(item.get("error")) if item.get("error") else None,
+        })
+    return results
 
 
 def _optional_float(value: Any) -> Optional[float]:
