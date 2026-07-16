@@ -82,15 +82,40 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def k8s_workload_prometheus_provider(
+def _cluster_fetch_result(
+    cluster: str,
+    status: str,
+    *,
+    resources_fetched: int = 0,
+    elapsed_seconds: Optional[float] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "cluster": str(cluster),
+        "status": "success" if status == "success" else "failed",
+        "resources_fetched": max(0, int(resources_fetched)),
+        "elapsed_seconds": round(float(elapsed_seconds), 2) if elapsed_seconds is not None else None,
+        "error": str(error) if error else None,
+    }
+
+
+def _missing_cluster_result(cluster: str) -> Dict[str, Any]:
+    return _cluster_fetch_result(
+        cluster,
+        "failed",
+        error=f"未找到 K8S Prometheus 集群配置: {cluster}",
+    )
+
+
+def fetch_k8s_workload_prometheus_result(
     *,
     resources: int,
     n: int,
     freq: str,
     clusters: Optional[Iterable[str]] = None,
     history_hours: Optional[float] = None,
-) -> List[Dict[str, Any]]:
-    """Fetch K8S controller-level workload resources from Prometheus.
+) -> Dict[str, Any]:
+    """Fetch K8S Workloads and report the result of every target cluster.
 
     ``resources <= 0`` means unlimited, which is useful for production upsert.
     The ``n`` and ``freq`` arguments are accepted for compatibility with the
@@ -101,10 +126,8 @@ def k8s_workload_prometheus_provider(
     wanted = {str(x).strip() for x in clusters or [] if str(x).strip()}
     if wanted:
         targets = [target for target in targets if target.cluster in wanted]
-        missing = wanted - {target.cluster for target in targets}
-        if missing:
-            raise ValueError(f"未找到 K8S Prometheus 集群配置: {', '.join(sorted(missing))}")
-    if not targets:
+    missing = sorted(wanted - {target.cluster for target in targets})
+    if not targets and not missing:
         raise ValueError(
             "请配置 settings.k8s_prometheus.clusters，"
             "或环境变量 K8S_PROMETHEUS_CLUSTERS"
@@ -112,7 +135,7 @@ def k8s_workload_prometheus_provider(
 
     limit = int(resources or 0)
     out: List[Dict[str, Any]] = []
-    errors: List[str] = []
+    cluster_results: List[Dict[str, Any]] = []
     started_at = _utc_timestamp()
     started_perf = time.perf_counter()
     logger.info(
@@ -124,6 +147,15 @@ def k8s_workload_prometheus_provider(
         started_at,
     )
     for target in targets:
+        if bool(cfg.fail_fast) and any(item["status"] == "failed" for item in cluster_results):
+            cluster_results.append(
+                _cluster_fetch_result(
+                    target.cluster,
+                    "failed",
+                    error="因 fail_fast 在前序集群失败后未执行",
+                )
+            )
+            continue
         target_started_at = _utc_timestamp()
         target_started_perf = time.perf_counter()
         fetched_count = 0
@@ -142,8 +174,18 @@ def k8s_workload_prometheus_provider(
             )
             items = _fetch_target(target, remaining, history_hours=history_hours)
             fetched_count = len(items)
+            if not items:
+                raise RuntimeError("Prometheus 未返回可聚合的 K8S Workload")
             out.extend(items)
             target_finished_at = _utc_timestamp()
+            cluster_results.append(
+                _cluster_fetch_result(
+                    target.cluster,
+                    "success",
+                    resources_fetched=fetched_count,
+                    elapsed_seconds=time.perf_counter() - target_started_perf,
+                )
+            )
             logger.info(
                 "[k8s_prometheus] fetch target finished: cluster=%s resources=%d elapsed=%.2fs "
                 "started_at=%s finished_at=%s",
@@ -154,9 +196,16 @@ def k8s_workload_prometheus_provider(
                 target_finished_at,
             )
         except Exception as exc:
-            msg = f"{target.cluster}({target.prometheus_url}): {exc}"
-            errors.append(msg)
             target_finished_at = _utc_timestamp()
+            cluster_results.append(
+                _cluster_fetch_result(
+                    target.cluster,
+                    "failed",
+                    resources_fetched=fetched_count,
+                    elapsed_seconds=time.perf_counter() - target_started_perf,
+                    error=str(exc),
+                )
+            )
             logger.error(
                 "[k8s_prometheus] fetch target failed: cluster=%s resources=%d elapsed=%.2fs "
                 "started_at=%s finished_at=%s error=%s",
@@ -167,8 +216,8 @@ def k8s_workload_prometheus_provider(
                 target_finished_at,
                 exc,
             )
-            if cfg.fail_fast:
-                raise RuntimeError(f"K8S Prometheus 拉取失败: {msg}") from exc
+
+    cluster_results.extend(_missing_cluster_result(cluster) for cluster in missing)
 
     finished_at = _utc_timestamp()
     logger.info(
@@ -176,14 +225,31 @@ def k8s_workload_prometheus_provider(
         "started_at=%s finished_at=%s",
         len(out),
         len(targets),
-        len(errors),
+        sum(1 for item in cluster_results if item["status"] == "failed"),
         time.perf_counter() - started_perf,
         started_at,
         finished_at,
     )
-    if not out and errors:
-        raise RuntimeError("所有 K8S Prometheus 集群拉取失败: " + "；".join(errors))
-    return out
+    return {"items": out, "cluster_results": cluster_results}
+
+
+def k8s_workload_prometheus_provider(
+    *,
+    resources: int,
+    n: int,
+    freq: str,
+    clusters: Optional[Iterable[str]] = None,
+    history_hours: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Compatibility wrapper returning only fetched K8S Workload items."""
+    result = fetch_k8s_workload_prometheus_result(
+        resources=resources,
+        n=n,
+        freq=freq,
+        clusters=clusters,
+        history_hours=history_hours,
+    )
+    return list(result["items"])
 
 
 def diagnose_k8s_prometheus(

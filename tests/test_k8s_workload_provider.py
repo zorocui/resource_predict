@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -14,6 +15,19 @@ from resource_predict.providers.k8s_prometheus import PrometheusTarget
 
 BASE_TS = 1_700_000_000
 GIB = 1024 ** 3
+
+
+def _target(cluster: str) -> PrometheusTarget:
+    return PrometheusTarget(
+        cluster=cluster,
+        prometheus_url=f"http://{cluster}.example",
+        namespace_regex="",
+        bearer_token="",
+        basic_auth="",
+        history_days=1,
+        step_seconds=300,
+        request_timeout_seconds=5,
+    )
 
 
 class FakePrometheusClient:
@@ -198,6 +212,97 @@ class K8SWorkloadProviderTest(unittest.TestCase):
     def setUp(self):
         FakePrometheusClient.queries = []
         FakePrometheusClient.range_calls = []
+
+    def test_structured_fetch_reports_all_clusters_successful(self):
+        targets = [_target("cluster-a"), _target("cluster-b")]
+
+        def fake_fetch(target, limit, *, history_hours=None):
+            return [{"resource_id": f"k8s:{target.cluster}:ns:deployment:api"}]
+
+        with patch.object(provider, "_resolve_targets", return_value=targets):
+            with patch.object(provider, "_fetch_target", side_effect=fake_fetch):
+                with patch.object(provider, "settings", SimpleNamespace(
+                    k8s_prometheus=SimpleNamespace(fail_fast=False)
+                )):
+                    result = provider.fetch_k8s_workload_prometheus_result(
+                        resources=0, n=0, freq="5min"
+                    )
+
+        self.assertEqual(len(result["items"]), 2)
+        self.assertEqual(
+            [(row["cluster"], row["status"]) for row in result["cluster_results"]],
+            [("cluster-a", "success"), ("cluster-b", "success")],
+        )
+
+    def test_structured_fetch_reports_partial_success(self):
+        targets = [_target("cluster-a"), _target("cluster-b")]
+
+        def fake_fetch(target, limit, *, history_hours=None):
+            if target.cluster == "cluster-b":
+                raise TimeoutError("Prometheus timeout")
+            return [{"resource_id": "k8s:cluster-a:ns:deployment:api"}]
+
+        with patch.object(provider, "_resolve_targets", return_value=targets):
+            with patch.object(provider, "_fetch_target", side_effect=fake_fetch):
+                with patch.object(provider, "settings", SimpleNamespace(
+                    k8s_prometheus=SimpleNamespace(fail_fast=False)
+                )):
+                    result = provider.fetch_k8s_workload_prometheus_result(
+                        resources=0, n=0, freq="5min"
+                    )
+
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(
+            [(row["cluster"], row["status"]) for row in result["cluster_results"]],
+            [("cluster-a", "success"), ("cluster-b", "failed")],
+        )
+        self.assertIn("Prometheus timeout", result["cluster_results"][1]["error"])
+
+    def test_structured_fetch_marks_empty_and_missing_clusters_failed(self):
+        with patch.object(provider, "_resolve_targets", return_value=[_target("cluster-a")]):
+            with patch.object(provider, "_fetch_target", return_value=[]):
+                with patch.object(provider, "settings", SimpleNamespace(
+                    k8s_prometheus=SimpleNamespace(fail_fast=False)
+                )):
+                    result = provider.fetch_k8s_workload_prometheus_result(
+                        resources=0,
+                        n=0,
+                        freq="5min",
+                        clusters=["cluster-a", "cluster-missing"],
+                    )
+
+        by_cluster = {row["cluster"]: row for row in result["cluster_results"]}
+        self.assertIn("未返回可聚合", by_cluster["cluster-a"]["error"])
+        self.assertIn("未找到 K8S Prometheus 集群配置", by_cluster["cluster-missing"]["error"])
+
+    def test_structured_fetch_records_fail_fast_targets_without_calling_them(self):
+        calls = []
+
+        def fake_fetch(target, limit, *, history_hours=None):
+            calls.append(target.cluster)
+            raise RuntimeError("boom")
+
+        with patch.object(provider, "_resolve_targets", return_value=[_target("cluster-a"), _target("cluster-b")]):
+            with patch.object(provider, "_fetch_target", side_effect=fake_fetch):
+                with patch.object(provider, "settings", SimpleNamespace(
+                    k8s_prometheus=SimpleNamespace(fail_fast=True)
+                )):
+                    result = provider.fetch_k8s_workload_prometheus_result(
+                        resources=0, n=0, freq="5min"
+                    )
+
+        self.assertEqual(calls, ["cluster-a"])
+        self.assertEqual([row["status"] for row in result["cluster_results"]], ["failed", "failed"])
+        self.assertIn("fail_fast", result["cluster_results"][1]["error"])
+
+    def test_list_provider_remains_compatible(self):
+        structured = {
+            "items": [{"resource_id": "k8s:cluster-a:ns:deployment:api"}],
+            "cluster_results": [],
+        }
+        with patch.object(provider, "fetch_k8s_workload_prometheus_result", return_value=structured):
+            items = provider.k8s_workload_prometheus_provider(resources=0, n=0, freq="5min")
+        self.assertEqual(items, structured["items"])
 
     def test_resolve_targets_prefers_file_config(self):
         with tempfile.TemporaryDirectory() as tmp:
