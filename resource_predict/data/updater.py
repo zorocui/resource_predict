@@ -251,7 +251,9 @@ def _record_current_update_history(
         "resources_created": result_data.get("resources_created", status.get("resources_created")),
         "predicted_resources": result_data.get("predicted_resources", status.get("predicted_resources")),
         "total_new_points": result_data.get("total_new_points", 0),
-        "message": status.get("message") or ("数据更新完成" if success else error_text),
+        "message": status.get("message") or (
+            "数据更新完成" if requested_status != "failed" and not error_text else error_text
+        ),
         "error": error_text or None,
     }
     if append_update_history(record, out_dir=out_dir):
