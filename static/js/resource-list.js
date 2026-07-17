@@ -184,6 +184,54 @@
     return metricKey;
   }
 
+  const K8S_METRIC_SPEC_FIELDS = {
+    cpu_limit: "cpu_limit_cores",
+    cpu_request: "cpu_request_cores",
+    memory_limit: "memory_limit_gb",
+    memory_request: "memory_request_gb",
+  };
+
+  function k8sContainerNames(item) {
+    const spec = item?.spec || {};
+    const containers = spec.containers && typeof spec.containers === "object" && !Array.isArray(spec.containers)
+      ? spec.containers
+      : {};
+    const names = new Set(Object.keys(containers).map((name) => String(name || "").trim()).filter(Boolean));
+    if (Array.isArray(spec.containers_observed)) {
+      spec.containers_observed.forEach((name) => {
+        const value = String(name || "").trim();
+        if (value) names.add(value);
+      });
+    }
+    return { containers, names: Array.from(names) };
+  }
+
+  function k8sWorkloadUsagePresentation(item, metricKey, displayUnit) {
+    const isPercent = displayUnit === "percent";
+    const label = isPercent ? "Workload 聚合 P95" : "Workload 汇总 P95";
+    const lines = [];
+    if (isPercent) {
+      const denominator = String(metricKey).endsWith("_request") ? "Request" : "Limit";
+      lines.push(`统计口径：参与容器使用量总和 ÷ ${denominator} 总和，不是容器使用率的算术平均。`);
+      const { containers, names } = k8sContainerNames(item);
+      const field = K8S_METRIC_SPEC_FIELDS[metricKey];
+      if (!field || !names.length) {
+        lines.push("参与容器：范围信息缺失。");
+      } else {
+        const participating = names.filter((name) => {
+          const value = Number(containers[name]?.[field]);
+          return Number.isFinite(value) && value > 0;
+        }).length;
+        lines.push(`参与计算：${participating}/${names.length} 个容器。`);
+      }
+    } else {
+      lines.push("统计口径：有该指标数据的观测容器使用量之和。");
+      lines.push("参与范围：有该指标数据的观测容器。");
+    }
+    lines.push("统计范围：完整历史观测窗口的 P95。");
+    return { label, tooltip: lines.join("\n") };
+  }
+
   function metricStatsFor(item, metricKey) {
     const advice = item?.scaling_advice || {};
     const stats = advice.stats || {};
@@ -380,9 +428,15 @@
       const representative = representativeK8sMetricStats(item, baseKey, action);
       const stat = representative.stats;
       const unit = resolveDisplayUnit(item, representative.key);
-      const p95 = stat.p95 !== undefined ? `P95 ${formatStatValue(stat.p95, unit)} · Workload` : actionLabel(action);
+      const presentation = k8sWorkloadUsagePresentation(item, representative.key, unit);
+      const p95 = stat.p95 !== undefined
+        ? `${presentation.label} ${formatStatValue(stat.p95, unit)}`
+        : actionLabel(action);
       const label = metricTitleFor(item, representative.key);
-      chips.push(`<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(label)} ${escapeHtml(p95)}</span>`);
+      const scopeInfo = stat.p95 !== undefined
+        ? ` ${infoTooltip(presentation.tooltip, `${label} Workload 聚合口径`)}`
+        : "";
+      chips.push(`<span class="metric-pill is-${escapeHtml(action)}">${escapeHtml(label)} · ${escapeHtml(p95)}${scopeInfo}</span>`);
     });
     return chips.join("");
   }
@@ -962,12 +1016,14 @@
     historyCoverageLabel,
     infoTooltip,
     isK8s,
+    k8sWorkloadUsagePresentation,
     analysisOnlyReasons,
     metricActionFor,
     containerMetricActionFor,
     metricKeysFor,
     metricTitleFor,
     metricObservedStatsFor,
+    metricSummary,
     containerMetricObservedStatsFor,
     representativeContainerName,
     metricStatsFor,
