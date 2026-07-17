@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import unittest
 
 from resource_predict.services.urgency import compute_urgency_breakdown, compute_urgency_score
@@ -65,6 +66,60 @@ class UrgencyScoreTest(unittest.TestCase):
         self.assertEqual(breakdown["score"], compute_urgency_score(item, settings.decision))
         self.assertTrue(breakdown["components"])
         self.assertTrue(breakdown["metric_scores"])
+
+    def test_k8s_residual_disk_data_does_not_affect_urgency(self):
+        clean = self._k8s_scale_in_item(
+            analysis_only=False,
+            ready_for_execution=True,
+            target_spec={"replicas": 1},
+        )
+        dirty = copy.deepcopy(clean)
+        dirty["spec"]["disk_gb"] = 100
+        dirty["scaling_advice"]["target_spec"]["disk_gb"] = 50
+        dirty["scaling_advice"]["metric_actions"]["disk"] = "scale_in_candidate"
+        dirty["scaling_advice"]["stats"]["disk"] = {
+            "avg": 0.01,
+            "p95": 0.01,
+            "peak": 0.01,
+            "gap": 0.0,
+        }
+
+        clean_breakdown = compute_urgency_breakdown(clean, settings.decision)
+        dirty_breakdown = compute_urgency_breakdown(dirty, settings.decision)
+
+        self.assertEqual(dirty_breakdown["score"], clean_breakdown["score"])
+        self.assertEqual(
+            [entry["metric"] for entry in dirty_breakdown["metric_scores"]],
+            ["cpu", "memory"],
+        )
+
+    def test_vm_disk_signal_still_contributes_to_urgency(self):
+        item = {
+            "resource_id": "vm:cluster-a:server-1",
+            "resource_type": "openstack_vm",
+            "spec": {"cpu_cores": 4, "memory_gb": 8, "disk_gb": 100},
+            "scaling_advice": {
+                "action": "scale_out",
+                "confidence": "high",
+                "metric_actions": {"disk": "scale_out"},
+                "risk_profile": {"risk_score": 80.0},
+                "stats": {
+                    "disk": {
+                        "avg": 0.9,
+                        "p95": 0.95,
+                        "peak": 0.98,
+                        "gap": 0.08,
+                    }
+                },
+                "target_spec": {"cpu_cores": 4, "memory_gb": 8, "disk_gb": 150},
+            },
+        }
+
+        breakdown = compute_urgency_breakdown(item, settings.decision)
+
+        metric_scores = {entry["metric"]: entry["value"] for entry in breakdown["metric_scores"]}
+        self.assertIn("disk", metric_scores)
+        self.assertGreater(metric_scores["disk"], 0.0)
 
 
 if __name__ == "__main__":

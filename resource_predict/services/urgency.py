@@ -17,6 +17,8 @@ def compute_urgency_breakdown(item: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
     advice = item.get("scaling_advice", {}) if isinstance(item, dict) else {}
     if not isinstance(advice, dict):
         return {"score": 0.0, "components": []}
+    resource_type = resource_type_of(item)
+    urgency_metrics = ("cpu", "memory") if resource_type == "k8s_workload" else ("cpu", "memory", "disk")
     action = str(advice.get("action", "hold")).lower()
     confidence = str(advice.get("confidence", "medium")).lower()
     if action == "hold":
@@ -55,11 +57,9 @@ def compute_urgency_breakdown(item: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
         if not isinstance(spec, dict) or not isinstance(target, dict):
             return 0.0
         ratios = []
-        # VM 维度键
         vm_dims = ("cpu_cores", "memory_gb", "disk_gb")
-        # K8S 维度键（request 优先，回退到通用键）
         k8s_dims = ("cpu_request_cores", "cpu_cores", "memory_request_gb", "memory_gb")
-        all_dims = vm_dims + k8s_dims
+        all_dims = k8s_dims if resource_type == "k8s_workload" else vm_dims
         checked: set = set()
         for dim in all_dims:
             cur = parse_float_or_none(spec.get(dim)) or 0.0
@@ -93,7 +93,7 @@ def compute_urgency_breakdown(item: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
     }.get(confidence, 2.0)
 
     metric_scores: List[Dict[str, Any]] = []
-    for metric in ("cpu", "memory", "disk"):
+    for metric in urgency_metrics:
         st = stats.get(metric, {})
         if not isinstance(st, dict):
             continue
