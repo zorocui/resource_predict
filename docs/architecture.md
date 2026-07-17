@@ -376,6 +376,8 @@ sequenceDiagram
 
 紧急度里的“指标贡献”用于排序优先级，和置信度章节中的“指标得分”不是同一套权重。它只对触发扩缩容动作的指标计算；`hold` 指标不会进入 `urgency_breakdown.metric_scores`。
 
+参与紧急度计算的指标按资源类型过滤：OpenStack VM 使用 CPU、内存和磁盘；K8S Workload 仅使用 CPU 和内存。K8S 旧产物或异常输入中即使残留 `disk` 统计、动作或目标规格，磁盘也不会进入指标贡献、多指标加成或目标变化分。
+
 扩容类指标贡献：
 
 ```text
