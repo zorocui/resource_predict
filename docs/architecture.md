@@ -305,6 +305,7 @@ sequenceDiagram
 
 - **当前资源规格**：K8S 当前 request/limit 只保存在 `spec.containers.<container>`，不保留 Workload 级累加 request/limit 字段；前端也按 container 粒度展示。
 - **Container 级预测**：K8S Workload 仍是资源主体；provider 同时输出 Workload 聚合 `metrics` 和 `container_metrics.<container>.<metric>`。预测产物保留 Workload 聚合 `charts`，并新增 `container_charts.<container>.<metric>` 供详情页在同一 ECharts 图中绘制多条 container 曲线。
+- **风险队列统计范围**：K8S 指标胶囊展示完整历史观测窗口的 Workload 聚合 P95。百分比按参与容器使用量总和除以对应 Request/Limit 总和计算，并显示参与容器数；这不是容器使用率的算术平均。详情抽屉的统计在容器图表加载后展示当前选中 Container 的范围，两者通过标签和提示明确区分。
 - **扩容判断**：基于 `cpu_limit` / `memory_limit`，P95 >= 0.8 或峰值 >= 0.9；没有 limit 时不提出扩容建议
 - **缩容判断**：基于 `cpu_request` / `memory_request`，均值 < 0.2 且 P95 < 0.35
 - **数据质量**：`_quality_level()` 评估每个指标的数据质量，poor 质量自动跳过执行建议
