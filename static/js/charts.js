@@ -22,13 +22,19 @@
     { key: "peak", label: "峰值" },
     { key: "raw", label: "原始" },
   ];
+  function isValidChartValue(value) {
+    if (value === null || value === undefined) return false;
+    if (typeof value === "string" && !value.trim()) return false;
+    return Number.isFinite(Number(value));
+  }
+
   function toPairs(xMs, y) {
     const res = [];
     for (let i = 0; i < xMs.length; i++) {
       let ts = xMs[i];
       if (typeof ts === "number" && ts < 1e12) ts *= 1000;
-      const val = Number(y[i]);
-      if (Number.isFinite(ts) && Number.isFinite(val)) res.push([ts, val]);
+      if (!Number.isFinite(ts) || !isValidChartValue(y[i])) continue;
+      res.push([ts, Number(y[i])]);
     }
     return res;
   }
@@ -36,6 +42,26 @@
   function normalizeTsMs(t) {
     if (typeof t !== "number" || !Number.isFinite(t)) return NaN;
     return t < 1e12 ? t * 1000 : t;
+  }
+
+  function futureForecastRange(xPredFuture, predsFuture) {
+    if (!Array.isArray(xPredFuture) || !predsFuture || typeof predsFuture !== "object") {
+      return null;
+    }
+    let startMs = Infinity;
+    let endMs = -Infinity;
+    Object.values(predsFuture).forEach((values) => {
+      if (!Array.isArray(values)) return;
+      const pairCount = Math.min(xPredFuture.length, values.length);
+      for (let index = 0; index < pairCount; index++) {
+        if (!isValidChartValue(values[index])) continue;
+        const ts = normalizeTsMs(xPredFuture[index]);
+        if (!Number.isFinite(ts)) continue;
+        startMs = Math.min(startMs, ts);
+        endMs = Math.max(endMs, ts);
+      }
+    });
+    return startMs < endMs ? { startMs, endMs } : null;
   }
 
   function formatMs(ms, variant) {
@@ -413,13 +439,15 @@
     }];
 
     if (app.chartAuxiliaryVisible) {
-      const futureStart = xPredFuture.length ? normalizeTsMs(xPredFuture[0]) : null;
-      const futureEnd = xPredFuture.length ? normalizeTsMs(xPredFuture[xPredFuture.length - 1]) : null;
+      const futureRange = futureForecastRange(xPredFuture, chartData.preds_future);
       const markLineData = auxiliaryMarkLines(metricKey, isPercentMode);
-      const markArea = futureStart != null && futureEnd != null ? {
+      const markArea = futureRange ? {
         silent: true,
         itemStyle: { color: "rgba(217,119,6,.09)" },
-        data: [[{ xAxis: futureStart }, { xAxis: futureEnd }]],
+        data: [[
+          { xAxis: futureRange.startMs },
+          { xAxis: futureRange.endMs },
+        ]],
       } : undefined;
       if (markLineData.length || markArea) {
         series.push({
@@ -1192,10 +1220,13 @@
   });
 
   window.ResourceCharts = {
+    buildChartOption,
     closeChartModal,
     disposeDetailChart,
+    futureForecastRange,
     openChartModal,
     renderDetail,
+    toPairs,
     toggleChartAuxiliary,
   };
 })();
