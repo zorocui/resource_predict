@@ -18,6 +18,7 @@ ENV/
 
 # Local scratch / generated checks
 .superpowers/
+.worktrees/
 .tmp_*/
 .tmp_upsert_check/
 .playwright-cli/
