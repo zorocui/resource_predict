@@ -2,7 +2,7 @@
   const app = window.ResourcePredictApp;
   const api = window.ResourceApi;
   const list = window.ResourceList;
-  const CHART_TIME_ZONE = "UTC";
+  const CHART_TIME_ZONE = "Asia/Shanghai";
   const MINUTE_MS = 60 * 1000;
   const HOUR_MS = 60 * MINUTE_MS;
   const DAY_MS = 24 * HOUR_MS;

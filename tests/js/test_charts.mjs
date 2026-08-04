@@ -41,6 +41,28 @@ const T0 = 1_800_000_000_000;
 const HOUR = 60 * 60 * 1000;
 const times = Array.from({ length: 9 }, (_, index) => T0 + index * HOUR);
 
+test("chart axis labels use Asia/Shanghai time", () => {
+  const timestamp = Date.UTC(2026, 7, 4, 4, 0, 0);
+  const option = buildChartOption(
+    {
+      x_train_ms: [timestamp],
+      y_train: [0.2],
+      x_test_ms: [timestamp + HOUR],
+      y_test: [0.3],
+      preds: { rolling_mean: [0.31] },
+      x_pred_ms: [],
+      preds_future: {},
+      metrics: { rolling_mean: { rmse: 0.01 } },
+      best_method: "rolling_mean",
+    },
+    "cpu",
+    "percent",
+    { resource_type: "openstack_vm" }
+  );
+
+  assert.equal(option.xAxis.axisLabel.formatter(timestamp), "08-04 12:00");
+});
+
 test("toPairs rejects missing values without rejecting real zero", () => {
   const pairs = toPairs(
     times,
