@@ -44,7 +44,7 @@
     app.resourcePayloadCache.clear();
     app.chartDataByKey.clear();
     app.loadedChartKeys.clear();
-    const [payload, summaryPayload, overviewPayload, forecastPayload] = await Promise.all([
+    const [payload, summaryPayload, overviewPayload] = await Promise.all([
       api.requestJson(api.buildQuery("/api/resources", {
         page: app.state.page,
         page_size: app.state.pageSize,
@@ -65,11 +65,13 @@
         confidence: app.state.confidenceFilter,
         q: app.state.query,
       })),
-      api.requestJson("/api/forecast-config", 1),
     ]);
     app.state.adviceSummary = summaryPayload;
     app.state.overviewSummary = overviewPayload;
-    app.state.forecastConfigPayload = forecastPayload;
+    app.state.forecastConfigPayload = {
+      enabled_methods: Object.keys(summaryPayload?.best_method_counts || {}),
+      enable_ensemble: false,
+    };
     const items = payload.items || [];
     if (!keepSelection) app.state.selectedResourceId = "";
     list.setItems(items, payload);
