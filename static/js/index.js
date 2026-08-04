@@ -21,7 +21,7 @@
       refreshUpdateStatus();
       refreshUpdateHistory();
     }
-    if (app.state.activeView === "configs") refreshClusterConfigs();
+    if (["system-config", "cluster-config"].includes(app.state.activeView)) refreshSystemConfig();
   }
 
   function setDetailTab(tab) {
@@ -528,10 +528,18 @@
     `;
   }
 
-  function setConfigMessage(message, isError = false) {
-    if (!app.els.clusterConfigMessage) return;
-    app.els.clusterConfigMessage.textContent = message || "";
-    app.els.clusterConfigMessage.classList.toggle("is-error", Boolean(isError));
+  function setPageConfigMessage(target, message, isError = false) {
+    if (!target) return;
+    target.textContent = message || "";
+    target.classList.toggle("is-error", Boolean(isError));
+  }
+
+  function setSystemConfigMessage(message, isError = false) {
+    setPageConfigMessage(app.els.systemConfigMessage, message, isError);
+  }
+
+  function setClusterConfigMessage(message, isError = false) {
+    setPageConfigMessage(app.els.clusterConfigMessage, message, isError);
   }
 
   function describeUpdateStatus(status) {
@@ -564,28 +572,32 @@
       `无本地基线或全量刷新时拉取最近 ${historyDays} 天。`;
   }
 
-  async function refreshClusterConfigs() {
+  function renderSystemConfigPayload(payload) {
+    renderRuntimeConfig(payload);
+    renderVmClusterRows(payload.vm_scaling_clusters || {});
+    renderK8sScheduleHint({ ...payload.runtime?.collection, incremental_overlap_minutes: 60 });
+    renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
+  }
+
+  async function refreshSystemConfig() {
     if (!app.els.vmClusterList || !app.els.k8sClusterList) return;
     app.els.vmClusterList.innerHTML = `<div class="empty-list is-compact">正在读取 VM 调配集群...</div>`;
     app.els.k8sClusterList.innerHTML = `<div class="empty-list is-compact">正在读取 K8S 监控接入...</div>`;
-    if (app.els.forecastModelList) {
-      app.els.forecastModelList.innerHTML = `<div class="empty-list is-compact">正在读取预测模型配置...</div>`;
-    }
+    setSystemConfigMessage("正在读取系统配置...");
+    setClusterConfigMessage("正在读取集群配置...");
     try {
       const payload = await api.requestJson("/api/system-config", 1);
       app.state.clusterConfigPayload = payload;
-      renderRuntimeConfig(payload);
-      renderVmClusterRows(payload.vm_scaling_clusters || {});
-      renderK8sScheduleHint({ ...payload.runtime?.collection, incremental_overlap_minutes: 60 });
-      renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
-      setConfigMessage("配置已加载。");
+      renderSystemConfigPayload(payload);
+      setSystemConfigMessage("系统配置已加载。");
+      setClusterConfigMessage("集群配置已加载。");
     } catch (e) {
       const msg = String(e.message || e);
       app.els.vmClusterList.innerHTML = `<div class="empty-list is-compact">读取失败：${list.escapeHtml(msg)}</div>`;
       app.els.k8sClusterList.innerHTML = "";
       if (app.els.k8sScheduleHint) app.els.k8sScheduleHint.textContent = "";
-      if (app.els.forecastModelList) app.els.forecastModelList.innerHTML = "";
-      setConfigMessage(msg, true);
+      setSystemConfigMessage(msg, true);
+      setClusterConfigMessage(msg, true);
     }
   }
 
@@ -701,32 +713,47 @@
     };
   }
 
-  async function saveClusterConfigs() {
-    setConfigMessage("正在保存配置...");
+  async function saveSystemConfig() {
+    setSystemConfigMessage("正在保存系统配置...");
     try {
-      const clusters = collectClusterConfigs();
+      const cached = app.state.clusterConfigPayload || {};
       const payload = await api.postJson("/api/system-config", {
-        runtime: collectRuntimeConfig(), ...clusters,
+        runtime: collectRuntimeConfig(),
+        vm_scaling_clusters: cached.vm_scaling_clusters || {},
+        k8s_prometheus_clusters: cached.k8s_prometheus_clusters || [],
       }, "PUT");
       app.state.clusterConfigPayload = payload;
-      renderRuntimeConfig(payload);
-      renderVmClusterRows(payload.vm_scaling_clusters || {});
-      renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
-      renderK8sScheduleHint({ ...payload.runtime?.collection, incremental_overlap_minutes: 60 });
-      setConfigMessage("配置已保存。后续 VM 调配、K8S 数据更新和重新预测会读取这些配置。");
+      renderSystemConfigPayload(payload);
+      setSystemConfigMessage("系统配置已保存，后续采集、预测和决策任务会读取新配置。");
     } catch (e) {
-      setConfigMessage(String(e.message || e), true);
+      setSystemConfigMessage(String(e.message || e), true);
+    }
+  }
+
+  async function saveClusterConfigs() {
+    setClusterConfigMessage("正在保存集群配置...");
+    try {
+      const cached = app.state.clusterConfigPayload || {};
+      const clusters = collectClusterConfigs();
+      const payload = await api.postJson("/api/system-config", {
+        runtime: cached.runtime || {}, ...clusters,
+      }, "PUT");
+      app.state.clusterConfigPayload = payload;
+      renderSystemConfigPayload(payload);
+      setClusterConfigMessage("集群配置已保存，后续 VM 调配和 K8S 数据更新会读取新配置。");
+    } catch (e) {
+      setClusterConfigMessage(String(e.message || e), true);
     }
   }
 
   async function diagnoseK8sConfigs() {
-    setConfigMessage("正在诊断 K8S Prometheus 接入...");
+    setClusterConfigMessage("正在诊断 K8S Prometheus 接入...");
     try {
       const names = collectClusterConfigs().k8s_prometheus_clusters.map((item) => item.cluster).filter(Boolean);
       const report = await api.postJson("/api/cluster-configs/k8s-diagnose", { clusters: names });
-      setConfigMessage(JSON.stringify(report, null, 2), !report.ok);
+      setClusterConfigMessage(JSON.stringify(report, null, 2), !report.ok);
     } catch (e) {
-      setConfigMessage(String(e.message || e), true);
+      setClusterConfigMessage(String(e.message || e), true);
     }
   }
 
@@ -735,22 +762,22 @@
       ? clusterNames
       : collectClusterConfigs().k8s_prometheus_clusters.map((item) => item.cluster).filter(Boolean);
     const label = names.length === 1 ? names[0] : `${names.length} 个集群`;
-    setConfigMessage(`正在提交 ${label} 的 K8S 数据拉取任务...`);
+    setClusterConfigMessage(`正在提交 ${label} 的 K8S 数据拉取任务...`);
     try {
       const payload = await api.postJson("/api/cluster-configs/k8s-fetch", { clusters: names });
-      setConfigMessage(payload.message || `${label} K8S 数据拉取任务已提交。`);
+      setClusterConfigMessage(payload.message || `${label} K8S 数据拉取任务已提交。`);
       setView("updates");
       startUpdatePolling();
     } catch (e) {
       if (e.status === 409 && e.updateStatus) {
         const detail = describeUpdateStatus(e.updateStatus);
-        setConfigMessage(`${String(e.message || e)}\n${detail}`.trim(), true);
+        setClusterConfigMessage(`${String(e.message || e)}\n${detail}`.trim(), true);
         updateStatusText(e.updateStatus);
         setView("updates");
         startUpdatePolling();
         return;
       }
-      setConfigMessage(String(e.message || e), true);
+      setClusterConfigMessage(String(e.message || e), true);
     }
   }
 
@@ -779,6 +806,7 @@
   }
 
   function bindClusterConfigEvents() {
+    app.els.systemConfigSave?.addEventListener("click", saveSystemConfig);
     app.els.clusterConfigSave?.addEventListener("click", saveClusterConfigs);
     app.els.vmClusterAdd?.addEventListener("click", addVmClusterRow);
     app.els.k8sScalingClusterAdd?.addEventListener("click", addK8sScalingClusterRow);
@@ -790,7 +818,7 @@
         const remove = event.target.closest("[data-config-remove]");
         if (remove) {
           remove.closest(".config-row")?.remove();
-          setConfigMessage("配置已在页面移除，保存后生效。");
+          setClusterConfigMessage("配置已在页面移除，保存后生效。");
           return;
         }
         const fetchSingle = event.target.closest("[data-k8s-fetch-single]");
@@ -798,7 +826,7 @@
           const row = fetchSingle.closest("[data-config-kind='k8s']");
           const cluster = rowValue(row, "cluster");
           if (!cluster) {
-            setConfigMessage("请先填写集群名并保存配置。", true);
+            setClusterConfigMessage("请先填写集群名并保存配置。", true);
             return;
           }
           fetchK8sPrometheusData([cluster]);

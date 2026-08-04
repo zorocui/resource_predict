@@ -16,6 +16,44 @@ from resource_predict.services.system_config import save_system_config_payload
 
 
 class SystemConfigTest(unittest.TestCase):
+    def test_template_separates_system_and_cluster_configuration_views(self):
+        root = Path(__file__).resolve().parents[1]
+        template = (root / "templates" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('data-view="system-config"', template)
+        self.assertIn('data-view="cluster-config"', template)
+        self.assertIn('id="system-config-view"', template)
+        self.assertIn('id="cluster-config-view"', template)
+        self.assertIn('id="system-config-save"', template)
+        self.assertIn('id="cluster-config-save"', template)
+
+        system_start = template.index('id="system-config-view"')
+        cluster_start = template.index('id="cluster-config-view"')
+        system_view = template[system_start:cluster_start]
+        cluster_view = template[cluster_start:]
+        self.assertIn('id="collection-config-list"', system_view)
+        self.assertNotIn('id="vm-cluster-list"', system_view)
+        self.assertIn('id="vm-cluster-list"', cluster_view)
+        self.assertNotIn('id="collection-config-list"', cluster_view)
+
+    def test_frontend_preserves_other_page_when_saving_configuration(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "static" / "js" / "index.js").read_text(encoding="utf-8")
+
+        self.assertIn(
+            '["system-config", "cluster-config"].includes(app.state.activeView)',
+            script,
+        )
+        self.assertIn("function refreshSystemConfig()", script)
+        self.assertIn("async function saveSystemConfig()", script)
+        self.assertIn(
+            "vm_scaling_clusters: cached.vm_scaling_clusters || {}", script
+        )
+        self.assertIn(
+            "k8s_prometheus_clusters: cached.k8s_prometheus_clusters || []", script
+        )
+        self.assertIn("runtime: cached.runtime || {}", script)
+
     def test_save_writes_all_sections_and_swaps_snapshot(self):
         store = RuntimeConfigStore(default_runtime_config())
         runtime = runtime_config_to_dict(default_runtime_config())

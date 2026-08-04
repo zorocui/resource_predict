@@ -20,7 +20,8 @@
           <button class="nav-tab" type="button" data-view="overview">概览</button>
           <button class="nav-tab" type="button" data-view="tasks">调配任务</button>
           <button class="nav-tab" type="button" data-view="updates">数据更新</button>
-          <button class="nav-tab" type="button" data-view="configs">系统配置</button>
+          <button class="nav-tab" type="button" data-view="system-config">系统配置</button>
+          <button class="nav-tab" type="button" data-view="cluster-config">集群配置</button>
         </nav>
       </header>
 
@@ -189,14 +190,14 @@
             </section>
           </div>
 
-          <div id="configs-view" class="view-panel">
+          <div id="system-config-view" class="view-panel">
             <section class="config-workspace">
               <div class="config-head">
                 <div>
                   <h2>系统配置</h2>
-                  <p>统一管理数据采集、预测、扩缩容策略和集群接入，保存后立即生效。</p>
+                  <p>管理数据采集、预测和扩缩容策略，保存后立即生效。</p>
                 </div>
-                <button id="cluster-config-save" class="primary-btn" type="button">保存配置</button>
+                <button id="system-config-save" class="primary-btn" type="button">保存系统配置</button>
               </div>
 
               <div class="config-section config-section-runtime">
@@ -212,6 +213,20 @@
               <div class="config-section config-section-runtime">
                 <div class="config-section-head"><div><h3>扩缩容策略</h3><p>只保留运维需要调整的策略阈值、确认轮次和冷却时间。</p></div></div>
                 <div id="decision-config-list" class="config-list"></div>
+              </div>
+
+              <pre id="system-config-message" class="status-message"></pre>
+            </section>
+          </div>
+
+          <div id="cluster-config-view" class="view-panel">
+            <section class="config-workspace">
+              <div class="config-head">
+                <div>
+                  <h2>集群配置</h2>
+                  <p>管理 VM/K8S 调配控制节点和 Prometheus 监控接入。</p>
+                </div>
+                <button id="cluster-config-save" class="primary-btn" type="button">保存集群配置</button>
               </div>
 
               <div class="config-section">

@@ -62,6 +62,8 @@
       updateFinished: document.getElementById("update-finished"),
       updateMessage: document.getElementById("update-message"),
       updateHistory: document.getElementById("update-history"),
+      systemConfigSave: document.getElementById("system-config-save"),
+      systemConfigMessage: document.getElementById("system-config-message"),
       clusterConfigSave: document.getElementById("cluster-config-save"),
       clusterConfigMessage: document.getElementById("cluster-config-message"),
       forecastModelList: document.getElementById("forecast-model-list"),
