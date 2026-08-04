@@ -208,8 +208,8 @@ class K8SPrometheusConfig:
     request_timeout_seconds: int = 300
     # 多集群拉取时是否遇到任一集群失败就立即中断；False 表示尽量保留成功集群。
     fail_fast: bool = False
-    # 是否启用显式启动的 K8S Prometheus 后台拉取；app.py 默认不自动启动。
-    scheduled_update_enabled: bool = False
+    # 是否在 python app.py 启动时启用 K8S Prometheus 后台拉取。
+    scheduled_update_enabled: bool = True
     # K8S Prometheus 显式后台拉取间隔，单位分钟。
     scheduled_update_interval_minutes: int = 360
     # 显式启动 K8S 后台调度器后的首次拉取延迟秒数；手动拉取不受影响。
