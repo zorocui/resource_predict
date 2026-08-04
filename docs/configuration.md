@@ -134,7 +134,7 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 
 K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_refresh=true` 时，会按 `history_days` 拉取全量历史窗口（默认最近 7 天）。已有本地基线后的普通拉取会使用增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认 `360 + 60 = 420` 分钟，即最近 7 小时。
 
-`app.py` 启动后不会自动拉取 VM 或 K8S 数据；需要通过页面按钮、更新 API 或 CLI 手动触发。
+通过 `python app.py` 启动时，将 `scheduled_update_enabled` 设为 `True` 会启用 K8S Prometheus 后台定时拉取：启动后等待 `scheduled_update_startup_delay_seconds`（默认 60 秒）执行首次拉取，此后按 `scheduled_update_interval_minutes` 执行。VM 数据更新仍需通过页面按钮、更新 API 或 CLI 手动触发。
 
 ### 预测窗口配置说明
 

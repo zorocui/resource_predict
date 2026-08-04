@@ -233,7 +233,7 @@ Push:       POST /api/update-data -> run_scoped_update_with_data -> _do_update
 K8S Fetch:  POST /api/cluster-configs/k8s-fetch -> run_k8s_prometheus_upsert（异步）
 ```
 
-K8S Prometheus 拉取窗口由 `run_k8s_prometheus_upsert()` 决定：如果 `outputs/k8s/raw_index.json` 缺失、指定集群没有本地基线，或请求传入 `full_refresh=true`，则按 `history_days` 拉取全量历史窗口（默认 7 天）；否则按 `scheduled_update_interval_minutes + incremental_overlap_minutes` 拉取增量窗口（默认 6 小时周期 + 1 小时 overlap = 最近 7 小时）。`app.py` 启动后不会自动拉取 K8S 数据，手动拉取可通过页面按钮、API 或 CLI 触发。
+K8S Prometheus 拉取窗口由 `run_k8s_prometheus_upsert()` 决定：如果 `outputs/k8s/raw_index.json` 缺失、指定集群没有本地基线，或请求传入 `full_refresh=true`，则按 `history_days` 拉取全量历史窗口（默认 7 天）；否则按 `scheduled_update_interval_minutes + incremental_overlap_minutes` 拉取增量窗口（默认 6 小时周期 + 1 小时 overlap = 最近 7 小时）。通过 `python app.py` 启动且 `scheduled_update_enabled=true` 时，应用会在 `scheduled_update_startup_delay_seconds` 后启动首次 K8S 拉取，此后按配置间隔执行；也可通过页面按钮、API 或 CLI 手动触发。
 
 关键线程原语（`data/updater.py`）：
 
