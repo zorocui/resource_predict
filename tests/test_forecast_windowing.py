@@ -27,7 +27,7 @@ def series(points: int, freq: str) -> pd.Series:
 
 
 class ForecastWindowingTest(unittest.TestCase):
-    def test_vm_uses_legacy_point_counts_by_default(self):
+    def test_vm_uses_runtime_duration_by_default(self):
         item = {
             "resource_id": "vm-001",
             "resource_type": "openstack_vm",
@@ -44,8 +44,8 @@ class ForecastWindowingTest(unittest.TestCase):
         self.assertEqual(window.resource_family, "vm")
         self.assertEqual(window.test_size, 72)
         self.assertEqual(window.future_steps, 24)
-        self.assertIsNone(window.test_duration)
-        self.assertIsNone(window.future_duration)
+        self.assertEqual(window.test_duration, "72h")
+        self.assertEqual(window.future_duration, "24h")
 
     def test_workload_duration_is_converted_from_sample_interval(self):
         item = {

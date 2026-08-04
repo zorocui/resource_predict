@@ -15,7 +15,7 @@ class AppSchedulerLifecycleTest(unittest.TestCase):
     def test_normal_start_runs_and_stops_k8s_scheduler(self):
         flask_app = MagicMock()
         scheduler_thread = object()
-        with patch.object(app_module, "settings", self._settings(debug=False)):
+        with patch.object(app_module, "bootstrap_settings", self._settings(debug=False).app):
             with patch.object(app_module, "create_app", return_value=flask_app):
                 with patch.object(
                     app_module,
@@ -36,7 +36,7 @@ class AppSchedulerLifecycleTest(unittest.TestCase):
 
     def test_debug_reloader_parent_does_not_start_scheduler(self):
         flask_app = MagicMock()
-        with patch.object(app_module, "settings", self._settings(debug=True)):
+        with patch.object(app_module, "bootstrap_settings", self._settings(debug=True).app):
             with patch.object(app_module, "create_app", return_value=flask_app):
                 with patch.object(
                     app_module, "start_k8s_background_updater"
@@ -56,7 +56,7 @@ class AppSchedulerLifecycleTest(unittest.TestCase):
     def test_debug_reloader_child_runs_and_stops_scheduler(self):
         flask_app = MagicMock()
         scheduler_thread = object()
-        with patch.object(app_module, "settings", self._settings(debug=True)):
+        with patch.object(app_module, "bootstrap_settings", self._settings(debug=True).app):
             with patch.object(app_module, "create_app", return_value=flask_app):
                 with patch.object(
                     app_module,

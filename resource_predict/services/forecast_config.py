@@ -84,6 +84,8 @@ def normalize_forecast_config_payload(payload: Any) -> Dict[str, Any]:
 
 def read_forecast_config(path: Path | str = DEFAULT_FORECAST_CONFIG_PATH) -> Dict[str, Any]:
     p = Path(path)
+    if p == DEFAULT_FORECAST_CONFIG_PATH:
+        return normalize_forecast_config_payload(default_forecast_config_payload())
     if not p.exists():
         return normalize_forecast_config_payload(default_forecast_config_payload())
     try:

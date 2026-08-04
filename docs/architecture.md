@@ -24,6 +24,7 @@
 │   ├── clusters.example.json        # 集群配置示例
 │   ├── clusters.json                # VM / K8S 调配集群配置
 │   ├── k8s_prometheus_clusters.json # K8S Prometheus 集群配置
+│   ├── runtime_config.json           # 页面统一管理的运行配置
 │   └── forecast_config.json         # 预测模型开关配置
 │
 ├── resource_predict/                # 核心业务包

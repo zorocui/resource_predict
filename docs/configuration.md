@@ -6,7 +6,8 @@
 
 | 文件 | 用途 | 是否提交 Git |
 | --- | --- | --- |
-| `resource_predict/settings.py` | 全局默认配置（frozen dataclass 单例） | 是 |
+| `resource_predict/settings.py` | 页面启动前必须确定的监听、目录和日志设置 | 是 |
+| `deploy/runtime_config.json` | 页面统一管理的数据采集、预测和决策运行配置 | 是 |
 | `deploy/clusters.json` | VM / K8S 调配集群配置（含 SSH 凭据） | 否 |
 | `deploy/k8s_prometheus_clusters.json` | K8S Prometheus 集群地址与认证 | 否 |
 | `deploy/forecast_config.json` | 预测模型开关 | 否 |
@@ -119,7 +120,19 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 
 ## 全局默认配置（`resource_predict/settings.py`）
 
-所有配置均为 frozen dataclass，运行时只读。主要配置组：
+`settings.py` 已精简为启动设置，只保留静态/模板/输出目录、日志和 Flask host/port/debug。
+业务运行配置请在 Web 的“系统配置”页面修改，保存到 `deploy/runtime_config.json` 后立即对新任务生效。
+
+页面运行配置只保留三组常用字段：数据采集（定时开关、周期、历史、步长、rate 窗口、超时）、
+预测（VM/K8S 验证与预测窗口、候选模型、Ensemble）以及决策（策略等级、扩缩容阈值、确认轮次、
+冷却时间和命名空间策略）。Prophet 底层参数、缓存、分页、mock 随机种子等实现细节不再作为用户配置。
+
+保存时服务端先校验完整配置；任何字段或集群配置错误都会整体拒绝。调度配置变化会唤醒唯一的
+K8S 后台调度线程重新读取开关和周期，不需要重启应用。
+
+旧版 `deploy/forecast_config.json` 仅在 `runtime_config.json` 不存在时作为模型开关迁移来源。
+
+历史默认配置组（仅供理解内部默认值，不再由用户直接编辑）：
 
 | 配置类 | 关键参数 | 默认值 |
 | --- | --- | --- |

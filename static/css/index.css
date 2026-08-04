@@ -1203,7 +1203,8 @@ h1 {
   font-weight: 900;
 }
 
-.config-field input {
+.config-field input,
+.config-field select {
   min-width: 0;
   width: 100%;
   border: 1px solid var(--border);
@@ -1211,6 +1212,23 @@ h1 {
   padding: 8px 9px;
   color: var(--text);
   background: #fff;
+}
+
+.config-section-runtime {
+  border-left: 3px solid #0f766e;
+  background: linear-gradient(90deg, rgba(15, 118, 110, .045), transparent 28%);
+}
+
+.config-section-runtime h3::before {
+  content: "运行时";
+  margin-right: 8px;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: #ccfbf1;
+  color: #115e59;
+  font-size: 9px;
+  letter-spacing: .08em;
+  vertical-align: 2px;
 }
 
 .config-field.is-disabled {

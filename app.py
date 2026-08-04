@@ -5,10 +5,10 @@ import os
 from flask import Flask
 
 from resource_predict.api.cluster_configs import register_cluster_config_routes
-from resource_predict.api.forecast_config import register_forecast_config_routes
 from resource_predict.api.pages import register_page_routes
 from resource_predict.api.resources import register_resource_routes
 from resource_predict.api.scaling import register_scaling_routes
+from resource_predict.api.system_config import register_system_config_routes
 from resource_predict.api.updates import register_update_routes
 from resource_predict.logging_setup import setup_application_logging
 from resource_predict.services.k8s_ingest import (
@@ -22,7 +22,7 @@ from resource_predict.services.store import (
     prediction_pending_for,
     safe_int,
 )
-from resource_predict.settings import settings
+from resource_predict.settings import bootstrap_settings
 
 
 def create_app() -> Flask:
@@ -30,8 +30,8 @@ def create_app() -> Flask:
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     app = Flask(
         __name__,
-        static_folder=settings.app.static_folder,
-        template_folder=settings.app.template_folder,
+        static_folder=bootstrap_settings.static_folder,
+        template_folder=bootstrap_settings.template_folder,
     )
 
     store = ForecastStore()
@@ -49,7 +49,7 @@ def create_app() -> Flask:
     register_scaling_routes(app, route_helpers)
     register_update_routes(app)
     register_cluster_config_routes(app)
-    register_forecast_config_routes(app)
+    register_system_config_routes(app)
 
     return app
 
@@ -58,11 +58,11 @@ def run_app() -> None:
     app = create_app()
     scheduler_thread = None
     is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
-    if not settings.app.debug or is_reloader_child:
+    if not bootstrap_settings.debug or is_reloader_child:
         scheduler_thread = start_k8s_background_updater()
 
     try:
-        app.run(host=settings.app.host, port=settings.app.port, debug=settings.app.debug)
+        app.run(host=bootstrap_settings.host, port=bootstrap_settings.port, debug=bootstrap_settings.debug)
     finally:
         if scheduler_thread is not None:
             stop_k8s_background_updater()

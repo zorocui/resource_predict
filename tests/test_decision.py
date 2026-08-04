@@ -434,7 +434,7 @@ class TestDecision(unittest.TestCase):
     def test_build_scaling_advice_with_custom_settings(self):
         """Verify that a custom DecisionConfig override propagates via patch."""
         custom_decision = replace(settings.decision, scale_out_threshold=0.7)
-        custom_settings = replace(settings, decision=custom_decision)
+        custom_settings = type("CustomSettings", (), {"decision": custom_decision})()
         future = _future({"cpu": [0.75] * 24})
         with patch("resource_predict.core.decision.settings", custom_settings):
             advice = build_scaling_advice(future, current_spec=VM_SPEC)

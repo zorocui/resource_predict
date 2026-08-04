@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # K8S Prometheus 后台定时调度器
 # ---------------------------------------------------------------------------
 _k8s_stop_event = threading.Event()
+_k8s_reload_event = threading.Event()
 _k8s_scheduler_thread: Optional[threading.Thread] = None
 
 
@@ -208,6 +209,12 @@ def _k8s_scheduler_loop(interval_seconds: float, startup_delay_seconds: float) -
             return
     first_run = True
     while not _k8s_stop_event.is_set():
+        cfg = settings.k8s_prometheus
+        if not cfg.scheduled_update_enabled:
+            logger.info("[k8s_ingest] K8S 定时拉取已关闭，等待配置变更")
+            _k8s_reload_event.wait()
+            _k8s_reload_event.clear()
+            continue
         try:
             run_k8s_prometheus_upsert(
                 fail_if_busy=False,
@@ -217,7 +224,9 @@ def _k8s_scheduler_loop(interval_seconds: float, startup_delay_seconds: float) -
         except Exception as exc:
             logger.error("[k8s_ingest] 调度循环异常: %s", exc)
 
-        _k8s_stop_event.wait(interval_seconds)
+        interval_seconds = max(60.0, float(cfg.scheduled_update_interval_minutes) * 60.0)
+        _k8s_reload_event.wait(interval_seconds)
+        _k8s_reload_event.clear()
 
     logger.info("[k8s_ingest] K8S Prometheus 后台调度器已停止")
 
@@ -229,7 +238,7 @@ def start_k8s_background_updater(
     启动 K8S Prometheus 后台定时拉取线程。
 
     参数可选，未传入时从 settings.k8s_prometheus 读取默认值。
-    若 scheduled_update_enabled 为 False，返回 None。
+    即使定时拉取关闭也保留一个等待配置变更的控制线程。
     """
     global _k8s_scheduler_thread
 
@@ -241,17 +250,8 @@ def start_k8s_background_updater(
     )
     startup_delay = max(0, int(cfg.scheduled_update_startup_delay_seconds))
 
-    if not cfg.scheduled_update_enabled:
-        logger.info(
-            "[k8s_ingest] 配置中 scheduled_update_enabled=False，跳过 K8S 后台定时拉取"
-            "（可通过 POST /api/cluster-configs/k8s-fetch 手动触发）"
-        )
-        return None
-
-    # 如果已有线程在跑，先停掉旧的
     if _k8s_scheduler_thread is not None and _k8s_scheduler_thread.is_alive():
-        logger.warning("[k8s_ingest] 检测到已有 K8S 调度线程在运行，先停止旧线程")
-        stop_k8s_background_updater()
+        return _k8s_scheduler_thread
 
     _k8s_stop_event.clear()
     _k8s_scheduler_thread = threading.Thread(
@@ -265,10 +265,16 @@ def start_k8s_background_updater(
     return _k8s_scheduler_thread
 
 
+def notify_k8s_scheduler_config_changed() -> None:
+    """唤醒唯一调度线程，使其在控制边界读取最新运行配置。"""
+    _k8s_reload_event.set()
+
+
 def stop_k8s_background_updater(timeout: float = 10.0) -> None:
     """通知 K8S 后台线程停止并等待其退出。"""
     global _k8s_scheduler_thread
     _k8s_stop_event.set()
+    _k8s_reload_event.set()
     if _k8s_scheduler_thread is not None and _k8s_scheduler_thread.is_alive():
         logger.info("[k8s_ingest] 等待 K8S 后台调度线程退出 …")
         _k8s_scheduler_thread.join(timeout=timeout)

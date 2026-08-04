@@ -1,4 +1,3 @@
-import dataclasses
 import json
 import tempfile
 import unittest

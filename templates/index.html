@@ -20,7 +20,7 @@
           <button class="nav-tab" type="button" data-view="overview">概览</button>
           <button class="nav-tab" type="button" data-view="tasks">调配任务</button>
           <button class="nav-tab" type="button" data-view="updates">数据更新</button>
-          <button class="nav-tab" type="button" data-view="configs">集群配置</button>
+          <button class="nav-tab" type="button" data-view="configs">系统配置</button>
         </nav>
       </header>
 
@@ -193,10 +193,25 @@
             <section class="config-workspace">
               <div class="config-head">
                 <div>
-                  <h2>集群配置</h2>
-                  <p>配置 VM 调配控制节点，以及 K8S 监控接入所需的 Prometheus 集群。</p>
+                  <h2>系统配置</h2>
+                  <p>统一管理数据采集、预测、扩缩容策略和集群接入，保存后立即生效。</p>
                 </div>
                 <button id="cluster-config-save" class="primary-btn" type="button">保存配置</button>
+              </div>
+
+              <div class="config-section config-section-runtime">
+                <div class="config-section-head"><div><h3>数据采集</h3><p>Prometheus 历史窗口、采样和后台调度。</p></div></div>
+                <div id="collection-config-list" class="config-list"></div>
+              </div>
+
+              <div class="config-section config-section-runtime">
+                <div class="config-section-head"><div><h3>预测配置</h3><p>分别设置 VM 与 K8S 的验证/未来窗口和候选模型。</p></div></div>
+                <div id="prediction-config-list" class="config-list"></div>
+              </div>
+
+              <div class="config-section config-section-runtime">
+                <div class="config-section-head"><div><h3>扩缩容策略</h3><p>只保留运维需要调整的策略阈值、确认轮次和冷却时间。</p></div></div>
+                <div id="decision-config-list" class="config-list"></div>
               </div>
 
               <div class="config-section">
@@ -227,16 +242,6 @@
                 </div>
                 <div id="k8s-schedule-hint" class="empty-list is-compact"></div>
                 <div id="k8s-cluster-list" class="config-list"></div>
-              </div>
-
-              <div class="config-section">
-                <div class="config-section-head">
-                  <div>
-                    <h3>预测模型</h3>
-                    <p>保存到 deploy/forecast_config.json，后续重新预测时按这里启用的模型参与选择。</p>
-                  </div>
-                </div>
-                <div id="forecast-model-list" class="config-list"></div>
               </div>
 
               <pre id="cluster-config-message" class="status-message"></pre>

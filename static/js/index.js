@@ -387,6 +387,54 @@
     `;
   }
 
+  function configSelect(label, name, value, options) {
+    return `<label class="config-field"><span>${label}</span><select data-config-name="${name}">${options.map((item) =>
+      `<option value="${list.escapeHtml(item.value)}" ${item.value === value ? "selected" : ""}>${list.escapeHtml(item.label)}</option>`
+    ).join("")}</select></label>`;
+  }
+
+  function renderRuntimeConfig(payload) {
+    const runtime = payload?.runtime || {};
+    const collection = runtime.collection || {};
+    const prediction = runtime.prediction || {};
+    const decision = runtime.decision || {};
+    if (app.els.collectionConfigList) app.els.collectionConfigList.innerHTML = `
+      <div class="config-row" data-config-kind="collection"><div class="config-grid">
+        ${configInput("启用定时拉取", "scheduled_update_enabled", collection.scheduled_update_enabled !== false, { type: "checkbox" })}
+        ${configInput("拉取周期（分钟）", "scheduled_update_interval_minutes", collection.scheduled_update_interval_minutes || 360, { type: "number" })}
+        ${configInput("全量历史（天）", "history_days", collection.history_days || 7, { type: "number" })}
+        ${configInput("采样步长（秒）", "step_seconds", collection.step_seconds || 300, { type: "number" })}
+        ${configInput("CPU Rate 窗口", "rate_window", collection.rate_window || "5m", { placeholder: "5m" })}
+        ${configInput("请求超时（秒）", "request_timeout_seconds", collection.request_timeout_seconds || 300, { type: "number" })}
+      </div></div>`;
+    const supported = Array.isArray(payload?.supported_methods) ? payload.supported_methods : [];
+    const enabled = new Set(prediction.enabled_methods || []);
+    if (app.els.predictionConfigList) app.els.predictionConfigList.innerHTML = `
+      <div class="config-row" data-config-kind="prediction"><div class="config-grid">
+        ${configInput("VM 验证窗口", "vm_test_duration", prediction.vm_test_duration || "72h")}
+        ${configInput("VM 预测窗口", "vm_future_duration", prediction.vm_future_duration || "24h")}
+        ${configInput("K8S 验证窗口", "workload_test_duration", prediction.workload_test_duration || "24h")}
+        ${configInput("K8S 预测窗口", "workload_future_duration", prediction.workload_future_duration || "24h")}
+        ${supported.map((method) => configInput(method.label || method.key, `method:${method.key}`, enabled.has(method.key), { type: "checkbox" })).join("")}
+        ${configInput("启用 Ensemble", "enable_ensemble", Boolean(prediction.enable_ensemble), { type: "checkbox" })}
+      </div></div>`;
+    if (app.els.decisionConfigList) app.els.decisionConfigList.innerHTML = `
+      <div class="config-row" data-config-kind="decision"><div class="config-grid">
+        ${configSelect("默认策略", "default_policy_tier", decision.default_policy_tier || "balanced", [
+          { value: "conservative", label: "保守" }, { value: "balanced", label: "均衡" }, { value: "aggressive", label: "激进" },
+        ])}
+        ${configInput("扩容阈值（%）", "scale_out_threshold_percent", Math.round(Number(decision.scale_out_threshold || 0.8) * 100), { type: "number" })}
+        ${configInput("缩容阈值（%）", "scale_in_threshold_percent", Math.round(Number(decision.scale_in_threshold || 0.2) * 100), { type: "number" })}
+        ${configInput("最大缩容比例（%）", "scale_in_max_reduction_ratio_percent", Math.round(Number(decision.scale_in_max_reduction_ratio || 0.5) * 100), { type: "number" })}
+        ${configInput("扩容确认轮次", "scale_out_confirmations", decision.scale_out_confirmations || 2, { type: "number" })}
+        ${configInput("缩容确认轮次", "scale_in_confirmations", decision.scale_in_confirmations || 3, { type: "number" })}
+        ${configInput("扩容冷却（分钟）", "scale_out_cooldown_minutes", decision.scale_out_cooldown_minutes || 60, { type: "number" })}
+        ${configInput("缩容冷却（分钟）", "scale_in_cooldown_minutes", decision.scale_in_cooldown_minutes || 360, { type: "number" })}
+        ${configInput("保守命名空间", "conservative_namespaces", (decision.conservative_namespaces || []).join(", "))}
+        ${configInput("激进命名空间", "aggressive_namespaces", (decision.aggressive_namespaces || []).join(", "))}
+      </div></div>`;
+  }
+
   function isK8sScalingCluster(cfg) {
     const type = String(cfg?.cloud_type || cfg?.type || "openstack").trim().toLowerCase();
     return type === "k8s" || type === "kubernetes";
@@ -510,8 +558,9 @@
     const incrementalLabel = Number.isInteger(incrementalHours)
       ? String(incrementalHours)
       : incrementalHours.toFixed(1);
+    const enabled = schedule?.scheduled_update_enabled !== false;
     app.els.k8sScheduleHint.textContent =
-      `app.py 启动后不会自动拉取 K8S 数据，可通过页面按钮手动触发；有本地基线时拉取最近 ${incrementalLabel} 小时，` +
+      `${enabled ? `已启用每 ${interval} 分钟自动拉取` : "自动拉取已关闭"}；有本地基线时拉取最近 ${incrementalLabel} 小时，` +
       `无本地基线或全量刷新时拉取最近 ${historyDays} 天。`;
   }
 
@@ -523,16 +572,12 @@
       app.els.forecastModelList.innerHTML = `<div class="empty-list is-compact">正在读取预测模型配置...</div>`;
     }
     try {
-      const [payload, forecastPayload] = await Promise.all([
-        api.requestJson("/api/cluster-configs", 1),
-        api.requestJson("/api/forecast-config", 1),
-      ]);
+      const payload = await api.requestJson("/api/system-config", 1);
       app.state.clusterConfigPayload = payload;
-      app.state.forecastConfigPayload = forecastPayload;
+      renderRuntimeConfig(payload);
       renderVmClusterRows(payload.vm_scaling_clusters || {});
-      renderK8sScheduleHint(payload.k8s_prometheus_schedule || {});
+      renderK8sScheduleHint({ ...payload.runtime?.collection, incremental_overlap_minutes: 60 });
       renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
-      renderForecastModelRows(forecastPayload);
       setConfigMessage("配置已加载。");
     } catch (e) {
       const msg = String(e.message || e);
@@ -619,18 +664,55 @@
     };
   }
 
+  function splitNamespaces(value) {
+    return [...new Set(String(value || "").split(",").map((item) => item.trim()).filter(Boolean))];
+  }
+
+  function collectRuntimeConfig() {
+    const collection = app.els.collectionConfigList?.querySelector('[data-config-kind="collection"]');
+    const prediction = app.els.predictionConfigList?.querySelector('[data-config-kind="prediction"]');
+    const decision = app.els.decisionConfigList?.querySelector('[data-config-kind="decision"]');
+    const methods = [];
+    prediction?.querySelectorAll('[data-config-name^="method:"]').forEach((input) => {
+      if (input.checked) methods.push(input.dataset.configName.replace("method:", ""));
+    });
+    return {
+      collection: {
+        scheduled_update_enabled: rowValue(collection, "scheduled_update_enabled"),
+        scheduled_update_interval_minutes: rowValue(collection, "scheduled_update_interval_minutes"),
+        history_days: rowValue(collection, "history_days"), step_seconds: rowValue(collection, "step_seconds"),
+        rate_window: rowValue(collection, "rate_window"), request_timeout_seconds: rowValue(collection, "request_timeout_seconds"),
+      },
+      prediction: {
+        vm_test_duration: rowValue(prediction, "vm_test_duration"), vm_future_duration: rowValue(prediction, "vm_future_duration"),
+        workload_test_duration: rowValue(prediction, "workload_test_duration"), workload_future_duration: rowValue(prediction, "workload_future_duration"),
+        enabled_methods: methods, enable_ensemble: rowValue(prediction, "enable_ensemble"),
+      },
+      decision: {
+        default_policy_tier: rowValue(decision, "default_policy_tier"),
+        scale_out_threshold: rowValue(decision, "scale_out_threshold_percent") / 100,
+        scale_in_threshold: rowValue(decision, "scale_in_threshold_percent") / 100,
+        scale_in_max_reduction_ratio: rowValue(decision, "scale_in_max_reduction_ratio_percent") / 100,
+        scale_out_confirmations: rowValue(decision, "scale_out_confirmations"), scale_in_confirmations: rowValue(decision, "scale_in_confirmations"),
+        scale_out_cooldown_minutes: rowValue(decision, "scale_out_cooldown_minutes"), scale_in_cooldown_minutes: rowValue(decision, "scale_in_cooldown_minutes"),
+        conservative_namespaces: splitNamespaces(rowValue(decision, "conservative_namespaces")),
+        aggressive_namespaces: splitNamespaces(rowValue(decision, "aggressive_namespaces")),
+      },
+    };
+  }
+
   async function saveClusterConfigs() {
     setConfigMessage("正在保存配置...");
     try {
-      const [payload, forecastPayload] = await Promise.all([
-        api.postJson("/api/cluster-configs", collectClusterConfigs(), "PUT"),
-        api.postJson("/api/forecast-config", collectForecastConfig(), "PUT"),
-      ]);
+      const clusters = collectClusterConfigs();
+      const payload = await api.postJson("/api/system-config", {
+        runtime: collectRuntimeConfig(), ...clusters,
+      }, "PUT");
       app.state.clusterConfigPayload = payload;
-      app.state.forecastConfigPayload = forecastPayload;
+      renderRuntimeConfig(payload);
       renderVmClusterRows(payload.vm_scaling_clusters || {});
       renderK8sClusterRows(payload.k8s_prometheus_clusters || []);
-      renderForecastModelRows(forecastPayload);
+      renderK8sScheduleHint({ ...payload.runtime?.collection, incremental_overlap_minutes: 60 });
       setConfigMessage("配置已保存。后续 VM 调配、K8S 数据更新和重新预测会读取这些配置。");
     } catch (e) {
       setConfigMessage(String(e.message || e), true);

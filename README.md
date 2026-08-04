@@ -210,6 +210,7 @@ VM 和 K8S 产物完全物理隔离，API 层透明合并。
 | --- | --- |
 | `deploy/clusters.json` | VM / K8S 调配集群配置（含 SSH 凭据） |
 | `deploy/k8s_prometheus_clusters.json` | K8S Prometheus 集群地址与认证 |
+| `deploy/runtime_config.json` | 页面管理的数据采集、预测与扩缩容运行配置 |
 | `deploy/forecast_config.json` | 预测模型开关 |
 | `.env` | 环境变量覆盖 |
 

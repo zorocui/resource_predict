@@ -183,6 +183,8 @@ queued -> running -> plan_built -> executing_command -> command_finished
 | PUT | `/api/forecast-config` | 保存预测模型开关 |
 | POST | `/api/cluster-configs/k8s-diagnose` | 诊断 K8S Prometheus 连通性 |
 | POST | `/api/cluster-configs/k8s-fetch` | 拉取 K8S Prometheus 数据（异步） |
+| GET | `/api/system-config` | 读取页面统一运行配置与集群配置 |
+| PUT | `/api/system-config` | 校验、保存并立即应用统一配置 |
 
 ### 集群配置读写
 
