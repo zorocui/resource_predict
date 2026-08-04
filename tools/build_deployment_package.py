@@ -1,12 +1,14 @@
 """构建仅包含运行文件的内网部署 ZIP。"""
 from __future__ import annotations
 
+import argparse
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Iterable, Sequence
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
@@ -181,3 +183,39 @@ def build_deployment_package(
         temporary_path.unlink(missing_ok=True)
         if final_created and not completed:
             final_path.unlink(missing_ok=True)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="生成精简的内网部署 ZIP")
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help="项目根目录，默认根据脚本位置自动识别",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="输出目录，默认使用项目根目录下的 dist",
+    )
+    args = parser.parse_args(argv)
+    try:
+        result = build_deployment_package(
+            args.project_root,
+            output_dir=args.output_dir,
+        )
+    except (PackageBuildError, OSError) as exc:
+        print(f"打包失败：{exc}", file=sys.stderr)
+        return 1
+
+    size_mib = result.size_bytes / (1024 * 1024)
+    print("打包成功")
+    print(f"文件位置：{result.path}")
+    print(f"文件数量：{result.file_count}")
+    print(f"压缩包大小：{size_mib:.2f} MiB")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

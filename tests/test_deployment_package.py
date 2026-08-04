@@ -155,3 +155,15 @@ def test_validation_failure_removes_temporary_and_final_files(project_tree, tmp_
             build_deployment_package(root, output_dir=output_dir)
 
     assert list(output_dir.iterdir()) == []
+
+
+def test_double_click_launcher_uses_project_python_and_packager():
+    project_root = Path(__file__).resolve().parents[1]
+    launcher = (project_root / "一键打包内网部署.bat").read_text(encoding="utf-8")
+
+    assert "%~dp0" in launcher
+    assert ".venv\\Scripts\\python.exe" in launcher
+    assert "tools\\build_deployment_package.py" in launcher
+    assert "where python" in launcher
+    assert "pause" in launcher.lower()
+    assert "exit /b" in launcher.lower()

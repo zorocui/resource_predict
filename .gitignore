@@ -28,6 +28,7 @@ ENV/
 # Runtime outputs (regenerate via generate_forecasts.py)
 outputs/*
 !outputs/.gitkeep
+dist/
 
 # Local cluster credentials (copy from deploy/clusters.example.json)
 deploy/clusters.json
