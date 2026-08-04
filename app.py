@@ -11,6 +11,10 @@ from resource_predict.api.resources import register_resource_routes
 from resource_predict.api.scaling import register_scaling_routes
 from resource_predict.api.updates import register_update_routes
 from resource_predict.logging_setup import setup_application_logging
+from resource_predict.services.k8s_ingest import (
+    start_k8s_background_updater,
+    stop_k8s_background_updater,
+)
 from resource_predict.services.store import (
     ForecastStore,
     action_priority,
@@ -50,6 +54,19 @@ def create_app() -> Flask:
     return app
 
 
-if __name__ == "__main__":
+def run_app() -> None:
     app = create_app()
-    app.run(host=settings.app.host, port=settings.app.port, debug=settings.app.debug)
+    scheduler_thread = None
+    is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    if not settings.app.debug or is_reloader_child:
+        scheduler_thread = start_k8s_background_updater()
+
+    try:
+        app.run(host=settings.app.host, port=settings.app.port, debug=settings.app.debug)
+    finally:
+        if scheduler_thread is not None:
+            stop_k8s_background_updater()
+
+
+if __name__ == "__main__":
+    run_app()
