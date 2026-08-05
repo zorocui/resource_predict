@@ -129,6 +129,7 @@ def generate_forecasts(
         items=prepared_data,
         explicit_test_size=explicit_test_size,
         explicit_future_steps=explicit_future_steps,
+        fallback_freq=freq,
     )
     test_size = window.test_size
     future_steps = window.future_steps

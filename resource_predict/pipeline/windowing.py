@@ -58,6 +58,7 @@ def resolve_forecast_window(
     items: list[dict[str, Any]],
     explicit_test_size: Optional[int],
     explicit_future_steps: Optional[int],
+    fallback_freq: Optional[str] = None,
 ) -> ForecastWindow:
     if not items:
         raise ValueError("无法解析预测窗口：资源列表为空")
@@ -65,6 +66,8 @@ def resolve_forecast_window(
     family = resource_family_for_items(items)
     index = _first_metric_index(items)
     sample_seconds = infer_sample_interval_seconds(index)
+    if sample_seconds is None:
+        sample_seconds = _fixed_frequency_seconds(fallback_freq)
 
     test_duration = _scoped_value(cfg, family, "test_duration")
     future_duration = _scoped_value(cfg, family, "future_duration")
@@ -156,6 +159,17 @@ def _steps_for_duration(duration: str, sample_seconds: Optional[float]) -> int:
     if seconds <= 0:
         raise ValueError(f"预测窗口时长必须为正数: {duration!r}")
     return max(1, int(round(seconds / sample_seconds)))
+
+
+def _fixed_frequency_seconds(freq: Optional[str]) -> Optional[float]:
+    if not freq:
+        return None
+    try:
+        offset = pd.tseries.frequencies.to_offset(str(freq))
+        seconds = float(pd.Timedelta(offset).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return seconds if seconds > 0 else None
 
 
 def _seconds_to_freq(seconds: float) -> str:

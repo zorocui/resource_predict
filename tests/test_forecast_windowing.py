@@ -68,6 +68,59 @@ class ForecastWindowingTest(unittest.TestCase):
         self.assertEqual(window.test_size, 288)
         self.assertEqual(window.future_steps, 288)
 
+    def test_single_point_workload_uses_raw_frequency_fallback(self):
+        item = {
+            "resource_id": "k8s:cluster-a:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "cpu": series(1, "5min"),
+        }
+
+        window = resolve_forecast_window(
+            cfg=settings.generation,
+            items=[item],
+            explicit_test_size=None,
+            explicit_future_steps=None,
+            fallback_freq="300s",
+        )
+
+        self.assertEqual(window.sample_interval_seconds, 300.0)
+        self.assertEqual(window.test_size, 288)
+        self.assertEqual(window.future_steps, 288)
+
+    def test_single_point_without_fallback_keeps_frequency_unknown_error(self):
+        item = {
+            "resource_id": "k8s:cluster-a:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "cpu": series(1, "5min"),
+        }
+
+        with self.assertRaisesRegex(ValueError, "时间序列频率未知"):
+            resolve_forecast_window(
+                cfg=settings.generation,
+                items=[item],
+                explicit_test_size=None,
+                explicit_future_steps=None,
+            )
+
+    def test_actual_interval_wins_over_frequency_fallback(self):
+        item = {
+            "resource_id": "k8s:cluster-a:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "cpu": series(100, "15min"),
+        }
+
+        window = resolve_forecast_window(
+            cfg=settings.generation,
+            items=[item],
+            explicit_test_size=None,
+            explicit_future_steps=None,
+            fallback_freq="300s",
+        )
+
+        self.assertEqual(window.sample_interval_seconds, 900.0)
+        self.assertEqual(window.test_size, 96)
+        self.assertEqual(window.future_steps, 96)
+
     def test_scoped_point_count_overrides_are_supported(self):
         cfg = replace(
             settings.generation,
