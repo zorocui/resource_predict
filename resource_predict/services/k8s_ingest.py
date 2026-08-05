@@ -118,7 +118,18 @@ def run_k8s_prometheus_upsert(
             fetch_finished_at,
         )
 
-        result = dict(run_upsert_with_data(items, fail_if_busy=fail_if_busy, out_dir=out_dir))
+        step_seconds = max(
+            1,
+            int(getattr(settings.k8s_prometheus, "step_seconds", 300)),
+        )
+        result = dict(
+            run_upsert_with_data(
+                items,
+                fail_if_busy=fail_if_busy,
+                out_dir=out_dir,
+                freq_hint=f"{step_seconds}s",
+            )
+        )
         result["cluster_results"] = cluster_results
         if not result.get("success"):
             result["status"] = "failed"

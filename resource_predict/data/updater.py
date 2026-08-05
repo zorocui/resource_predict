@@ -627,6 +627,7 @@ def run_upsert_with_data(
     fail_if_busy: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     task_source: str = "推送 Upsert 更新",
+    freq_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     使用外部传入数据进行显式 upsert：已有资源更新，不存在的资源插入。
@@ -650,6 +651,7 @@ def run_upsert_with_data(
         out_dir=out_dir,
         task_source=effective_source,
         record_history=not inherited_external_source,
+        freq_hint=freq_hint,
     )
 
 
@@ -740,6 +742,7 @@ def _do_update(
     _exclusive_already_acquired: bool = False,
     task_source: str = "",
     record_history: bool = True,
+    freq_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     更新流程核心：run_update / run_update_with_data 复用。
@@ -819,6 +822,10 @@ def _do_update(
                 meta = raw_store.metadata()
                 freq = str(meta.get("freq", settings.generation.freq))
             logger.info("[updater] 已读取 %d 个资源，freq=%s", len(prepared), freq)
+
+        if freq_hint:
+            freq = str(freq_hint)
+            logger.info("[updater] 使用显式采样频率提示：freq=%s", freq)
 
         cfg_u = settings.update
         use_sw = bool(cfg_u.sliding_window)
@@ -960,7 +967,7 @@ def _do_update(
             _update_status["resources_updated"] = updated_count
             _update_status["resources_created"] = created_count
             _update_status["created_resource_ids"] = list(created_resource_ids)
-        if prepared:
+        if prepared and not freq_hint:
             try:
                 first_metric = metric_names_for_resource(prepared[0])[0]
                 freq = infer_series_freq(prepared[0][first_metric].index)

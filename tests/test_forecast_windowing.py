@@ -212,6 +212,36 @@ class ForecastWindowingTest(unittest.TestCase):
             meta = RawResourceStore(base).metadata()
             self.assertEqual(meta.get("freq"), "5min")
 
+    def test_single_point_k8s_upsert_preserves_frequency_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            timestamp = int(pd.Timestamp("2026-01-01").timestamp() * 1000)
+            k8s_item = {
+                "resource_id": "k8s:cluster-a:ns:deployment:api",
+                "resource_type": "k8s_workload",
+                "metrics": {
+                    metric: {"timestamps": [timestamp], "values": [0.2]}
+                    for metric in K8S_METRICS
+                },
+                "spec": {
+                    "cluster": "cluster-a",
+                    "namespace": "ns",
+                    "workload_kind": "Deployment",
+                    "workload_name": "api",
+                    "containers": {},
+                },
+            }
+
+            result = run_upsert_with_data(
+                [k8s_item],
+                out_dir=base,
+                fail_if_busy=True,
+                freq_hint="300s",
+            )
+
+            self.assertTrue(result["success"], result)
+            self.assertEqual(RawResourceStore(base).metadata().get("freq"), "300s")
+
     def test_k8s_upsert_merges_container_metrics_for_existing_resource(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

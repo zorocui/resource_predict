@@ -129,6 +129,7 @@ class ClusterConfigsTest(unittest.TestCase):
                 k8s_prometheus=SimpleNamespace(
                     scheduled_update_interval_minutes=360,
                     incremental_overlap_minutes=60,
+                    step_seconds=600,
                 ),
             )
             with patch.object(k8s_ingest, "settings", fake_settings):
@@ -147,6 +148,7 @@ class ClusterConfigsTest(unittest.TestCase):
             items,
             fail_if_busy=True,
             out_dir=Path(tmp) / "k8s",
+            freq_hint="600s",
         )
 
     def test_k8s_ingest_uses_full_window_without_raw_baseline(self):
