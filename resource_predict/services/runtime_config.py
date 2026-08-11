@@ -30,8 +30,8 @@ class CollectionConfig:
     scheduled_update_enabled: bool = True
     scheduled_update_interval_minutes: int = 360
     history_days: int = 7
-    step_seconds: int = 300
-    rate_window: str = "5m"
+    step_seconds: int = 600
+    rate_window: str = "15m"
     request_timeout_seconds: int = 300
     range_query_chunk_hours: int = 24
     request_max_attempts: int = 3
@@ -164,7 +164,7 @@ def normalize_runtime_config(payload: Any) -> RuntimeConfig:
 
     rate_window = str(c["rate_window"] or "").strip()
     if not re.fullmatch(r"[1-9]\d*[smhd]", rate_window):
-        raise _error("runtime.collection.rate_window", "必须是正整数加 s/m/h/d，例如 5m")
+        raise _error("runtime.collection.rate_window", "必须是正整数加 s/m/h/d，例如 15m")
     collection = CollectionConfig(
         scheduled_update_enabled=_bool(c["scheduled_update_enabled"], "runtime.collection.scheduled_update_enabled"),
         scheduled_update_interval_minutes=_positive_int(c["scheduled_update_interval_minutes"], "runtime.collection.scheduled_update_interval_minutes"),

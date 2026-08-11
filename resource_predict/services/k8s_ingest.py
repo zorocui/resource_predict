@@ -120,7 +120,7 @@ def run_k8s_prometheus_upsert(
 
         step_seconds = max(
             1,
-            int(getattr(settings.k8s_prometheus, "step_seconds", 300)),
+            int(getattr(settings.k8s_prometheus, "step_seconds", 600)),
         )
         result = dict(
             run_upsert_with_data(

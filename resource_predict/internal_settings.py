@@ -197,11 +197,11 @@ class K8SPrometheusConfig:
     history_days: int = 7
     # 增量拉取时在调度周期外额外回看多久，单位分钟；默认 60 表示多拉 1 小时以覆盖延迟/边界。
     incremental_overlap_minutes: int = 60
-    # Prometheus range query 步长，单位秒；300 表示 5 分钟一个点。
-    step_seconds: int = 300
-    # rate() 计算窗口，例如 "5m"、"10m"；建议为 step_seconds 的 2~4 倍。
+    # Prometheus range query 步长，单位秒；600 表示 10 分钟一个点。
+    step_seconds: int = 600
+    # rate() 计算窗口，例如 "15m"、"30m"；建议覆盖至少 2~4 个 Prometheus 抓取样本。
     # 单集群未配置时使用该值作为默认值。
-    rate_window: str = "5m"
+    rate_window: str = "15m"
     # 全局命名空间过滤正则；单集群未配置 namespace_regex 时使用该值。
     namespace_regex: str = ""
     # Prometheus HTTP 请求超时时间，单位秒。

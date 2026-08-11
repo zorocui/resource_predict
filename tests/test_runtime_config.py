@@ -18,7 +18,8 @@ class RuntimeConfigTest(unittest.TestCase):
     def test_defaults_expose_only_runtime_whitelist(self):
         payload = runtime_config_to_dict(default_runtime_config())
         self.assertEqual(set(payload), {"collection", "prediction", "decision"})
-        self.assertEqual(payload["collection"]["rate_window"], "5m")
+        self.assertEqual(payload["collection"]["step_seconds"], 600)
+        self.assertEqual(payload["collection"]["rate_window"], "15m")
         self.assertNotIn("fail_fast", payload["collection"])
         self.assertEqual(sum(len(v) for v in payload.values()), 26)
 

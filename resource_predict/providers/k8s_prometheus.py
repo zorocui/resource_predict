@@ -140,7 +140,7 @@ class PrometheusTarget:
     history_days: int
     step_seconds: int
     request_timeout_seconds: int
-    rate_window: str = "5m"
+    rate_window: str = "15m"
 
 
 ContainerKey = Tuple[str, str, str]
@@ -795,7 +795,7 @@ def _resolve_targets() -> List[PrometheusTarget]:
                 history_days=int(cfg.history_days),
                 step_seconds=int(cfg.step_seconds),
                 request_timeout_seconds=int(cfg.request_timeout_seconds),
-                rate_window=str(data.get("rate_window") or cfg.rate_window or "5m").strip(),
+                rate_window=str(data.get("rate_window") or cfg.rate_window or "15m").strip(),
             )
         )
     if invalid:

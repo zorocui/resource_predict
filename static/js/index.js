@@ -405,8 +405,8 @@
         ${configInput("启用定时拉取", "scheduled_update_enabled", collection.scheduled_update_enabled !== false, { type: "checkbox" })}
         ${configInput("拉取周期（分钟）", "scheduled_update_interval_minutes", collection.scheduled_update_interval_minutes || 360, { type: "number" })}
         ${configInput("全量历史（天）", "history_days", collection.history_days || 7, { type: "number" })}
-        ${configInput("采样步长（秒）", "step_seconds", collection.step_seconds || 300, { type: "number" })}
-        ${configInput("CPU Rate 窗口", "rate_window", collection.rate_window || "5m", { placeholder: "5m" })}
+        ${configInput("采样步长（秒）", "step_seconds", collection.step_seconds || 600, { type: "number" })}
+        ${configInput("CPU Rate 窗口", "rate_window", collection.rate_window || "15m", { placeholder: "15m" })}
         ${configInput("请求超时（秒）", "request_timeout_seconds", collection.request_timeout_seconds || 300, { type: "number" })}
         ${configInput("Range 分片（小时）", "range_query_chunk_hours", collection.range_query_chunk_hours || 24, { type: "number" })}
         ${configInput("最大请求次数", "request_max_attempts", collection.request_max_attempts || 3, { type: "number" })}
@@ -499,7 +499,7 @@
           ${configInput("Namespace 正则", "namespace_regex", cfg.namespace_regex || "", { placeholder: "prod|default" })}
           ${configInput("Bearer Token", "bearer_token", cfg.bearer_token || "")}
           ${configInput("Basic Auth", "basic_auth", cfg.basic_auth || "", { placeholder: "base64(user:password)" })}
-          ${configInput("Rate 窗口", "rate_window", cfg.rate_window || "", { placeholder: "5m" })}
+          ${configInput("Rate 窗口", "rate_window", cfg.rate_window || "", { placeholder: "15m" })}
         </div>
       </div>
     `).join("");
