@@ -10,8 +10,10 @@ import pandas as pd
 
 from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.data import updater
-from resource_predict.data.updater import run_update_with_data
+from resource_predict.data.updater import run_update_with_data, run_upsert_with_data
 from resource_predict.pipeline.constants import RAW_INDEX_FILENAME
+from resource_predict.pipeline.partial import load_existing_forecast_items
+from resource_predict.pipeline.write_outputs import write_prediction_outputs
 
 
 def _series(values, freq="5min"):
@@ -48,6 +50,36 @@ def _k8s(resource_id):
             }
         },
     }
+
+
+def _forecast_item(resource_id, marker):
+    return {
+        "resource_id": resource_id,
+        "resource_type": "k8s_workload",
+        "spec": {"cluster": "a", "namespace": "prod", "containers": {"api": {}}},
+        "best_methods": {},
+        "metrics": {},
+        "charts_forecast": {},
+        "observed_stats": {"marker": marker},
+    }
+
+
+def _write_forecast_items(base, items):
+    return write_prediction_outputs(
+        out_base=base,
+        resources_items=items,
+        active_methods=["rolling_mean"],
+        test_size=1,
+        future_steps=1,
+        forecast_window={"sample_interval_seconds": 300.0},
+        detail_chunk_size=100,
+        predicted_count=len(items),
+        partial_resource_ids=set(),
+        metric_filter_by_id={},
+        metric_partial_enabled=False,
+        total_elapsed=0.0,
+        raw_stats={},
+    )
 
 
 class RawResourceStoreTest(unittest.TestCase):
@@ -232,6 +264,61 @@ class RawResourceStoreTest(unittest.TestCase):
 
             self.assertTrue(result["success"], result.get("error"))
             self.assertEqual(RawResourceStore(base).get("vm-1")["cpu"].iloc[-1], 0.4)
+
+    def test_partial_k8s_upsert_preserves_missing_workload_and_forecast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rid_a = "k8s:a:prod:deployment:api"
+            rid_b = "k8s:a:prod:deployment:worker"
+            resource_a = _k8s(rid_a)
+            resource_b = _k8s(rid_b)
+            original_values = resource_b["cpu_limit"].tolist()
+            write_raw_resource_dataset(base, [resource_a, resource_b], freq="5min")
+            _write_forecast_items(
+                base,
+                [_forecast_item(rid_a, "old-a"), _forecast_item(rid_b, "old-b")],
+            )
+            timestamp = int(pd.Timestamp("2026-01-01 00:20:00").timestamp() * 1000)
+
+            def fake_worker(index, prepared, **_kwargs):
+                self.assertEqual([item["resource_id"] for item in prepared], [rid_a])
+                return {**_forecast_item(rid_a, "new-a"), "_slot": index, "_timings": {}}
+
+            window = type("Window", (), {
+                "test_size": 1,
+                "future_steps": 1,
+                "sample_interval_seconds": 300.0,
+                "source": "test",
+                "resource_family": "k8s",
+                "test_duration": "5min",
+                "future_duration": "5min",
+            })()
+            with patch("resource_predict.pipeline.run.resolve_forecast_window", return_value=window):
+                with patch("resource_predict.pipeline.run._worker", side_effect=fake_worker):
+                    result = run_upsert_with_data(
+                        [{
+                            "resource_id": rid_a,
+                            "resource_type": "k8s_workload",
+                            "metrics": {
+                                metric: {"timestamps": [timestamp], "values": [0.5]}
+                                for metric in (
+                                    "cpu_limit", "cpu_request", "memory_limit", "memory_request"
+                                )
+                            },
+                        }],
+                        out_dir=base,
+                        fail_if_busy=True,
+                        freq_hint="5min",
+                    )
+
+            self.assertTrue(result["success"], result.get("error"))
+            store = RawResourceStore(base)
+            self.assertEqual(set(store.resource_ids()), {rid_a, rid_b})
+            self.assertEqual(store.get(rid_b)["cpu_limit"].tolist(), original_values)
+            forecasts = load_existing_forecast_items(base)
+            self.assertEqual({item["resource_id"] for item in forecasts}, {rid_a, rid_b})
+            markers = {item["resource_id"]: item["observed_stats"]["marker"] for item in forecasts}
+            self.assertEqual(markers, {rid_a: "new-a", rid_b: "old-b"})
 
     def test_pull_provider_runs_inside_update_exclusive_lock(self):
         with tempfile.TemporaryDirectory() as tmp:

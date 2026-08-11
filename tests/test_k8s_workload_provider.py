@@ -704,6 +704,49 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         self.assertEqual(quality["level"], "good")
         self.assertEqual(quality["max_gap_seconds"], 300)
 
+    def test_regularize_series_fills_short_gap_but_leaves_large_gap_empty(self):
+        idx = pd.to_datetime([
+            "2026-08-01 00:00",
+            "2026-08-01 00:10",
+            "2026-08-01 01:00",
+            "2026-08-01 01:05",
+        ])
+        original = pd.Series([0.0, 2.0, 10.0, 11.0], index=idx)
+
+        result = provider._regularize_series(original, 300, max_gap_steps=3)
+
+        self.assertAlmostEqual(result.loc[pd.Timestamp("2026-08-01 00:05")], 1.0)
+        large_gap_points = pd.date_range(
+            "2026-08-01 00:15", "2026-08-01 00:55", freq="5min"
+        )
+        self.assertTrue(
+            all(timestamp not in result.index for timestamp in large_gap_points)
+        )
+
+        quality = provider._data_quality(original, step_seconds=300)
+        self.assertEqual(quality["max_gap_seconds"], 3000)
+        self.assertGreater(quality["missing_ratio"], 0.5)
+
+    def test_fetch_target_applies_configured_gap_limit_to_every_series(self):
+        target = _target("cluster-a")
+
+        with patch.object(provider, "PrometheusClient", FakePrometheusClient):
+            with patch.object(
+                provider,
+                "_regularize_series",
+                wraps=provider._regularize_series,
+            ) as regularize:
+                items = provider._fetch_target(target, limit=0)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(regularize.call_count, 12)
+        self.assertTrue(
+            all(
+                call.args[2] == provider.settings.k8s_prometheus.max_interpolation_gap_steps
+                for call in regularize.call_args_list
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

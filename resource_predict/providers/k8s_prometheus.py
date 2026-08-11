@@ -495,6 +495,9 @@ def _fetch_target(
     else:
         start = end - int(target.history_days) * 86400
     step = int(target.step_seconds)
+    max_interpolation_gap_steps = int(
+        settings.k8s_prometheus.max_interpolation_gap_steps
+    )
     selector = 'container!="",container!="POD",pod!=""'
     if target.namespace_regex:
         selector += f',namespace=~"{target.namespace_regex}"'
@@ -673,10 +676,18 @@ def _fetch_target(
                 "memory_request": _data_quality(mem_request_container_norm, step),
             }
             container_metrics[container] = {
-                "cpu_limit": _series_payload(_regularize_series(cpu_limit_container_norm, step)),
-                "cpu_request": _series_payload(_regularize_series(cpu_request_container_norm, step)),
-                "memory_limit": _series_payload(_regularize_series(mem_limit_container_norm, step)),
-                "memory_request": _series_payload(_regularize_series(mem_request_container_norm, step)),
+                "cpu_limit": _series_payload(_regularize_series(
+                    cpu_limit_container_norm, step, max_interpolation_gap_steps
+                )),
+                "cpu_request": _series_payload(_regularize_series(
+                    cpu_request_container_norm, step, max_interpolation_gap_steps
+                )),
+                "memory_limit": _series_payload(_regularize_series(
+                    mem_limit_container_norm, step, max_interpolation_gap_steps
+                )),
+                "memory_request": _series_payload(_regularize_series(
+                    mem_request_container_norm, step, max_interpolation_gap_steps
+                )),
             }
             container_modes[container] = {
                 "cpu_limit": cpu_limit_container_metric,
@@ -684,10 +695,18 @@ def _fetch_target(
                 "memory_limit": mem_limit_container_metric,
                 "memory_request": mem_request_container_metric,
             }
-        cpu_limit_norm = _regularize_series(cpu_limit_norm, step)
-        cpu_request_norm = _regularize_series(cpu_request_norm, step)
-        mem_limit_norm = _regularize_series(mem_limit_norm, step)
-        mem_request_norm = _regularize_series(mem_request_norm, step)
+        cpu_limit_norm = _regularize_series(
+            cpu_limit_norm, step, max_interpolation_gap_steps
+        )
+        cpu_request_norm = _regularize_series(
+            cpu_request_norm, step, max_interpolation_gap_steps
+        )
+        mem_limit_norm = _regularize_series(
+            mem_limit_norm, step, max_interpolation_gap_steps
+        )
+        mem_request_norm = _regularize_series(
+            mem_request_norm, step, max_interpolation_gap_steps
+        )
         namespace, owner_kind, owner_name = key
         meta = metadata_by_workload.get(key, {})
         # 优先使用 kube-state-metrics 上报的控制器副本数（spec/status replicas），
@@ -1157,15 +1176,30 @@ def _series_bytes_to_gb(series: Optional[pd.Series]) -> Optional[pd.Series]:
     return series / BYTES_PER_GIB
 
 
-def _regularize_series(series: pd.Series, step_seconds: int) -> pd.Series:
-    s = series.sort_index()
-    if s.empty:
-        return s
+def _regularize_series(
+    series: pd.Series,
+    step_seconds: int,
+    max_gap_steps: int,
+) -> pd.Series:
+    ordered = series.sort_index()
+    if ordered.empty:
+        return ordered
     rule = f"{max(1, int(step_seconds))}s"
-    out = s.resample(rule).mean()
-    if out.isna().any():
-        out = out.interpolate(method="time").ffill().bfill()
-    return out
+    resampled = ordered.resample(rule).mean()
+    missing = resampled.isna()
+    if not missing.any() or int(max_gap_steps) <= 0:
+        return resampled.dropna()
+
+    # ``interpolate(limit=N)`` still fills N samples at the edge of a gap
+    # longer than N.  Instead, classify complete missing runs and allow values
+    # only when the whole interior run fits within the configured bound.
+    run_ids = missing.ne(missing.shift(fill_value=False)).cumsum()
+    run_lengths = missing.groupby(run_ids).transform("sum")
+    bounded_missing = missing & (run_lengths <= max(0, int(max_gap_steps)))
+    interpolated = resampled.interpolate(method="time", limit_area="inside")
+    filled = resampled.copy()
+    filled.loc[bounded_missing] = interpolated.loc[bounded_missing]
+    return filled.dropna()
 
 
 def _bytes_to_gb(value: Optional[float]) -> Optional[float]:
