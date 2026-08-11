@@ -85,7 +85,7 @@ cp deploy/clusters.example.json deploy/clusters.json
     "namespace_regex": "default|prod",
     "bearer_token": "",
     "basic_auth": "",
-    "rate_window": "5m"
+    "rate_window": "15m"
   }
 ]
 ```
@@ -140,8 +140,8 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
     "scheduled_update_enabled": true,
     "scheduled_update_interval_minutes": 360,
     "history_days": 7,
-    "step_seconds": 300,
-    "rate_window": "5m",
+    "step_seconds": 600,
+    "rate_window": "15m",
     "request_timeout_seconds": 300,
     "range_query_chunk_hours": 24,
     "request_max_attempts": 3,
@@ -173,9 +173,9 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 | `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `True` / `True` / `auto` / `3.5` |
 | `DecisionConfig` | `scale_out_threshold` / `scale_in_threshold` / `scale_in_max_reduction_ratio` / `scale_out_confirmations` / `scale_in_confirmations` / `action_gate_state_retention_days` | `0.8` / `0.2` / `0.5` / `2` / `3` / `30` |
 | `UpdateConfig` | `enabled` / `interval_minutes` / `startup_delay_seconds` / `sliding_window` | `False` / `60` / `60` / `False` |
-| `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` / `range_query_chunk_hours` / `request_max_attempts` / `retry_backoff_seconds` / `max_interpolation_gap_steps` | `7` / `60` / `300` / `5m` / `True` / `360` / `24` / `3` / `1.0` / `3` |
+| `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` / `range_query_chunk_hours` / `request_max_attempts` / `retry_backoff_seconds` / `max_interpolation_gap_steps` | `7` / `60` / `600` / `15m` / `True` / `360` / `24` / `3` / `1.0` / `3` |
 
-`rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值。
+`rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值 `15m`。默认 `step_seconds=600` 表示每 10 分钟返回一个结果点，两个参数彼此独立。
 
 K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_refresh=true` 时，会按 `history_days` 拉取全量历史窗口（默认最近 7 天）。已有本地基线后的普通拉取会使用增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认 `360 + 60 = 420` 分钟，即最近 7 小时。
 
@@ -189,7 +189,7 @@ K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_re
 | `vm_test_duration` / `vm_future_duration` | VM 专用时长，优先于点数 |
 | `workload_test_duration` / `workload_future_duration` | K8S Workload 专用时长，默认 `24h` |
 
-VM 时长根据观测到的采样间隔换算点数；K8S Workload 始终以配置的 `step_seconds` 为权威采样间隔，避免 Prometheus 拉取失败形成的大间隔误导窗口换算。例如 `step_seconds=300` + `workload_test_duration="24h"` = 288 个测试点。未来预测时间戳从最后一个有效测试点之后的一个采样间隔开始，不随当前时间或稀疏观测间隔平移。
+VM 时长根据观测到的采样间隔换算点数；K8S Workload 始终以配置的 `step_seconds` 为权威采样间隔，避免 Prometheus 拉取失败形成的大间隔误导窗口换算。例如 `step_seconds=600` + `workload_test_duration="24h"` = 144 个测试点。未来预测时间戳从最后一个有效测试点之后的一个采样间隔开始，不随当前时间或稀疏观测间隔平移。
 
 ### 策略分级配置
 
