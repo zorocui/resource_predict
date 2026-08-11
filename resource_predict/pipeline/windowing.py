@@ -59,15 +59,20 @@ def resolve_forecast_window(
     explicit_test_size: Optional[int],
     explicit_future_steps: Optional[int],
     fallback_freq: Optional[str] = None,
+    prefer_fallback_freq: bool = False,
 ) -> ForecastWindow:
     if not items:
         raise ValueError("无法解析预测窗口：资源列表为空")
 
     family = resource_family_for_items(items)
     index = _first_metric_index(items)
-    sample_seconds = infer_sample_interval_seconds(index)
-    if sample_seconds is None:
-        sample_seconds = _fixed_frequency_seconds(fallback_freq)
+    observed_seconds = infer_sample_interval_seconds(index)
+    fallback_seconds = _fixed_frequency_seconds(fallback_freq)
+    sample_seconds = (
+        fallback_seconds
+        if prefer_fallback_freq and fallback_seconds is not None
+        else observed_seconds if observed_seconds is not None else fallback_seconds
+    )
 
     test_duration = _scoped_value(cfg, family, "test_duration")
     future_duration = _scoped_value(cfg, family, "future_duration")
@@ -122,6 +127,33 @@ def resolve_forecast_window(
         future_duration=future_duration,
         source=f"{test_source},{future_source}",
     )
+
+
+def recent_contiguous_segment(
+    series: pd.Series,
+    sample_interval_seconds: float,
+    max_gap_steps: int,
+) -> pd.Series:
+    """Return the newest run of observations not separated by a large gap."""
+    if not isinstance(series, pd.Series):
+        raise TypeError("series 必须为 pandas.Series")
+    if not isinstance(series.index, pd.DatetimeIndex):
+        raise TypeError("series.index 必须为 DatetimeIndex")
+    sample_seconds = float(sample_interval_seconds)
+    if not np.isfinite(sample_seconds) or sample_seconds <= 0:
+        raise ValueError("sample_interval_seconds 必须为正数")
+    gap_steps = int(max_gap_steps)
+    if gap_steps < 0:
+        raise ValueError("max_gap_steps 不能为负数")
+
+    ordered = series.sort_index()
+    ordered = ordered[~ordered.index.duplicated(keep="last")].dropna()
+    if len(ordered) < 2:
+        return ordered.copy()
+    diffs = np.diff(ordered.index.view("int64")) / 1_000_000_000
+    large_gap_positions = np.flatnonzero(diffs > sample_seconds * (gap_steps + 1))
+    start = int(large_gap_positions[-1] + 1) if large_gap_positions.size else 0
+    return ordered.iloc[start:].copy()
 
 
 def _resource_family(item: dict[str, Any]) -> str:

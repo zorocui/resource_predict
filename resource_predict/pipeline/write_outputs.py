@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -33,7 +33,9 @@ def write_prediction_outputs(
     metric_partial_enabled: bool,
     total_elapsed: float,
     raw_stats: Dict[str, int],
+    prediction_skips: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
+    prediction_skips = list(prediction_skips or [])
     details_dir = out_base / DETAILS_DIRNAME
     details_dir.mkdir(parents=True, exist_ok=True)
     details_files: List[str] = []
@@ -103,6 +105,7 @@ def write_prediction_outputs(
             "details_dir": DETAILS_DIRNAME,
             "details_files": details_files,
             "raw_index_file": RAW_INDEX_FILENAME,
+            "prediction_skips": prediction_skips,
         },
         "resources": summary_resources,
     }
@@ -116,7 +119,7 @@ def write_prediction_outputs(
     manifest_items = [dict(item) for item in resources_items]
     atomic_write_json(
         out_base / MANIFEST_FILENAME,
-        {"resources": manifest_items},
+        {"meta": {"prediction_skips": prediction_skips}, "resources": manifest_items},
         ensure_ascii=False,
         indent=2,
     )
@@ -126,6 +129,7 @@ def write_prediction_outputs(
         test_size=test_size,
         future_steps=future_steps,
         forecast_window=forecast_window,
+        prediction_skips=prediction_skips,
     )
     atomic_write_json(
         out_base / FORECAST_ERROR_REPORT_FILENAME,
@@ -165,6 +169,7 @@ def write_prediction_outputs(
         "total_output_bytes": total_bytes,
         "forecast_error_report_file": FORECAST_ERROR_REPORT_FILENAME,
         "raw": dict(raw_stats),
+        "prediction_skips": prediction_skips,
     }
     atomic_write_json(
         out_base / GENERATION_STATS_FILENAME,
@@ -182,6 +187,7 @@ def _build_forecast_error_report(
     test_size: int,
     future_steps: int,
     forecast_window: Dict[str, Any],
+    prediction_skips: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """构建按资源/指标/模型/窗口展开的预测误差报告。"""
     rows: List[Dict[str, Any]] = []
@@ -250,6 +256,7 @@ def _build_forecast_error_report(
             "rows": len(rows),
             "active_methods": active_methods,
             "window": window_info,
+            "prediction_skips": list(prediction_skips or []),
         },
         "resources": resources,
         "rows": rows,

@@ -19,8 +19,16 @@ from resource_predict.pipeline._types import WorkerContext
 from resource_predict.pipeline.constants import MANIFEST_FILENAME
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
-from resource_predict.pipeline.prepare import ExternalProvider, build_prepared_data
-from resource_predict.pipeline.windowing import infer_series_freq, resolve_forecast_window
+from resource_predict.pipeline.prepare import (
+    ExternalProvider,
+    build_prepared_data,
+    prepare_recent_contiguous_forecast_data,
+)
+from resource_predict.pipeline.windowing import (
+    infer_series_freq,
+    resolve_forecast_window,
+    resource_family_for_items,
+)
 from resource_predict.pipeline.worker import worker as _worker
 from resource_predict.pipeline.write_outputs import write_prediction_outputs
 from resource_predict.resource_types import metric_names_for_resource
@@ -124,21 +132,29 @@ def generate_forecasts(
         # 注：raw 写盘延迟到频率推断完成后（下方统一执行），避免用初始频率写入。
         # data_provider 路径已在 build_prepared_data 内做 checkpoint 写入作为安全网。
 
+    resource_family = resource_family_for_items(prepared_data)
+    if resource_family == "workload":
+        configured_step = int(settings.k8s_prometheus.step_seconds)
+        freq = pd.tseries.frequencies.to_offset(
+            pd.Timedelta(seconds=configured_step)
+        ).freqstr
     window = resolve_forecast_window(
         cfg=cfg,
         items=prepared_data,
         explicit_test_size=explicit_test_size,
         explicit_future_steps=explicit_future_steps,
         fallback_freq=freq,
+        prefer_fallback_freq=resource_family == "workload",
     )
     test_size = window.test_size
     future_steps = window.future_steps
-    try:
-        first_series = _first_metric_series(prepared_data)
-        if first_series is not None:
-            freq = infer_series_freq(first_series.index)
-    except Exception:
-        pass
+    if resource_family != "workload":
+        try:
+            first_series = _first_metric_series(prepared_data)
+            if first_series is not None:
+                freq = infer_series_freq(first_series.index)
+        except Exception:
+            pass
     if not predict_only and save_raw:
         raw_stats = write_raw_resource_dataset(out_base, prepared_data, freq=freq)
         logger.info(
@@ -148,50 +164,54 @@ def generate_forecasts(
             raw_stats["files_reused"],
             raw_stats["files_removed"],
         )
+    prediction_skips: List[Dict[str, str]] = []
+    if resource_family == "workload":
+        prepared_data, prediction_skips = prepare_recent_contiguous_forecast_data(
+            prepared_data,
+            sample_interval_seconds=float(window.sample_interval_seconds),
+            max_gap_steps=int(settings.k8s_prometheus.max_interpolation_gap_steps),
+            test_size=test_size,
+        )
     skipped_short: List[str] = []
     for p in prepared_data:
         rid = p["resource_id"]
         metric_names = metric_names_for_resource(p)
         min_len = min(len(p[m]) for m in metric_names)
         if min_len <= test_size:
-            if predict_only:
-                skipped_short.append(rid)
-            else:
-                raise ValueError(
-                    f"{rid} 有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
-                )
+            skipped_short.append(rid)
+    retained_skip_items = _load_retained_skipped_items(
+        out_base,
+        skipped_resource_ids=set(skipped_short),
+        current_items=prepared_data,
+    )
     if skipped_short:
         for rid in skipped_short:
             logger.warning(
-                "[progress] 跳过有效点数不足的资源（predict_only 模式）：%s"
-                "（序列长度 ≤ test_size=%d）",
+                "[progress] 跳过最近连续段有效点数不足的资源：%s"
+                "（最近连续段长度 ≤ test_size=%d）",
                 rid, test_size,
             )
         prepared_data = [
             p for p in prepared_data if p["resource_id"] not in set(skipped_short)
         ]
         resources_ct = len(prepared_data)
-        if partial_resource_ids:
-            partial_resource_ids = {
-                rid for rid in partial_resource_ids if rid not in set(skipped_short)
-            }
         if resources_ct == 0:
             logger.warning(
                 "[progress] 所有待预测资源均因有效点数不足被跳过，"
-                "本次不执行预测（test_size=%d）",
+                "本次保留既有预测产物（test_size=%d）",
                 test_size,
             )
-            return []
-    _log_input_stats(
-        prepared_data,
-        resources_ct,
-        test_size,
-        future_steps,
-        freq,
-        predict_only=predict_only,
-        window_source=window.source,
-        sample_interval_seconds=window.sample_interval_seconds,
-    )
+    if resources_ct > 0:
+        _log_input_stats(
+            prepared_data,
+            resources_ct,
+            test_size,
+            future_steps,
+            freq,
+            predict_only=predict_only,
+            window_source=window.source,
+            sample_interval_seconds=window.sample_interval_seconds,
+        )
 
     max_workers, parallel_metrics_enabled, inner_metric_workers = resolve_parallel_plan(
         resources_ct=resources_ct,
@@ -273,6 +293,20 @@ def generate_forecasts(
         for item in resources_items
         if item.get("resource_id") is not None
     }
+    resources_items = _restore_skipped_container_forecasts(
+        out_base,
+        resources_items=resources_items,
+        prediction_skips=prediction_skips,
+    )
+    if retained_skip_items:
+        resources_items = merge_partial_forecast_items(
+            retained_skip_items,
+            resources_items,
+        )
+        logger.info(
+            "[progress] 因数据质量跳过后保留 %d 个既有预测资源",
+            len(retained_skip_items),
+        )
     if predict_only and partial_resource_ids:
         existing_items = existing_items_for_partial or load_existing_forecast_items(out_base)
         if existing_items:
@@ -319,6 +353,7 @@ def generate_forecasts(
         metric_partial_enabled=metric_partial_enabled,
         total_elapsed=total_elapsed,
         raw_stats=raw_stats,
+        prediction_skips=prediction_skips,
     )
     try:
         write_action_gate_state(out_base, action_gate_state)
@@ -343,6 +378,90 @@ def generate_forecasts(
             avg_parts,
         )
     return manifest_items
+
+
+def _load_retained_skipped_items(
+    out_base: Path,
+    *,
+    skipped_resource_ids: Set[str],
+    current_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not skipped_resource_ids:
+        return []
+    current_by_id = {
+        str(item.get("resource_id")): item
+        for item in current_items
+        if item.get("resource_id") is not None
+    }
+    retained: List[Dict[str, Any]] = []
+    for old in load_existing_forecast_items(out_base):
+        rid = str(old.get("resource_id") or "")
+        if rid not in skipped_resource_ids:
+            continue
+        merged = dict(old)
+        current = current_by_id.get(rid, {})
+        for field in (
+            "spec",
+            "data_quality",
+            "container_data_quality",
+            "container_metric_modes",
+        ):
+            if isinstance(current.get(field), dict):
+                merged[field] = current[field]
+        retained.append(merged)
+    return retained
+
+
+def _restore_skipped_container_forecasts(
+    out_base: Path,
+    *,
+    resources_items: List[Dict[str, Any]],
+    prediction_skips: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    skipped: Dict[str, List[tuple[str, str]]] = {}
+    for entry in prediction_skips:
+        metric_path = str(entry.get("metric") or "")
+        parts = metric_path.split("/", 2)
+        if len(parts) != 3 or parts[0] != "container":
+            continue
+        skipped.setdefault(str(entry.get("resource_id") or ""), []).append(
+            (parts[1], parts[2])
+        )
+    if not skipped:
+        return resources_items
+    previous_by_id = {
+        str(item.get("resource_id") or ""): item
+        for item in load_existing_forecast_items(out_base)
+    }
+    restored: List[Dict[str, Any]] = []
+    for source in resources_items:
+        rid = str(source.get("resource_id") or "")
+        old = previous_by_id.get(rid)
+        if not isinstance(old, dict) or rid not in skipped:
+            restored.append(source)
+            continue
+        item = dict(source)
+        charts = _copy_nested_mapping(item.get("container_charts_forecast"))
+        old_charts = old.get("container_charts_forecast")
+        if isinstance(old_charts, dict):
+            for container, metric in skipped[rid]:
+                old_container = old_charts.get(container)
+                if isinstance(old_container, dict) and isinstance(old_container.get(metric), dict):
+                    charts.setdefault(container, {})[metric] = old_container[metric]
+        if charts:
+            item["container_charts_forecast"] = charts
+        restored.append(item)
+    return restored
+
+
+def _copy_nested_mapping(value: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): dict(nested)
+        for key, nested in value.items()
+        if isinstance(nested, dict)
+    }
 
 
 def generate_predictions_only(**kwargs: Any) -> List[Dict[str, Any]]:

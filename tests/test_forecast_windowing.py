@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,9 +11,16 @@ import pandas as pd
 
 from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.data.updater import run_upsert_with_data
-from resource_predict.pipeline.constants import FORECAST_ERROR_REPORT_FILENAME
+from resource_predict.pipeline.constants import FORECAST_ERROR_REPORT_FILENAME, MANIFEST_FILENAME
+from resource_predict.pipeline.partial import load_existing_forecast_items
 from resource_predict.pipeline.run import generate_forecasts
-from resource_predict.pipeline.windowing import infer_series_freq, resolve_forecast_window
+from resource_predict.pipeline.write_outputs import write_prediction_outputs
+from resource_predict.pipeline.prepare import prepare_recent_contiguous_forecast_data
+from resource_predict.pipeline.windowing import (
+    infer_series_freq,
+    recent_contiguous_segment,
+    resolve_forecast_window,
+)
 from resource_predict.settings import settings
 
 
@@ -120,6 +128,103 @@ class ForecastWindowingTest(unittest.TestCase):
         self.assertEqual(window.sample_interval_seconds, 900.0)
         self.assertEqual(window.test_size, 96)
         self.assertEqual(window.future_steps, 96)
+
+    def test_sparse_workload_prefers_configured_frequency(self):
+        idx = pd.to_datetime([
+            "2026-08-01 00:00", "2026-08-01 00:05", "2026-08-03 00:00"
+        ])
+        item = {
+            "resource_id": "k8s:a:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            "cpu_limit": pd.Series([0.1, 0.2, 0.3], index=idx),
+        }
+
+        window = resolve_forecast_window(
+            cfg=settings.generation,
+            items=[item],
+            explicit_test_size=None,
+            explicit_future_steps=None,
+            fallback_freq="300s",
+            prefer_fallback_freq=True,
+        )
+
+        self.assertEqual(window.sample_interval_seconds, 300.0)
+        self.assertEqual(window.test_size, 288)
+        self.assertEqual(window.future_steps, 288)
+
+    def test_vm_observed_interval_still_wins_when_fallback_is_not_preferred(self):
+        item = {
+            "resource_id": "vm-001",
+            "resource_type": "openstack_vm",
+            "cpu": series(100, "15min"),
+        }
+
+        window = resolve_forecast_window(
+            cfg=settings.generation,
+            items=[item],
+            explicit_test_size=None,
+            explicit_future_steps=None,
+            fallback_freq="300s",
+            prefer_fallback_freq=False,
+        )
+
+        self.assertEqual(window.sample_interval_seconds, 900.0)
+
+    def test_recent_contiguous_segment_starts_after_last_large_gap(self):
+        idx = pd.to_datetime([
+            "2026-08-01 00:00", "2026-08-01 00:05",
+            "2026-08-03 00:00", "2026-08-03 00:05", "2026-08-03 00:10",
+        ])
+        source = pd.Series(range(5), index=idx, dtype=float)
+
+        result = recent_contiguous_segment(source, 300.0, max_gap_steps=3)
+
+        self.assertEqual(result.index[0], pd.Timestamp("2026-08-03 00:00"))
+        self.assertEqual(result.tolist(), [2.0, 3.0, 4.0])
+
+    def test_workload_and_container_metrics_use_independent_recent_segments(self):
+        old = pd.date_range("2026-08-01", periods=2, freq="5min")
+        top_recent = pd.date_range("2026-08-03", periods=4, freq="5min")
+        container_recent = pd.date_range("2026-08-04", periods=3, freq="5min")
+        top = pd.Series(range(6), index=old.append(top_recent), dtype=float)
+        container = pd.Series(range(5), index=old.append(container_recent), dtype=float)
+        item = {
+            "resource_id": "k8s:a:ns:deployment:api",
+            "resource_type": "k8s_workload",
+            **{metric: top for metric in K8S_METRICS},
+            "container_metrics": {
+                "app": {metric: container for metric in K8S_METRICS}
+            },
+            "data_quality": {metric: {"level": "poor"} for metric in K8S_METRICS},
+            "container_data_quality": {
+                "app": {metric: {"level": "poor"} for metric in K8S_METRICS}
+            },
+        }
+
+        trimmed, skips = prepare_recent_contiguous_forecast_data(
+            [item],
+            sample_interval_seconds=300.0,
+            max_gap_steps=3,
+            test_size=3,
+        )
+
+        self.assertEqual(len(item["cpu_limit"]), 6)
+        self.assertEqual(trimmed[0]["cpu_limit"].index[0], top_recent[0])
+        self.assertEqual(trimmed[0]["container_metrics"]["app"]["cpu_limit"].index[0], container_recent[0])
+        quality = trimmed[0]["data_quality"]["cpu_limit"]
+        self.assertEqual(quality["recent_contiguous_points"], 4)
+        self.assertEqual(quality["data_end_ms"], int(top.index.max().value // 1_000_000))
+        self.assertFalse(quality["prediction_skipped"])
+        container_quality = trimmed[0]["container_data_quality"]["app"]["cpu_limit"]
+        self.assertTrue(container_quality["prediction_skipped"])
+        self.assertIn(
+            {
+                "resource_id": item["resource_id"],
+                "metric": "container/app/cpu_limit",
+                "reason": "recent_contiguous_segment_too_short",
+            },
+            skips,
+        )
 
     def test_scoped_point_count_overrides_are_supported(self):
         cfg = replace(
@@ -426,6 +531,209 @@ class ForecastWindowingTest(unittest.TestCase):
                 self.assertIn(key, row)
                 self.assertIsInstance(row[key], (int, float))
             self.assertEqual(row["window"]["source"], "workload_test_duration,workload_future_duration")
+
+    def test_short_recent_segment_retains_old_prediction_and_records_skip_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rid = "k8s:cluster-a:ns:deployment:api"
+            old_item = {
+                "resource_id": rid,
+                "resource_type": "k8s_workload",
+                "spec": {"cluster": "cluster-a", "namespace": "ns", "containers": {}},
+                "best_methods": {},
+                "metrics": {},
+                "charts_forecast": {},
+                "observed_stats": {"marker": "retained"},
+            }
+            write_prediction_outputs(
+                out_base=base,
+                resources_items=[old_item],
+                active_methods=["rolling_mean"],
+                test_size=3,
+                future_steps=2,
+                forecast_window={"sample_interval_seconds": 300.0},
+                detail_chunk_size=100,
+                predicted_count=1,
+                partial_resource_ids=set(),
+                metric_filter_by_id={},
+                metric_partial_enabled=False,
+                total_elapsed=0.0,
+                raw_stats={},
+            )
+            idx = pd.to_datetime([
+                "2026-08-01 00:00", "2026-08-01 00:05",
+                "2026-08-03 00:00", "2026-08-03 00:05", "2026-08-03 00:10",
+            ])
+            timestamps = (idx.view("int64") // 1_000_000).tolist()
+            incoming = {
+                "resource_id": rid,
+                "resource_type": "k8s_workload",
+                "metrics": {
+                    metric: {"timestamps": timestamps, "values": [0.2] * len(idx)}
+                    for metric in K8S_METRICS
+                },
+                "spec": old_item["spec"],
+            }
+
+            generate_forecasts(
+                out_dir=str(base),
+                data_provider=lambda resources, n, freq: [incoming],
+                test_size=3,
+                future_steps=2,
+                freq="300s",
+                save_raw=True,
+            )
+
+            raw = RawResourceStore(base).get(rid)
+            self.assertEqual(len(raw["cpu_limit"]), 5)
+            retained = load_existing_forecast_items(base)[0]
+            self.assertEqual(retained["observed_stats"]["marker"], "retained")
+            self.assertEqual(retained["data_quality"]["cpu_limit"]["recent_contiguous_points"], 3)
+            self.assertTrue(retained["data_quality"]["cpu_limit"]["prediction_skipped"])
+            manifest = json.loads((base / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+            report = json.loads((base / FORECAST_ERROR_REPORT_FILENAME).read_text(encoding="utf-8"))
+            expected = {
+                "resource_id": rid,
+                "metric": "cpu_limit",
+                "reason": "recent_contiguous_segment_too_short",
+            }
+            self.assertIn(expected, manifest["meta"]["prediction_skips"])
+            self.assertIn(expected, report["meta"]["prediction_skips"])
+
+    def test_short_container_segment_retains_its_previous_chart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rid = "k8s:cluster-a:ns:deployment:api"
+            old_item = {
+                "resource_id": rid,
+                "resource_type": "k8s_workload",
+                "spec": {"cluster": "cluster-a", "namespace": "ns", "containers": {"app": {}}},
+                "best_methods": {},
+                "metrics": {},
+                "charts_forecast": {},
+                "observed_stats": {},
+                "container_charts_forecast": {
+                    "app": {"cpu_limit": {"best_method": "retained-model"}}
+                },
+            }
+            write_prediction_outputs(
+                out_base=base,
+                resources_items=[old_item],
+                active_methods=["rolling_mean"],
+                test_size=3,
+                future_steps=2,
+                forecast_window={"sample_interval_seconds": 300.0},
+                detail_chunk_size=100,
+                predicted_count=1,
+                partial_resource_ids=set(),
+                metric_filter_by_id={},
+                metric_partial_enabled=False,
+                total_elapsed=0.0,
+                raw_stats={},
+            )
+            top_idx = pd.date_range("2026-08-03", periods=5, freq="5min")
+            container_idx = pd.to_datetime([
+                "2026-08-01 00:00", "2026-08-01 00:05",
+                "2026-08-03 00:00", "2026-08-03 00:05", "2026-08-03 00:10",
+            ])
+            incoming = {
+                "resource_id": rid,
+                "resource_type": "k8s_workload",
+                "metrics": {
+                    metric: {
+                        "timestamps": (top_idx.view("int64") // 1_000_000).tolist(),
+                        "values": [0.2] * len(top_idx),
+                    }
+                    for metric in K8S_METRICS
+                },
+                "container_metrics": {
+                    "app": {
+                        metric: {
+                            "timestamps": (container_idx.view("int64") // 1_000_000).tolist(),
+                            "values": [0.2] * len(container_idx),
+                        }
+                        for metric in K8S_METRICS
+                    }
+                },
+                "spec": old_item["spec"],
+            }
+
+            with patch(
+                "resource_predict.pipeline.run.read_forecast_config",
+                return_value={"enabled_methods": ["rolling_mean"], "enable_ensemble": False},
+            ):
+                generate_forecasts(
+                    out_dir=str(base),
+                    data_provider=lambda resources, n, freq: [incoming],
+                    test_size=3,
+                    future_steps=2,
+                    save_raw=True,
+                )
+
+            result = load_existing_forecast_items(base)[0]
+            self.assertEqual(
+                result["container_charts_forecast"]["app"]["cpu_limit"]["best_method"],
+                "retained-model",
+            )
+            self.assertTrue(
+                result["container_data_quality"]["app"]["cpu_limit"]["prediction_skipped"]
+            )
+
+    def test_partial_short_segment_keeps_unrelated_existing_forecasts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rid = "k8s:cluster-a:ns:deployment:api"
+            other_rid = "k8s:cluster-a:ns:deployment:worker"
+            old_items = []
+            for resource_id in (rid, other_rid):
+                old_items.append({
+                    "resource_id": resource_id,
+                    "resource_type": "k8s_workload",
+                    "spec": {"cluster": "cluster-a", "namespace": "ns", "containers": {}},
+                    "best_methods": {},
+                    "metrics": {},
+                    "charts_forecast": {},
+                    "observed_stats": {"marker": resource_id},
+                })
+            write_prediction_outputs(
+                out_base=base,
+                resources_items=old_items,
+                active_methods=["rolling_mean"],
+                test_size=3,
+                future_steps=2,
+                forecast_window={"sample_interval_seconds": 300.0},
+                detail_chunk_size=100,
+                predicted_count=2,
+                partial_resource_ids=set(),
+                metric_filter_by_id={},
+                metric_partial_enabled=False,
+                total_elapsed=0.0,
+                raw_stats={},
+            )
+            idx = pd.to_datetime([
+                "2026-08-01 00:00", "2026-08-01 00:05",
+                "2026-08-03 00:00", "2026-08-03 00:05", "2026-08-03 00:10",
+            ])
+            sparse = {
+                "resource_id": rid,
+                "resource_type": "k8s_workload",
+                "spec": old_items[0]["spec"],
+                **{metric: pd.Series([0.2] * len(idx), index=idx) for metric in K8S_METRICS},
+            }
+            write_raw_resource_dataset(base, [sparse], freq="5min")
+
+            generate_forecasts(
+                out_dir=str(base),
+                predict_only=True,
+                resource_ids=[rid],
+                test_size=3,
+                future_steps=2,
+            )
+
+            result_ids = {
+                item["resource_id"] for item in load_existing_forecast_items(base)
+            }
+            self.assertEqual(result_ids, {rid, other_rid})
 
 
 if __name__ == "__main__":

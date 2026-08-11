@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from resource_predict.data.io import coerce_metric_series
+from resource_predict.pipeline.windowing import recent_contiguous_segment
 from resource_predict.resource_types import metric_names_for_resource
 
 logger = logging.getLogger(__name__)
@@ -180,3 +181,121 @@ def _prepare_container_metrics(value: Any, metric_names: tuple[str, ...]) -> Dic
         if metric_out:
             out[name] = metric_out
     return out
+
+
+def prepare_recent_contiguous_forecast_data(
+    items: List[Dict[str, Any]],
+    *,
+    sample_interval_seconds: float,
+    max_gap_steps: int,
+    test_size: int,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """Create a Workload forecast copy trimmed independently per metric."""
+    prepared: List[Dict[str, Any]] = []
+    skips: List[Dict[str, str]] = []
+    for source in items:
+        item = dict(source)
+        rid = str(item.get("resource_id") or "")
+        metric_names = metric_names_for_resource(item)
+        quality_by_metric = _copy_quality_map(item.get("data_quality"))
+        for metric in metric_names:
+            series = item.get(metric)
+            if not isinstance(series, pd.Series):
+                continue
+            segment = recent_contiguous_segment(
+                series,
+                sample_interval_seconds,
+                max_gap_steps,
+            )
+            item[metric] = segment
+            quality = quality_by_metric.setdefault(metric, {})
+            _update_recent_segment_quality(
+                quality,
+                original=series,
+                segment=segment,
+                test_size=test_size,
+            )
+            if len(segment) <= test_size:
+                skips.append(_skip_entry(rid, metric))
+        item["data_quality"] = quality_by_metric
+
+        raw_containers = item.get("container_metrics")
+        if isinstance(raw_containers, dict):
+            containers_out: Dict[str, Dict[str, pd.Series]] = {}
+            container_quality = _copy_container_quality(item.get("container_data_quality"))
+            for container, metrics in raw_containers.items():
+                if not isinstance(metrics, dict):
+                    continue
+                container_name = str(container)
+                metric_out = dict(metrics)
+                quality_out = container_quality.setdefault(container_name, {})
+                for metric, series in metrics.items():
+                    if not isinstance(series, pd.Series):
+                        continue
+                    segment = recent_contiguous_segment(
+                        series,
+                        sample_interval_seconds,
+                        max_gap_steps,
+                    )
+                    metric_out[str(metric)] = segment
+                    quality = quality_out.setdefault(str(metric), {})
+                    _update_recent_segment_quality(
+                        quality,
+                        original=series,
+                        segment=segment,
+                        test_size=test_size,
+                    )
+                    if len(segment) <= test_size:
+                        skips.append(
+                            _skip_entry(rid, f"container/{container_name}/{metric}")
+                        )
+                containers_out[container_name] = metric_out
+            item["container_metrics"] = containers_out
+            item["container_data_quality"] = container_quality
+        prepared.append(item)
+    return prepared, skips
+
+
+def _copy_quality_map(value: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(metric): dict(quality) if isinstance(quality, dict) else {}
+        for metric, quality in value.items()
+    }
+
+
+def _copy_container_quality(value: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(container): _copy_quality_map(metrics)
+        for container, metrics in value.items()
+        if isinstance(metrics, dict)
+    }
+
+
+def _update_recent_segment_quality(
+    quality: Dict[str, Any],
+    *,
+    original: pd.Series,
+    segment: pd.Series,
+    test_size: int,
+) -> None:
+    quality.update({
+        "recent_contiguous_points": int(len(segment)),
+        "recent_contiguous_span_hours": round(
+            max(0.0, (segment.index[-1] - segment.index[0]).total_seconds()) / 3600.0,
+            2,
+        ) if len(segment) >= 2 else 0.0,
+        "data_end_ms": int(original.index.max().value // 1_000_000),
+        "prediction_skipped": len(segment) <= test_size,
+    })
+
+
+def _skip_entry(resource_id: str, metric: str) -> Dict[str, str]:
+    return {
+        "resource_id": resource_id,
+        "metric": metric,
+        "reason": "recent_contiguous_segment_too_short",
+    }
