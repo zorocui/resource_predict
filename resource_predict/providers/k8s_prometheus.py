@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -23,12 +24,54 @@ from resource_predict.services.cluster_configs import (
 logger = logging.getLogger(__name__)
 
 
+def _is_retryable_http_status(status: int) -> bool:
+    return status == 429 or 500 <= status <= 599
+
+
+def _retry_delay(base_seconds: float, attempt_index: int) -> float:
+    return float(base_seconds) * (2 ** max(0, attempt_index))
+
+
+def _merge_matrix_results(
+    chunks: Iterable[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    samples: Dict[str, Dict[float, List[Any]]] = {}
+    for chunk in chunks:
+        for row in chunk:
+            metric = row.get("metric", {})
+            values = row.get("values", [])
+            if not isinstance(metric, dict) or not isinstance(values, list):
+                continue
+            metric_key = json.dumps(metric, sort_keys=True, separators=(",", ":"))
+            merged.setdefault(metric_key, {"metric": dict(metric), "values": []})
+            metric_samples = samples.setdefault(metric_key, {})
+            for sample in values:
+                if not isinstance(sample, list) or len(sample) < 2:
+                    continue
+                try:
+                    timestamp = float(sample[0])
+                except (TypeError, ValueError):
+                    continue
+                metric_samples[timestamp] = sample
+
+    out: List[Dict[str, Any]] = []
+    for metric_key in sorted(merged):
+        row = merged[metric_key]
+        row["values"] = [samples[metric_key][ts] for ts in sorted(samples[metric_key])]
+        out.append(row)
+    return out
+
+
 @dataclass(frozen=True)
 class PrometheusClient:
     base_url: str
     bearer_token: str = ""
     basic_auth: str = ""
     timeout_seconds: int = 30
+    max_attempts: int = 3
+    retry_backoff_seconds: float = 1.0
+    range_query_chunk_hours: int = 24
 
     def query(self, query: str, *, ts: Optional[float] = None) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"query": query}
@@ -37,10 +80,24 @@ class PrometheusClient:
         return self._get("/api/v1/query", params).get("result", [])
 
     def query_range(self, query: str, *, start: float, end: float, step: int) -> List[Dict[str, Any]]:
-        return self._get(
-            "/api/v1/query_range",
-            {"query": query, "start": start, "end": end, "step": step},
-        ).get("result", [])
+        chunk_seconds = max(1, int(self.range_query_chunk_hours)) * 3600
+        if end <= start or end - start <= chunk_seconds:
+            return self._get(
+                "/api/v1/query_range",
+                {"query": query, "start": start, "end": end, "step": step},
+            ).get("result", [])
+
+        chunks: List[List[Dict[str, Any]]] = []
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(end, chunk_start + chunk_seconds)
+            rows = self._get(
+                "/api/v1/query_range",
+                {"query": query, "start": chunk_start, "end": chunk_end, "step": step},
+            ).get("result", [])
+            chunks.append(rows)
+            chunk_start = chunk_end
+        return _merge_matrix_results(chunks)
 
     def _get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = self.base_url.rstrip("/") + path + "?" + urllib.parse.urlencode(params)
@@ -49,8 +106,21 @@ class PrometheusClient:
             req.add_header("Authorization", f"Bearer {self.bearer_token}")
         if self.basic_auth:
             req.add_header("Authorization", f"Basic {self.basic_auth}")
-        with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        attempts = max(1, int(self.max_attempts))
+        payload: Dict[str, Any]
+        for attempt_index in range(attempts):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                if not _is_retryable_http_status(int(exc.code)) or attempt_index + 1 >= attempts:
+                    raise
+                time.sleep(_retry_delay(self.retry_backoff_seconds, attempt_index))
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt_index + 1 >= attempts:
+                    raise
+                time.sleep(_retry_delay(self.retry_backoff_seconds, attempt_index))
         if payload.get("status") != "success":
             raise RuntimeError(f"Prometheus query failed: {payload}")
         data = payload.get("data", {})
@@ -279,6 +349,9 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
         bearer_token=target.bearer_token,
         basic_auth=target.basic_auth,
         timeout_seconds=int(target.request_timeout_seconds),
+        max_attempts=int(settings.k8s_prometheus.request_max_attempts),
+        retry_backoff_seconds=float(settings.k8s_prometheus.retry_backoff_seconds),
+        range_query_chunk_hours=int(settings.k8s_prometheus.range_query_chunk_hours),
     )
     step = int(target.step_seconds)
     end = time.time()
@@ -412,6 +485,9 @@ def _fetch_target(
         bearer_token=target.bearer_token,
         basic_auth=target.basic_auth,
         timeout_seconds=int(target.request_timeout_seconds),
+        max_attempts=int(settings.k8s_prometheus.request_max_attempts),
+        retry_backoff_seconds=float(settings.k8s_prometheus.retry_backoff_seconds),
+        range_query_chunk_hours=int(settings.k8s_prometheus.range_query_chunk_hours),
     )
     end = time.time()
     if history_hours is not None and float(history_hours) > 0:

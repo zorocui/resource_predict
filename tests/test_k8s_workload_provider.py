@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +16,20 @@ from resource_predict.providers.k8s_prometheus import PrometheusTarget
 
 BASE_TS = 1_700_000_000
 GIB = 1024 ** 3
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict[str, object]):
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self) -> bytes:
+        return self._body
 
 
 def _target(cluster: str) -> PrometheusTarget:
@@ -33,9 +48,10 @@ def _target(cluster: str) -> PrometheusTarget:
 class FakePrometheusClient:
     queries: list[str] = []
     range_calls: list[dict] = []
+    init_kwargs: list[dict] = []
 
     def __init__(self, *args, **kwargs):
-        pass
+        self.init_kwargs.append(dict(kwargs))
 
     def query_range(self, query: str, *, start: float, end: float, step: int):
         self.queries.append(query)
@@ -212,6 +228,121 @@ class K8SWorkloadProviderTest(unittest.TestCase):
     def setUp(self):
         FakePrometheusClient.queries = []
         FakePrometheusClient.range_calls = []
+        FakePrometheusClient.init_kwargs = []
+
+    def test_prometheus_client_retries_503_then_succeeds(self):
+        error = urllib.error.HTTPError("http://prom", 503, "busy", {}, None)
+        response = _FakeResponse({"status": "success", "data": {"result": []}})
+        client = provider.PrometheusClient(
+            "http://prom", max_attempts=3, retry_backoff_seconds=0.25
+        )
+
+        with patch("urllib.request.urlopen", side_effect=[error, response]) as open_url:
+            with patch("resource_predict.providers.k8s_prometheus.time.sleep") as sleep:
+                self.assertEqual(client.query("up"), [])
+
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(0.25)
+
+    def test_prometheus_client_does_not_retry_bad_request(self):
+        error = urllib.error.HTTPError("http://prom", 400, "bad query", {}, None)
+        client = provider.PrometheusClient("http://prom", max_attempts=3)
+
+        with patch("urllib.request.urlopen", side_effect=error) as open_url:
+            with self.assertRaises(urllib.error.HTTPError):
+                client.query("bad")
+
+        self.assertEqual(open_url.call_count, 1)
+
+    def test_prometheus_client_retries_transient_failures_with_exponential_backoff(self):
+        transient_errors = (
+            urllib.error.URLError("network unavailable"),
+            TimeoutError("timed out"),
+            urllib.error.HTTPError("http://prom", 429, "rate limited", {}, None),
+            urllib.error.HTTPError("http://prom", 500, "server error", {}, None),
+        )
+        response = _FakeResponse({"status": "success", "data": {"result": []}})
+
+        for error in transient_errors:
+            with self.subTest(error=type(error).__name__, status=getattr(error, "code", None)):
+                client = provider.PrometheusClient(
+                    "http://prom",
+                    bearer_token="top-secret-token",
+                    max_attempts=3,
+                    retry_backoff_seconds=0.5,
+                )
+                with patch(
+                    "urllib.request.urlopen",
+                    side_effect=[error, error, response],
+                ) as open_url:
+                    with patch("resource_predict.providers.k8s_prometheus.time.sleep") as sleep:
+                        with patch.object(provider.logger, "warning") as warning:
+                            self.assertEqual(client.query("up"), [])
+
+                self.assertEqual(open_url.call_count, 3)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.0])
+                self.assertNotIn("top-secret-token", repr(warning.call_args_list))
+
+    def test_prometheus_client_does_not_retry_semantic_failure(self):
+        response = _FakeResponse({"status": "error", "error": "invalid expression"})
+        client = provider.PrometheusClient("http://prom", max_attempts=3)
+
+        with patch("urllib.request.urlopen", return_value=response) as open_url:
+            with self.assertRaisesRegex(RuntimeError, "Prometheus query failed"):
+                client.query("bad")
+
+        self.assertEqual(open_url.call_count, 1)
+
+    def test_query_range_chunks_and_merges_by_full_metric_labels(self):
+        client = provider.PrometheusClient(
+            "http://prom", range_query_chunk_hours=24
+        )
+        chunks = [
+            {"result": [
+                {"metric": {"pod": "a", "container": "app"}, "values": [[10, "1"], [20, "2"]]},
+                {"metric": {"pod": "a", "container": "sidecar"}, "values": [[10, "8"]]},
+            ]},
+            {"result": [
+                {"metric": {"container": "app", "pod": "a"}, "values": [[20, "3"], [30, "4"]]},
+            ]},
+            {"result": [
+                {"metric": {"pod": "a", "container": "app"}, "values": [[40, "5"]]},
+            ]},
+        ]
+
+        with patch.object(provider.PrometheusClient, "_get", side_effect=chunks) as get:
+            rows = client.query_range("metric", start=0, end=49 * 3600, step=10)
+
+        self.assertEqual(get.call_count, 3)
+        params = [call.args[1] for call in get.call_args_list]
+        self.assertEqual(
+            [(item["start"], item["end"]) for item in params],
+            [(0, 24 * 3600), (24 * 3600, 48 * 3600), (48 * 3600, 49 * 3600)],
+        )
+        app_row = next(row for row in rows if row["metric"]["container"] == "app")
+        self.assertEqual(app_row["values"], [[10, "1"], [20, "3"], [30, "4"], [40, "5"]])
+        self.assertEqual(len(rows), 2)
+
+    def test_query_range_returns_no_partial_rows_when_later_chunk_exhausts_retries(self):
+        first = _FakeResponse({
+            "status": "success",
+            "data": {"result": [{"metric": {"pod": "a"}, "values": [[10, "1"]]}]},
+        })
+        failure = urllib.error.URLError("network unavailable")
+        client = provider.PrometheusClient(
+            "http://prom",
+            max_attempts=3,
+            retry_backoff_seconds=0.25,
+            range_query_chunk_hours=24,
+        )
+
+        with patch("urllib.request.urlopen", side_effect=[first, failure, failure, failure]) as open_url:
+            with patch("resource_predict.providers.k8s_prometheus.time.sleep") as sleep:
+                with self.assertRaises(urllib.error.URLError):
+                    client.query_range("metric", start=0, end=25 * 3600, step=10)
+
+        self.assertEqual(open_url.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
 
     def test_structured_fetch_reports_all_clusters_successful(self):
         targets = [_target("cluster-a"), _target("cluster-b")]
@@ -412,6 +543,18 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         ])
         self.assertTrue(any("缺少 owner" in warning for warning in report["warnings"]))
         self.assertEqual(report["errors"], [])
+        self.assertEqual(
+            FakePrometheusClient.init_kwargs[0]["max_attempts"],
+            provider.settings.k8s_prometheus.request_max_attempts,
+        )
+        self.assertEqual(
+            FakePrometheusClient.init_kwargs[0]["retry_backoff_seconds"],
+            provider.settings.k8s_prometheus.retry_backoff_seconds,
+        )
+        self.assertEqual(
+            FakePrometheusClient.init_kwargs[0]["range_query_chunk_hours"],
+            provider.settings.k8s_prometheus.range_query_chunk_hours,
+        )
 
     def test_replicaset_owner_query_does_not_include_pod_selector(self):
         target = PrometheusTarget(
@@ -472,6 +615,18 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         cpu_queries = [q for q in FakePrometheusClient.queries if "container_cpu_usage_seconds_total" in q]
         self.assertTrue(cpu_queries)
         self.assertTrue(all("[7m]" in query for query in cpu_queries))
+        self.assertEqual(
+            FakePrometheusClient.init_kwargs[0]["max_attempts"],
+            provider.settings.k8s_prometheus.request_max_attempts,
+        )
+        self.assertEqual(
+            FakePrometheusClient.init_kwargs[0]["retry_backoff_seconds"],
+            provider.settings.k8s_prometheus.retry_backoff_seconds,
+        )
+        self.assertEqual(
+            FakePrometheusClient.init_kwargs[0]["range_query_chunk_hours"],
+            provider.settings.k8s_prometheus.range_query_chunk_hours,
+        )
 
     def test_fetch_target_can_use_incremental_history_hours(self):
         target = PrometheusTarget(
