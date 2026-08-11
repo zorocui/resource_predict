@@ -33,7 +33,10 @@ vm.runInThisContext(source, { filename: "static/js/charts.js" });
 
 const {
   buildChartOption,
+  futurePairsAfterTest,
   futureForecastRange,
+  insertGapBreaks,
+  lastValidTimestamp,
   toPairs,
 } = window.ResourceCharts;
 
@@ -75,61 +78,58 @@ test("toPairs rejects missing values without rejecting real zero", () => {
   ]);
 });
 
-test("future range uses the union of valid future points across models", () => {
-  const result = futureForecastRange(
-    times.slice(0, 5),
-    {
-      rolling_mean: [null, 0.2, 0.3, null, null],
-      arima: [null, null, 0.4, 0.5, null],
-    }
-  );
-
-  assert.deepEqual(result, { startMs: times[1], endMs: times[3] });
+test("last valid timestamp normalizes seconds and ignores invalid values", () => {
+  assert.equal(lastValidTimestamp([null, T0 / 1000, "", T0 + HOUR]), T0 + HOUR);
+  assert.equal(lastValidTimestamp([null, "", Number.NaN]), null);
 });
 
-test("internal missing points do not split or shrink valid outer bounds", () => {
+test("future range starts at test end and ignores predictions inside test data", () => {
+  const testEnd = times[3];
   const result = futureForecastRange(
-    times.slice(0, 5),
-    { rolling_mean: [0.1, null, "", 0.4, 0.5] }
+    [times[2], times[3], times[4], times[5]],
+    { rolling_mean: [0.1, 0.2, 0.3, 0.4] },
+    testEnd
   );
 
-  assert.deepEqual(result, { startMs: times[0], endMs: times[4] });
+  assert.deepEqual(result, { startMs: testEnd, endMs: times[5] });
 });
 
-test("future range ignores models without arrays and mismatched array tails", () => {
-  const result = futureForecastRange(
-    times.slice(0, 4),
-    {
-      rolling_mean: [null, 0.2, 0.3],
-      invalid: null,
-    }
+test("one future point after test end creates a nonzero forecast area", () => {
+  assert.deepEqual(
+    futureForecastRange([times[4]], { rolling_mean: [0.3] }, times[3]),
+    { startMs: times[3], endMs: times[4] }
   );
-
-  assert.deepEqual(result, { startMs: times[1], endMs: times[2] });
 });
 
-test("future range is absent with fewer than two distinct valid timestamps", () => {
+test("future range is absent when every prediction is inside the test interval", () => {
   assert.equal(
-    futureForecastRange(times.slice(0, 3), { rolling_mean: [null, 0.2, null] }),
-    null
-  );
-  assert.equal(
-    futureForecastRange(times.slice(0, 3), { rolling_mean: [null, "", undefined] }),
+    futureForecastRange([times[2], times[3]], { rolling_mean: [0.2, 0.3] }, times[3]),
     null
   );
 });
 
-test("markArea starts at valid future data and never covers test predictions", () => {
+test("future pairs retain only valid points strictly after test end", () => {
+  assert.deepEqual(
+    futurePairsAfterTest(
+      [times[2], times[3], times[4], times[5]],
+      [0.1, 0.2, null, 0.4],
+      times[3]
+    ),
+    [[times[5], 0.4]]
+  );
+});
+
+test("markArea starts at test end and model future data excludes overlaps", () => {
   const testStart = T0;
-  const futureStart = T0 + 3 * HOUR;
+  const testEnd = testStart + HOUR;
   const chartData = {
     x_train_ms: [testStart - HOUR],
     y_train: [0.2],
-    x_test_ms: [testStart, testStart + HOUR],
+    x_test_ms: [testStart, testEnd],
     y_test: [0.3, 0.4],
     preds: { rolling_mean: [0.31, 0.41] },
-    x_pred_ms: [futureStart, futureStart + HOUR, futureStart + 2 * HOUR],
-    preds_future: { rolling_mean: [null, 0.5, 0.6] },
+    x_pred_ms: [testStart, testEnd, testEnd + HOUR, testEnd + 2 * HOUR],
+    preds_future: { rolling_mean: [0.35, 0.45, 0.5, 0.6] },
     metrics: { rolling_mean: { rmse: 0.01 } },
     best_method: "rolling_mean",
   };
@@ -144,8 +144,77 @@ test("markArea starts at valid future data and never covers test predictions", (
 
   assert.ok(auxiliary);
   assert.deepEqual(auxiliary.markArea.data, [[
-    { xAxis: futureStart + HOUR },
-    { xAxis: futureStart + 2 * HOUR },
+    { xAxis: testEnd },
+    { xAxis: testEnd + 2 * HOUR },
   ]]);
-  assert.ok(auxiliary.markArea.data[0][0].xAxis > chartData.x_test_ms.at(-1));
+  const model = option.series.find((series) => series.name === "Rolling Mean");
+  const futurePoints = model.data.filter(([timestamp]) => timestamp > testEnd);
+  assert.deepEqual(futurePoints, [
+    [testEnd + HOUR, 0.5],
+    [testEnd + 2 * HOUR, 0.6],
+  ]);
+  assert.equal(model.data.some(([timestamp, value]) => timestamp === testEnd && value === 0.45), false);
+});
+
+test("explicit test end metadata overrides an older x_test fallback", () => {
+  const chartData = {
+    x_train_ms: [times[0]],
+    y_train: [0.1],
+    x_test_ms: [times[1]],
+    y_test: [0.2],
+    test_end_ms: times[3],
+    x_pred_ms: [times[2], times[4]],
+    preds_future: { rolling_mean: [0.3, 0.4] },
+    preds: { rolling_mean: [0.2] },
+    metrics: { rolling_mean: { rmse: 0.01 } },
+    best_method: "rolling_mean",
+  };
+  const option = buildChartOption(chartData, "cpu", "percent", { resource_type: "openstack_vm" });
+  const auxiliary = option.series.find((series) => series.markArea);
+  assert.deepEqual(auxiliary.markArea.data, [[
+    { xAxis: times[3] },
+    { xAxis: times[4] },
+  ]]);
+});
+
+test("gap breaks prevent history and test lines from crossing large outages", () => {
+  const result = insertGapBreaks(
+    [[times[0], 0.1], [times[1], 0.2], [times[7], 0.3]],
+    3600,
+    3
+  );
+  assert.deepEqual(result, [
+    [times[0], 0.1],
+    [times[1], 0.2],
+    [times[1] + HOUR, null],
+    [times[7] - HOUR, null],
+    [times[7], 0.3],
+  ]);
+});
+
+test("chart applies emitted gap metadata to history and test series", () => {
+  const chartData = {
+    x_train_ms: [times[0], times[1], times[7]],
+    y_train: [0.1, 0.2, 0.3],
+    x_test_ms: [times[7], times[8]],
+    y_test: [0.3, 0.4],
+    x_pred_ms: [],
+    preds_future: {},
+    preds: {},
+    metrics: {},
+    sample_interval_seconds: 3600,
+    max_interpolation_gap_steps: 3,
+  };
+  const option = buildChartOption(chartData, "cpu", "percent", { resource_type: "openstack_vm" });
+  const history = option.series.find((series) => series.name !== "Rolling Mean" && series.z === 2);
+  const testSeries = option.series.find((series) => series.z === 3);
+  assert.deepEqual(history.data, [
+    [times[0], 0.1],
+    [times[1], 0.2],
+    [times[1] + HOUR, null],
+    [times[7] - HOUR, null],
+    [times[7], 0.3],
+  ]);
+  assert.equal(history.connectNulls, false);
+  assert.equal(testSeries.connectNulls, false);
 });

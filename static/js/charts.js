@@ -44,24 +44,63 @@
     return t < 1e12 ? t * 1000 : t;
   }
 
-  function futureForecastRange(xPredFuture, predsFuture) {
+  function lastValidTimestamp(xValues) {
+    if (!Array.isArray(xValues)) return null;
+    let latest = -Infinity;
+    xValues.forEach((value) => {
+      const ts = normalizeTsMs(value);
+      if (Number.isFinite(ts)) latest = Math.max(latest, ts);
+    });
+    return Number.isFinite(latest) ? latest : null;
+  }
+
+  function futurePairsAfterTest(xValues, yValues, testEndMs) {
+    const boundary = normalizeTsMs(testEndMs);
+    if (!Number.isFinite(boundary) || !Array.isArray(xValues) || !Array.isArray(yValues)) {
+      return [];
+    }
+    return toPairs(xValues, yValues).filter(([timestamp]) => timestamp > boundary);
+  }
+
+  function futureForecastRange(xPredFuture, predsFuture, testEndMs) {
     if (!Array.isArray(xPredFuture) || !predsFuture || typeof predsFuture !== "object") {
       return null;
     }
-    let startMs = Infinity;
+    const boundary = normalizeTsMs(testEndMs);
+    if (!Number.isFinite(boundary)) return null;
     let endMs = -Infinity;
     Object.values(predsFuture).forEach((values) => {
       if (!Array.isArray(values)) return;
-      const pairCount = Math.min(xPredFuture.length, values.length);
-      for (let index = 0; index < pairCount; index++) {
-        if (!isValidChartValue(values[index])) continue;
-        const ts = normalizeTsMs(xPredFuture[index]);
-        if (!Number.isFinite(ts)) continue;
-        startMs = Math.min(startMs, ts);
+      futurePairsAfterTest(xPredFuture, values, boundary).forEach(([ts]) => {
         endMs = Math.max(endMs, ts);
-      }
+      });
     });
-    return startMs < endMs ? { startMs, endMs } : null;
+    return endMs > boundary ? { startMs: boundary, endMs } : null;
+  }
+
+  function insertGapBreaks(pairs, sampleIntervalSeconds, maxGapSteps) {
+    if (!Array.isArray(pairs) || pairs.length < 2) return Array.isArray(pairs) ? pairs.slice() : [];
+    const intervalMs = Number(sampleIntervalSeconds) * 1000;
+    const gapSteps = Number(maxGapSteps);
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0 || !Number.isFinite(gapSteps) || gapSteps < 0) {
+      return pairs.slice();
+    }
+    const thresholdMs = intervalMs * (gapSteps + 1);
+    const result = [pairs[0]];
+    for (let index = 1; index < pairs.length; index++) {
+      const left = pairs[index - 1];
+      const right = pairs[index];
+      if (Array.isArray(left) && Array.isArray(right)
+        && Number.isFinite(left[0]) && Number.isFinite(right[0])
+        && right[0] - left[0] > thresholdMs) {
+        const leftBreak = left[0] + intervalMs;
+        const rightBreak = right[0] - intervalMs;
+        result.push([leftBreak, null]);
+        if (rightBreak !== leftBreak) result.push([rightBreak, null]);
+      }
+      result.push(right);
+    }
+    return result;
   }
 
   function formatMs(ms, variant) {
@@ -157,9 +196,33 @@
       .map(([ts, stats]) => [ts, modeKey === "peak" ? stats.max : stats.sum / stats.count]);
   }
 
-  function prepareSeriesData(pairs, windowInfo, isVm) {
+  function aggregateBrokenPairs(pairs, bucketMs) {
+    if (!bucketMs || !pairs.some((pair) => pair[1] === null)) return aggregatePairs(pairs, bucketMs);
+    const result = [];
+    let segment = [];
+    const flush = () => {
+      if (!segment.length) return;
+      result.push(...aggregatePairs(segment, bucketMs));
+      segment = [];
+    };
+    pairs.forEach((pair) => {
+      if (pair[1] === null) {
+        flush();
+        result.push(pair);
+      } else {
+        segment.push(pair);
+      }
+    });
+    flush();
+    return result;
+  }
+
+  function prepareSeriesData(pairs, windowInfo, isVm, gapConfig = null) {
     const visible = filterPairsByWindow(pairs, windowInfo);
-    return aggregatePairs(visible, chooseBucketMs(windowInfo.spanMs, visible.length, isVm));
+    const withBreaks = gapConfig
+      ? insertGapBreaks(visible, gapConfig.sampleIntervalSeconds, gapConfig.maxGapSteps)
+      : visible;
+    return aggregateBrokenPairs(withBreaks, chooseBucketMs(windowInfo.spanMs, visible.length, isVm));
   }
 
   function prependBridgePoint(seriesData, bridgePoint) {
@@ -412,6 +475,14 @@
     const xTest = Array.isArray(chartData.x_test_ms) ? chartData.x_test_ms : [];
     const yTest = Array.isArray(chartData.y_test) ? chartData.y_test : [];
     const xPredFuture = Array.isArray(chartData.x_pred_ms) ? chartData.x_pred_ms : [];
+    const emittedTestEnd = normalizeTsMs(chartData.test_end_ms);
+    const testEndMs = Number.isFinite(emittedTestEnd) ? emittedTestEnd : lastValidTimestamp(xTest);
+    const gapConfig = {
+      sampleIntervalSeconds: Number(chartData.sample_interval_seconds),
+      maxGapSteps: Number.isFinite(Number(chartData.max_interpolation_gap_steps))
+        ? Number(chartData.max_interpolation_gap_steps)
+        : 3,
+    };
     const anchorTs = xTrain.length ? xTrain[xTrain.length - 1] : null;
     const anchorVal = yTrain.length ? yTrain[yTrain.length - 1] : null;
     const rawTrainPairs = toPairs(xTrain, yTrain);
@@ -421,10 +492,10 @@
     // VM 资源强制显示原始数据模式标题
     const modeLabel = isVm ? "原始" : activeMode.label;
     const isPercentMode = displayUnit === "percent";
-    const historyData = prepareSeriesData(rawTrainPairs, windowInfo, isVm);
+    const historyData = prepareSeriesData(rawTrainPairs, windowInfo, isVm, gapConfig);
     const historyBridgePoint = historyData.length ? historyData[historyData.length - 1] : null;
     const testData = prependBridgePoint(
-      prepareSeriesData(rawTestPairs, windowInfo, isVm),
+      prepareSeriesData(rawTestPairs, windowInfo, isVm, gapConfig),
       historyBridgePoint
     );
     const series = [{
@@ -435,11 +506,12 @@
       sampling: "lttb",
       lineStyle: { color: "#2563eb", width: 1.35, opacity: (isVm || activeMode.key === "raw") ? 0.55 : 0.78 },
       itemStyle: { color: "#2563eb" },
+      connectNulls: false,
       z: 2,
     }];
 
     if (app.chartAuxiliaryVisible) {
-      const futureRange = futureForecastRange(xPredFuture, chartData.preds_future);
+      const futureRange = futureForecastRange(xPredFuture, chartData.preds_future, testEndMs);
       const markLineData = auxiliaryMarkLines(metricKey, isPercentMode);
       const markArea = futureRange ? {
         silent: true,
@@ -477,30 +549,33 @@
       sampling: "lttb",
       lineStyle: { color: "#dc2626", width: 2.1 },
       itemStyle: { color: "#dc2626" },
+      connectNulls: false,
       z: 3,
     });
 
     const legendData = ["历史", "测试"];
-    for (const m of Object.keys(chartData.preds || chartData.preds_future || {})) {
+    const modelNames = new Set([
+      ...Object.keys(chartData.preds || {}),
+      ...Object.keys(chartData.preds_future || {}),
+    ]);
+    for (const m of modelNames) {
       const label = app.labelMap[m] || m;
       const testPred = chartData.preds?.[m];
       const futurePred = chartData.preds_future?.[m];
-      let predX = [];
-      let predY = [];
+      let testPredX = [];
+      let testPredY = [];
       if (anchorTs != null && anchorVal != null) {
-        predX.push(anchorTs);
-        predY.push(anchorVal);
+        testPredX.push(anchorTs);
+        testPredY.push(anchorVal);
       }
       if (Array.isArray(testPred) && Array.isArray(chartData.x_test_ms)) {
-        predX = predX.concat(chartData.x_test_ms);
-        predY = predY.concat(testPred);
+        testPredX = testPredX.concat(chartData.x_test_ms);
+        testPredY = testPredY.concat(testPred);
       }
-      if (Array.isArray(futurePred) && xPredFuture.length) {
-        predX = predX.concat(xPredFuture);
-        predY = predY.concat(futurePred);
-      }
-      if (!predX.length) continue;
-      const rawPredPairs = toPairs(predX, predY);
+      const rawPredPairs = toPairs(testPredX, testPredY).concat(
+        futurePairsAfterTest(xPredFuture, futurePred, testEndMs)
+      );
+      if (!rawPredPairs.length) continue;
       legendData.push(label);
       series.push({
         name: label,
@@ -1223,7 +1298,10 @@
     buildChartOption,
     closeChartModal,
     disposeDetailChart,
+    futurePairsAfterTest,
     futureForecastRange,
+    insertGapBreaks,
+    lastValidTimestamp,
     openChartModal,
     renderDetail,
     toPairs,
