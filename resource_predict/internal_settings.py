@@ -206,6 +206,14 @@ class K8SPrometheusConfig:
     namespace_regex: str = ""
     # Prometheus HTTP 请求超时时间，单位秒。
     request_timeout_seconds: int = 300
+    # Prometheus range query 单个请求的最大时间跨度，单位小时。
+    range_query_chunk_hours: int = 24
+    # Prometheus 请求（含首次请求）的最大尝试次数。
+    request_max_attempts: int = 3
+    # Prometheus 请求重试的基础退避时间，单位秒。
+    retry_backoff_seconds: float = 1.0
+    # 自动插值允许覆盖的最大连续缺失采样步数。
+    max_interpolation_gap_steps: int = 3
     # 多集群拉取时是否遇到任一集群失败就立即中断；False 表示尽量保留成功集群。
     fail_fast: bool = False
     # 是否在 python app.py 启动时启用 K8S Prometheus 后台拉取。
@@ -285,6 +293,10 @@ class SettingsProxy:
             step_seconds=cfg.step_seconds,
             rate_window=cfg.rate_window,
             request_timeout_seconds=cfg.request_timeout_seconds,
+            range_query_chunk_hours=cfg.range_query_chunk_hours,
+            request_max_attempts=cfg.request_max_attempts,
+            retry_backoff_seconds=cfg.retry_backoff_seconds,
+            max_interpolation_gap_steps=cfg.max_interpolation_gap_steps,
         )
 
 

@@ -408,6 +408,10 @@
         ${configInput("采样步长（秒）", "step_seconds", collection.step_seconds || 300, { type: "number" })}
         ${configInput("CPU Rate 窗口", "rate_window", collection.rate_window || "5m", { placeholder: "5m" })}
         ${configInput("请求超时（秒）", "request_timeout_seconds", collection.request_timeout_seconds || 300, { type: "number" })}
+        ${configInput("Range 分片（小时）", "range_query_chunk_hours", collection.range_query_chunk_hours || 24, { type: "number" })}
+        ${configInput("最大请求次数", "request_max_attempts", collection.request_max_attempts || 3, { type: "number" })}
+        ${configInput("重试退避（秒）", "retry_backoff_seconds", collection.retry_backoff_seconds || 1, { type: "number" })}
+        ${configInput("最大插值缺口（步）", "max_interpolation_gap_steps", collection.max_interpolation_gap_steps || 3, { type: "number" })}
       </div></div>`;
     const supported = Array.isArray(payload?.supported_methods) ? payload.supported_methods : [];
     const enabled = new Set(prediction.enabled_methods || []);
@@ -696,6 +700,10 @@
         scheduled_update_interval_minutes: rowValue(collection, "scheduled_update_interval_minutes"),
         history_days: rowValue(collection, "history_days"), step_seconds: rowValue(collection, "step_seconds"),
         rate_window: rowValue(collection, "rate_window"), request_timeout_seconds: rowValue(collection, "request_timeout_seconds"),
+        range_query_chunk_hours: rowValue(collection, "range_query_chunk_hours"),
+        request_max_attempts: rowValue(collection, "request_max_attempts"),
+        retry_backoff_seconds: rowValue(collection, "retry_backoff_seconds"),
+        max_interpolation_gap_steps: rowValue(collection, "max_interpolation_gap_steps"),
       },
       prediction: {
         vm_test_duration: rowValue(prediction, "vm_test_duration"), vm_future_duration: rowValue(prediction, "vm_future_duration"),

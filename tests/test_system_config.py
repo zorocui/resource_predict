@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,16 +7,77 @@ from unittest.mock import patch
 from flask import Flask
 
 from resource_predict.api.system_config import register_system_config_routes
+from resource_predict.internal_settings import settings
 from resource_predict.services.runtime_config import (
     RuntimeConfigStore,
     RuntimeConfigValidationError,
     default_runtime_config,
+    runtime_config_store,
     runtime_config_to_dict,
+    write_runtime_config,
 )
 from resource_predict.services.system_config import save_system_config_payload
 
 
 class SystemConfigTest(unittest.TestCase):
+    def test_collection_reliability_defaults_and_roundtrip(self):
+        runtime = runtime_config_to_dict(default_runtime_config())
+        collection = runtime["collection"]
+        self.assertEqual(collection["range_query_chunk_hours"], 24)
+        self.assertEqual(collection["request_max_attempts"], 3)
+        self.assertEqual(collection["retry_backoff_seconds"], 1.0)
+        self.assertEqual(collection["max_interpolation_gap_steps"], 3)
+
+        store = RuntimeConfigStore(default_runtime_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime.json"
+            normalized = store.replace_payload(runtime)
+            write_runtime_config(normalized, path)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["collection"], collection)
+
+    def test_collection_reliability_values_must_be_positive(self):
+        for field, value in (
+            ("range_query_chunk_hours", 0),
+            ("request_max_attempts", 0),
+            ("retry_backoff_seconds", 0),
+            ("max_interpolation_gap_steps", 0),
+        ):
+            payload = runtime_config_to_dict(default_runtime_config())
+            payload["collection"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(RuntimeConfigValidationError, field):
+                    RuntimeConfigStore(default_runtime_config()).replace_payload(payload)
+
+    def test_retry_backoff_must_be_numeric_finite_and_positive(self):
+        for value in ("1", -1, float("inf"), float("nan")):
+            payload = runtime_config_to_dict(default_runtime_config())
+            payload["collection"]["retry_backoff_seconds"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    RuntimeConfigValidationError, "retry_backoff_seconds"
+                ):
+                    RuntimeConfigStore(default_runtime_config()).replace_payload(payload)
+
+    def test_collection_reliability_values_are_exposed_by_settings(self):
+        original = runtime_config_store.snapshot()
+        payload = runtime_config_to_dict(original)
+        payload["collection"].update(
+            range_query_chunk_hours=12,
+            request_max_attempts=5,
+            retry_backoff_seconds=0.25,
+            max_interpolation_gap_steps=2,
+        )
+        try:
+            runtime_config_store.replace_payload(payload)
+            config = settings.k8s_prometheus
+            self.assertEqual(config.range_query_chunk_hours, 12)
+            self.assertEqual(config.request_max_attempts, 5)
+            self.assertEqual(config.retry_backoff_seconds, 0.25)
+            self.assertEqual(config.max_interpolation_gap_steps, 2)
+        finally:
+            runtime_config_store.replace(original)
+
     def test_template_separates_system_and_cluster_configuration_views(self):
         root = Path(__file__).resolve().parents[1]
         template = (root / "templates" / "index.html").read_text(encoding="utf-8")

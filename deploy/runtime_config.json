@@ -5,7 +5,11 @@
     "history_days": 7,
     "step_seconds": 300,
     "rate_window": "5m",
-    "request_timeout_seconds": 300
+    "request_timeout_seconds": 300,
+    "range_query_chunk_hours": 24,
+    "request_max_attempts": 3,
+    "retry_backoff_seconds": 1.0,
+    "max_interpolation_gap_steps": 3
   },
   "prediction": {
     "vm_test_duration": "72h",

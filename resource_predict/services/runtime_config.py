@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -32,6 +33,10 @@ class CollectionConfig:
     step_seconds: int = 300
     rate_window: str = "5m"
     request_timeout_seconds: int = 300
+    range_query_chunk_hours: int = 24
+    request_max_attempts: int = 3
+    retry_backoff_seconds: float = 1.0
+    max_interpolation_gap_steps: int = 3
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,15 @@ def _positive_int(value: Any, path: str) -> int:
     return value
 
 
+def _positive_float(value: Any, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _error(path, f"{path.rsplit('.', 1)[-1]} 必须为有限正数")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise _error(path, f"{path.rsplit('.', 1)[-1]} 必须为有限正数")
+    return result
+
+
 def _ratio(value: Any, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _error(path, "必须是 0 到 1 之间的数值")
@@ -158,6 +172,10 @@ def normalize_runtime_config(payload: Any) -> RuntimeConfig:
         step_seconds=_positive_int(c["step_seconds"], "runtime.collection.step_seconds"),
         rate_window=rate_window,
         request_timeout_seconds=_positive_int(c["request_timeout_seconds"], "runtime.collection.request_timeout_seconds"),
+        range_query_chunk_hours=_positive_int(c["range_query_chunk_hours"], "runtime.collection.range_query_chunk_hours"),
+        request_max_attempts=_positive_int(c["request_max_attempts"], "runtime.collection.request_max_attempts"),
+        retry_backoff_seconds=_positive_float(c["retry_backoff_seconds"], "runtime.collection.retry_backoff_seconds"),
+        max_interpolation_gap_steps=_positive_int(c["max_interpolation_gap_steps"], "runtime.collection.max_interpolation_gap_steps"),
     )
 
     methods_raw = p["enabled_methods"]
