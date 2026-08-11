@@ -25,7 +25,7 @@ class _FakeResponse:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, traceback):
+    def __exit__(self, _exc_type, exc, _traceback):
         return False
 
     def read(self) -> bytes:

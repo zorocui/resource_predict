@@ -123,12 +123,44 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 `settings.py` 已精简为启动设置，只保留静态/模板/输出目录、日志和 Flask host/port/debug。
 业务运行配置请在 Web 的“系统配置”页面修改，保存到 `deploy/runtime_config.json` 后立即对新任务生效。
 
-页面运行配置只保留三组常用字段：数据采集（定时开关、周期、历史、步长、rate 窗口、超时）、
+页面运行配置只保留三组常用字段：数据采集（定时开关、周期、历史、步长、rate 窗口、超时、分片与重试）、
 预测（VM/K8S 验证与预测窗口、候选模型、Ensemble）以及决策（策略等级、扩缩容阈值、确认轮次、
 冷却时间和命名空间策略）。Prophet 底层参数、缓存、分页、mock 随机种子等实现细节不再作为用户配置。
 
 保存时服务端先校验完整配置；任何字段或集群配置错误都会整体拒绝。调度配置变化会唤醒唯一的
 K8S 后台调度线程重新读取开关和周期，不需要重启应用。
+
+### K8S 数据采集可靠性
+
+`deploy/runtime_config.json` 的 `collection` 段包含以下 Prometheus 采集参数：
+
+```json
+{
+  "collection": {
+    "scheduled_update_enabled": true,
+    "scheduled_update_interval_minutes": 360,
+    "history_days": 7,
+    "step_seconds": 300,
+    "rate_window": "5m",
+    "request_timeout_seconds": 300,
+    "range_query_chunk_hours": 24,
+    "request_max_attempts": 3,
+    "retry_backoff_seconds": 1.0,
+    "max_interpolation_gap_steps": 3
+  }
+}
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `range_query_chunk_hours` | `24` | `query_range` 单个时间分片的最大时长（小时） |
+| `request_max_attempts` | `3` | 每个 Prometheus HTTP 请求的最大尝试次数，包含首次请求 |
+| `retry_backoff_seconds` | `1.0` | 首次重试等待秒数；后续按指数退避增长 |
+| `max_interpolation_gap_steps` | `3` | 只对不超过该采样步数的完整内部缺口插值；更大的缺口保持断开 |
+
+连接失败、超时、HTTP 429 和 5xx 会在最大尝试次数内重试；其他 4xx 参数或认证错误不会重试。`query_range` 的分片结果按完整 Prometheus 标签集合与时间戳合并，并在边界时间戳重复时保留后一个分片的样本。任一分片在重试耗尽后失败，会使该集群的本轮查询整体失败，不会提交不完整的时间范围。
+
+同一轮中其他成功集群仍会按 `resource_id` 增量 upsert。本轮未返回或失败集群所属的 Workload 不会被当作删除，也不会清空已有 raw 历史和预测产物。采集端仅补齐短缺口；预测端使用最近连续且足够长的数据段，连续段不足测试窗口时跳过该指标或 Workload 的本轮重算并保留旧预测。
 
 旧版 `deploy/forecast_config.json` 仅在 `runtime_config.json` 不存在时作为模型开关迁移来源。
 
@@ -141,7 +173,7 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 | `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `True` / `True` / `auto` / `3.5` |
 | `DecisionConfig` | `scale_out_threshold` / `scale_in_threshold` / `scale_in_max_reduction_ratio` / `scale_out_confirmations` / `scale_in_confirmations` / `action_gate_state_retention_days` | `0.8` / `0.2` / `0.5` / `2` / `3` / `30` |
 | `UpdateConfig` | `enabled` / `interval_minutes` / `startup_delay_seconds` / `sliding_window` | `False` / `60` / `60` / `False` |
-| `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` | `7` / `60` / `300` / `5m` / `True` / `360` |
+| `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` / `range_query_chunk_hours` / `request_max_attempts` / `retry_backoff_seconds` / `max_interpolation_gap_steps` | `7` / `60` / `300` / `5m` / `True` / `360` / `24` / `3` / `1.0` / `3` |
 
 `rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值。
 
@@ -157,7 +189,7 @@ K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_re
 | `vm_test_duration` / `vm_future_duration` | VM 专用时长，优先于点数 |
 | `workload_test_duration` / `workload_future_duration` | K8S Workload 专用时长，默认 `24h` |
 
-时长配置根据真实采样间隔自动换算点数。例如 `step_seconds=300` + `workload_test_duration="24h"` = 288 个测试点。
+VM 时长根据观测到的采样间隔换算点数；K8S Workload 始终以配置的 `step_seconds` 为权威采样间隔，避免 Prometheus 拉取失败形成的大间隔误导窗口换算。例如 `step_seconds=300` + `workload_test_duration="24h"` = 288 个测试点。未来预测时间戳从最后一个有效测试点之后的一个采样间隔开始，不随当前时间或稀疏观测间隔平移。
 
 ### 策略分级配置
 

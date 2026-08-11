@@ -20,7 +20,7 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(set(payload), {"collection", "prediction", "decision"})
         self.assertEqual(payload["collection"]["rate_window"], "5m")
         self.assertNotIn("fail_fast", payload["collection"])
-        self.assertEqual(sum(len(v) for v in payload.values()), 22)
+        self.assertEqual(sum(len(v) for v in payload.values()), 26)
 
     def test_unknown_field_reports_stable_path(self):
         with self.assertRaises(RuntimeConfigValidationError) as caught:

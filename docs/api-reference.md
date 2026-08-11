@@ -48,6 +48,18 @@
 
 弹窗应先请求 `include_charts=false` 并立即展示规格、建议和门控状态，再按可见指标异步请求 `/charts`。每个图表请求只会读取该资源对应的一个 raw 分片，不扫描其他资源。
 
+图表块除 `x_train_ms`、`x_test_ms`、`x_pred_ms` 及对应值外，还包含以下时间与缺口元数据：
+
+| 字段 | 说明 |
+| --- | --- |
+| `test_end_ms` | 最后一个有效测试数据点的毫秒时间戳 |
+| `sample_interval_seconds` | 本轮预测采用的规范采样间隔；K8S Workload 使用运行配置中的 `step_seconds` |
+| `max_interpolation_gap_steps` | 可自动补齐的最大连续缺失步数，同时用于前端判断是否断线 |
+
+后端保证 `x_pred_ms` 的首点为 `test_end_ms + sample_interval_seconds`，其余未来点保持相同间隔。前端会再次过滤所有不晚于 `test_end_ms` 的未来点；黄色预测区域从 `test_end_ms` 开始，到最后一个有效未来预测点结束。若没有严格晚于测试终点的未来点，则不显示黄色区域。历史和测试曲线遇到超过允许步数的大缺口会断开。
+
+K8S 指标的 `data_quality` 会附带 `recent_contiguous_points`、`recent_contiguous_span_hours`、`data_end_ms` 和 `prediction_skipped`。当最近连续段的点数不足测试窗口时，该指标记为跳过；若 Workload 因指标过短无法重算，接口继续提供其已有预测产物。可在 `manifest.json` 与 `forecast_error_report.json` 的 `meta.prediction_skips`、以及 `generation_stats.json` 顶层的 `prediction_skips` 中查看 `resource_id`、`metric` 与原因 `recent_contiguous_segment_too_short`。
+
 ## 数据更新
 
 | 方法 | 路径 | 说明 |
@@ -59,6 +71,8 @@
 | POST | `/api/upsert-data` | 推送数据，更新或新增资源（异步） |
 
 更新任务成功、部分成功或失败后都会写入 `outputs/update_history.json`，应用重启后仍可查询。系统按完成时间从新到旧保留最近 100 条；历史文件读取或写入异常只记录日志，不影响数据更新主流程。历史记录包含任务来源、拉取窗口、开始/结束时间、耗时、资源和数据点统计以及错误信息。整体 `status` 可为 `success`、`partial_success` 或 `failed`；K8S Prometheus 更新还通过 `cluster_results` 记录每个集群的 `success` / `failed`、Workload 数、耗时和错误。
+
+K8S 多集群拉取中，只要至少一个集群成功且后续 upsert/预测完成，同时另有集群失败，整体即为 `partial_success`。失败集群的具体异常写入对应 `cluster_results[].error`；成功集群的数据继续提交。失败集群所属或本轮未返回的 Workload 会保留已有 raw 历史和预测产物，不会因为一次稀疏结果被删除。一个 range 查询的任一分片在重试耗尽后失败时，该集群查询按整体失败处理，不会合并部分时间范围。
 
 ```json
 {

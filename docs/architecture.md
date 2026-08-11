@@ -198,6 +198,26 @@ Provider（mock / real / Prometheus）
   -> write_prediction_outputs()     [pipeline/write_outputs.py]
 ```
 
+K8S Prometheus 的缺口安全链路进一步细化为：
+
+```text
+Prometheus range window
+  -> 24h chunks
+  -> per-request retry
+  -> label/timestamp merge
+  -> per-cluster atomic aggregation
+  -> resource-ID scoped upsert
+  -> recent contiguous forecast segment
+  -> canonical future index after test_end_ms
+  -> frontend test-boundary guard
+```
+
+每个 range 分片独立对连接失败、超时、HTTP 429 和 5xx 执行有限次数指数退避重试，分片按完整标签集合和时间戳合并。任一必需查询或分片最终失败时，该集群本轮不会提交部分时间范围；其他成功集群仍继续更新。upsert 只触及本轮成功返回的 `resource_id`，因此失败集群或本轮未出现的 Workload 会保留既有 raw 历史和预测产物。
+
+采集正则化只插值不超过 `max_interpolation_gap_steps` 的完整短缺口，大缺口保持稀疏。预测使用 K8S 配置的 `step_seconds` 作为权威采样间隔，并从每个指标最近的连续数据段评估可用性；连续段不足测试窗口时跳过重算、记录 `prediction_skips` 并保留旧产物。模型未来值统一重建为从真实测试终点 `test_end_ms + sample_interval_seconds` 开始的规范时间轴。
+
+前端仍执行防御性边界检查：只绘制严格晚于 `test_end_ms` 的未来点，黄色预测区域从最后测试点开始，到最后一个有效未来点结束，与当前时间无关。历史线和测试线在大缺口处插入空点并保持 `connectNulls=false`，避免跨越采集中断直接连线。
+
 `WorkerContext`（`pipeline/_types.py`）是传递给每个 worker 的只读上下文。`FitResult` 是每个指标的返回结构。管线使用 `concurrent.futures.ThreadPoolExecutor` 进行资源级并行，可选的指标级内部并行由 `resolve_parallel_plan()` 控制。
 
 ## 产物隔离
@@ -226,7 +246,7 @@ VM 数据写入 `outputs/vm/`，K8S 数据写入 `outputs/k8s/`。两个目录�
 
 每个更新任务进入成功、部分成功或失败终态时，`services/update_history.py` 会将摘要原子写入 `outputs/update_history.json`。该文件按完成时间倒序保留最近 100 条，供 `GET /api/update-history` 和“数据更新”页面读取。历史存储与更新结果隔离：文件缺失或损坏时返回空历史，写入失败只记录日志，不改变采集、合并或预测结果。
 
-K8S Prometheus 更新还保存 `cluster_results`：每个目标集群分别记录成功/失败、Workload 数、耗时和错误。只要成功集群的数据完成 upsert 与预测，多集群混合结果记为 `partial_success`；全部集群失败或后续写入/预测失败时记为 `failed`。部分失败不会丢弃成功集群的数据。
+K8S Prometheus 更新还保存 `cluster_results`：每个目标集群分别记录成功/失败、Workload 数、耗时和错误。只要成功集群的数据完成 upsert 与预测，多集群混合结果记为 `partial_success`；全部集群失败或后续写入/预测失败时记为 `failed`。部分失败不会丢弃成功集群的数据，本轮未返回的 Workload 也不作为删除信号。
 
 ```text
 Pull:       POST /api/update-trigger -> run_update -> IncrementalProvider -> _do_update
