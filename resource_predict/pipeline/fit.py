@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 from resource_predict.pipeline._types import WorkerContext
@@ -16,6 +17,44 @@ from resource_predict.pipeline.series_utils import compute_metrics
 from resource_predict.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+def canonical_future_index(
+    test_index: pd.DatetimeIndex,
+    steps: int,
+    sample_interval_seconds: Optional[float],
+) -> pd.DatetimeIndex:
+    """Build the shared future timeline immediately after the real test endpoint."""
+    if not isinstance(test_index, pd.DatetimeIndex) or test_index.empty:
+        raise ValueError("cannot build future index without a test endpoint")
+    seconds = float(sample_interval_seconds or 0)
+    if not np.isfinite(seconds) or seconds <= 0:
+        raise ValueError("cannot build future index without a positive sample interval")
+    start = test_index.max() + pd.Timedelta(seconds=seconds)
+    return pd.date_range(
+        start=start,
+        periods=int(steps),
+        freq=pd.Timedelta(seconds=seconds),
+    )
+
+
+def _canonicalize_future_series(
+    future_by_method: Dict[str, pd.Series],
+    *,
+    index: pd.DatetimeIndex,
+    expected_steps: int,
+    method_failures: Dict[str, str],
+) -> None:
+    for method, series in list(future_by_method.items()):
+        if len(series) != expected_steps:
+            method_failures[method] = (
+                f"future forecast length mismatch: expected {expected_steps}, got {len(series)}"
+            )
+            del future_by_method[method]
+            continue
+        normalized = series.copy()
+        normalized.index = index
+        future_by_method[method] = normalized
 
 
 def fit_one_metric(
@@ -135,6 +174,17 @@ def fit_one_metric(
                 continue
             preds_future[m] = res.yhat.copy()
             timing[m] += float(res.seconds)
+    future_index = canonical_future_index(
+        y_test.index,
+        ctx.future_steps,
+        ctx.sample_interval_seconds,
+    )
+    _canonicalize_future_series(
+        preds_future,
+        index=future_index,
+        expected_steps=ctx.future_steps,
+        method_failures=method_failures,
+    )
     if best not in preds_future:
         fallback = "rolling_mean"
         res = forecast_by_method(fallback, y_full, ctx.future_steps)
@@ -145,6 +195,14 @@ def fit_one_metric(
             best,
             "future forecast unavailable; rolling_mean future used",
         )
+        _canonicalize_future_series(
+            preds_future,
+            index=future_index,
+            expected_steps=ctx.future_steps,
+            method_failures=method_failures,
+        )
+    if best not in preds_future:
+        raise RuntimeError(f"no valid future forecast available for selected method {best}")
     ensemble_future = ensemble_series(preds_future, metrics, enable_ensemble=enable_ensemble)
     if ensemble_future is not None:
         preds_future["ensemble"] = ensemble_future

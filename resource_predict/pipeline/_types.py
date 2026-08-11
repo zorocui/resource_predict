@@ -1,7 +1,7 @@
 """pipeline 模块共享数据结构。"""
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 class WorkerContext:
@@ -15,6 +15,8 @@ class WorkerContext:
         "metric_filter_by_id",
         "metric_partial_enabled",
         "existing_partial_ids",
+        "sample_interval_seconds",
+        "max_interpolation_gap_steps",
     )
 
     def __init__(
@@ -27,6 +29,8 @@ class WorkerContext:
         metric_filter_by_id: Dict[str, Any],
         metric_partial_enabled: bool,
         existing_partial_ids: set[str],
+        sample_interval_seconds: Optional[float] = None,
+        max_interpolation_gap_steps: int = 3,
     ) -> None:
         self.test_size = test_size
         self.future_steps = future_steps
@@ -35,3 +39,5 @@ class WorkerContext:
         self.metric_filter_by_id = metric_filter_by_id
         self.metric_partial_enabled = metric_partial_enabled
         self.existing_partial_ids = existing_partial_ids
+        self.sample_interval_seconds = sample_interval_seconds
+        self.max_interpolation_gap_steps = max_interpolation_gap_steps

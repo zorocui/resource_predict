@@ -284,6 +284,9 @@ def merge_charts_into_detail(
             "preds_future": block.get("preds_future", {}),
             "metrics": block.get("metrics", {}),
             "best_method": block.get("best_method", ""),
+            "test_end_ms": block.get("test_end_ms"),
+            "sample_interval_seconds": block.get("sample_interval_seconds"),
+            "max_interpolation_gap_steps": block.get("max_interpolation_gap_steps"),
         }
     out["charts"] = merged_charts
     container_charts = _merge_container_charts(
@@ -355,6 +358,9 @@ def _merge_container_charts(
                 "preds_future": block.get("preds_future", {}),
                 "metrics": block.get("metrics", {}),
                 "best_method": block.get("best_method", ""),
+                "test_end_ms": block.get("test_end_ms"),
+                "sample_interval_seconds": block.get("sample_interval_seconds"),
+                "max_interpolation_gap_steps": block.get("max_interpolation_gap_steps"),
             }
         if metric_out:
             out[str(container)] = metric_out

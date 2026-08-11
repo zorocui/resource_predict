@@ -17,6 +17,8 @@ def _ctx() -> WorkerContext:
         metric_filter_by_id={},
         metric_partial_enabled=False,
         existing_partial_ids=set(),
+        sample_interval_seconds=3600.0,
+        max_interpolation_gap_steps=3,
     )
 
 
@@ -48,3 +50,7 @@ def test_worker_writes_observed_stats_for_full_history():
     assert item["history_coverage"]["span_hours"] == 3.0
     assert item["history_coverage"]["span_days"] == 0.12
     assert item["history_coverage"]["is_short"] is True
+    cpu_chart = item["charts_forecast"]["cpu"]
+    assert cpu_chart["test_end_ms"] == int(index[-1].value // 1_000_000)
+    assert cpu_chart["sample_interval_seconds"] == 3600.0
+    assert cpu_chart["max_interpolation_gap_steps"] == 3

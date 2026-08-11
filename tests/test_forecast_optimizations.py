@@ -33,10 +33,58 @@ def _ctx(config: dict) -> WorkerContext:
         metric_filter_by_id={},
         metric_partial_enabled=False,
         existing_partial_ids=set(),
+        sample_interval_seconds=300.0,
+        max_interpolation_gap_steps=3,
     )
 
 
 class ForecastOptimizationTest(unittest.TestCase):
+    def test_reused_model_future_index_starts_after_real_test_end(self):
+        index = pd.to_datetime([
+            "2026-08-01 00:00", "2026-08-01 00:05", "2026-08-01 00:10",
+            "2026-08-02 00:00", "2026-08-03 04:00", "2026-08-09 04:00",
+        ])
+        y_full = pd.Series(range(6), index=index, dtype=float)
+        y_train, y_test = y_full.iloc[:-3], y_full.iloc[-3:]
+
+        def fake_forecast(_method, train, steps):
+            wrong = pd.date_range(train.index[-1], periods=steps + 1, freq="5min")[1:]
+            return ForecastResult(pd.Series(range(steps), index=wrong, dtype=float), 0.1)
+
+        with patch("resource_predict.pipeline.fit.forecast_by_method", fake_forecast):
+            _preds, _metrics, _best, future, _timing, _diagnostics = fit_one_metric(
+                y_train, y_test, y_full,
+                ctx=_ctx({"reuse_backtest_model_for_future": True}),
+            )
+
+        expected = pd.date_range(
+            y_test.index[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min"
+        )
+        self.assertTrue(future["rolling_mean"].index.equals(expected))
+
+    def test_refitted_model_future_index_starts_after_real_test_end(self):
+        index = pd.to_datetime([
+            "2026-08-01 00:00", "2026-08-01 00:05", "2026-08-01 00:10",
+            "2026-08-02 00:00", "2026-08-03 04:00", "2026-08-09 04:00",
+        ])
+        y_full = pd.Series(range(6), index=index, dtype=float)
+        y_train, y_test = y_full.iloc[:-3], y_full.iloc[-3:]
+
+        def fake_forecast(_method, train, steps):
+            wrong = pd.date_range(train.index[-1], periods=steps + 1, freq="5min")[1:]
+            return ForecastResult(pd.Series(range(steps), index=wrong, dtype=float), 0.1)
+
+        with patch("resource_predict.pipeline.fit.forecast_by_method", fake_forecast):
+            _preds, _metrics, _best, future, _timing, _diagnostics = fit_one_metric(
+                y_train, y_test, y_full,
+                ctx=_ctx({"reuse_backtest_model_for_future": False}),
+            )
+
+        expected = pd.date_range(
+            y_test.index[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min"
+        )
+        self.assertTrue(future["rolling_mean"].index.equals(expected))
+
     def test_reuse_backtest_model_forecasts_holdout_and_future_once(self):
         y_full = _series([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
         y_train = y_full.iloc[:-3]
@@ -105,6 +153,7 @@ class ForecastOptimizationTest(unittest.TestCase):
             metric_filter_by_id={},
             metric_partial_enabled=False,
             existing_partial_ids=set(),
+            sample_interval_seconds=3600.0,
         )
 
         def fake_forecast(method: str, y_train_arg: pd.Series, steps: int) -> ForecastResult:
@@ -144,6 +193,7 @@ class ForecastOptimizationTest(unittest.TestCase):
             metric_filter_by_id={},
             metric_partial_enabled=False,
             existing_partial_ids=set(),
+            sample_interval_seconds=300.0,
         )
 
         def fake_forecast(method: str, y_train_arg: pd.Series, steps: int) -> ForecastResult:
@@ -164,7 +214,48 @@ class ForecastOptimizationTest(unittest.TestCase):
         self.assertIn("rolling_mean", preds)
         self.assertIn("rolling_mean", metrics)
         self.assertEqual(len(future["rolling_mean"]), 2)
+        expected = pd.date_range(
+            y_test.index[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min"
+        )
+        self.assertTrue(future["rolling_mean"].index.equals(expected))
         self.assertIn("arima", diagnostics["method_failures"])
+
+    def test_all_configured_methods_failed_fallback_uses_canonical_future_index(self):
+        y_full = _series([0.1, 0.2, 0.3, 0.4, 0.5], freq="5min")
+        y_train, y_test = y_full.iloc[:-3], y_full.iloc[-3:]
+        ctx = WorkerContext(
+            test_size=3,
+            future_steps=2,
+            active_methods=["arima"],
+            forecast_config={
+                "enabled_methods": ["arima"],
+                "enable_ensemble": False,
+                "reuse_backtest_model_for_future": True,
+                "prophet_routing_enabled": False,
+                "prophet_routing_mode": "auto",
+            },
+            metric_filter_by_id={},
+            metric_partial_enabled=False,
+            existing_partial_ids=set(),
+            sample_interval_seconds=300.0,
+        )
+
+        def fake_forecast(method: str, train: pd.Series, steps: int) -> ForecastResult:
+            if method == "arima":
+                raise ValueError("configured model failed")
+            wrong = pd.date_range(train.index[-1], periods=steps + 1, freq="h")[1:]
+            return ForecastResult(pd.Series([0.2] * steps, index=wrong), seconds=0.1)
+
+        with patch("resource_predict.pipeline.fit.forecast_by_method", fake_forecast):
+            _preds, _metrics, best, future, _timing, _diagnostics = fit_one_metric(
+                y_train, y_test, y_full, ctx=ctx
+            )
+
+        expected = pd.date_range(
+            y_test.index[-1] + pd.Timedelta(minutes=5), periods=2, freq="5min"
+        )
+        self.assertEqual(best, "rolling_mean")
+        self.assertTrue(future["rolling_mean"].index.equals(expected))
 
 
 if __name__ == "__main__":

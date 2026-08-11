@@ -93,6 +93,9 @@ def worker(
             "preds_future": {m: series_to_lists(future_pred[m]) for m in future_pred.keys()},
             "metrics": metric_scores,
             "best_method": best,
+            "test_end_ms": int(metric_sources[metric_name][1].index.max().value // 1_000_000),
+            "sample_interval_seconds": float(ctx.sample_interval_seconds),
+            "max_interpolation_gap_steps": int(ctx.max_interpolation_gap_steps),
         }
         futures_for_advice[metric_name] = future_pred[best].to_numpy(dtype=float)
 
@@ -212,6 +215,9 @@ def _fit_container_metrics(
                 "metrics": metric_scores,
                 "best_method": best,
                 "forecast_diagnostics": diagnostics,
+                "test_end_ms": int(y_test.index.max().value // 1_000_000),
+                "sample_interval_seconds": float(ctx.sample_interval_seconds),
+                "max_interpolation_gap_steps": int(ctx.max_interpolation_gap_steps),
             }
             futures.setdefault(name, {})[metric_name] = future_pred[best].to_numpy(dtype=float)
     return charts, futures

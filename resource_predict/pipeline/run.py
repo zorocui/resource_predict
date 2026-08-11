@@ -236,6 +236,8 @@ def generate_forecasts(
         metric_filter_by_id=metric_filter_by_id,
         metric_partial_enabled=metric_partial_enabled,
         existing_partial_ids=existing_partial_ids,
+        sample_interval_seconds=window.sample_interval_seconds,
+        max_interpolation_gap_steps=int(settings.k8s_prometheus.max_interpolation_gap_steps),
     )
 
     logger.info(

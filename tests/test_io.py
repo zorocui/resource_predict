@@ -218,6 +218,9 @@ class MergeChartsIntoDetailTest(unittest.TestCase):
                     "preds_future": {},
                     "metrics": {},
                     "best_method": "arima",
+                    "test_end_ms": 1_700_000_000_000,
+                    "sample_interval_seconds": 300.0,
+                    "max_interpolation_gap_steps": 3,
                 },
             },
         }
@@ -230,6 +233,9 @@ class MergeChartsIntoDetailTest(unittest.TestCase):
         self.assertEqual(len(cpu_chart["y_train"]), n - test_size)
         self.assertEqual(len(cpu_chart["y_test"]), test_size)
         self.assertEqual(cpu_chart["best_method"], "arima")
+        self.assertEqual(cpu_chart["test_end_ms"], 1_700_000_000_000)
+        self.assertEqual(cpu_chart["sample_interval_seconds"], 300.0)
+        self.assertEqual(cpu_chart["max_interpolation_gap_steps"], 3)
 
     def test_merges_container_charts(self):
         n = 30
@@ -271,6 +277,9 @@ class MergeChartsIntoDetailTest(unittest.TestCase):
                         "preds_future": {"arima": [0.6]},
                         "metrics": {},
                         "best_method": "arima",
+                        "test_end_ms": 1_700_000_000_000,
+                        "sample_interval_seconds": 300.0,
+                        "max_interpolation_gap_steps": 3,
                     }
                 }
             },
@@ -282,6 +291,9 @@ class MergeChartsIntoDetailTest(unittest.TestCase):
         self.assertEqual(len(app_cpu["y_train"]), n - test_size)
         self.assertEqual(len(app_cpu["y_test"]), test_size)
         self.assertEqual(app_cpu["best_method"], "arima")
+        self.assertEqual(app_cpu["test_end_ms"], 1_700_000_000_000)
+        self.assertEqual(app_cpu["sample_interval_seconds"], 300.0)
+        self.assertEqual(app_cpu["max_interpolation_gap_steps"], 3)
         self.assertNotIn("container_charts_forecast", result)
 
     def test_skips_if_already_has_y_train(self):
