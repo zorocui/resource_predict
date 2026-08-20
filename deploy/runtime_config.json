@@ -3,6 +3,7 @@
     "scheduled_update_enabled": true,
     "scheduled_update_interval_minutes": 360,
     "history_days": 7,
+    "retention_days": 30,
     "step_seconds": 600,
     "rate_window": "15m",
     "request_timeout_seconds": 300,

@@ -27,6 +27,7 @@ class SystemConfigTest(unittest.TestCase):
         self.assertEqual(collection["request_max_attempts"], 3)
         self.assertEqual(collection["retry_backoff_seconds"], 1.0)
         self.assertEqual(collection["max_interpolation_gap_steps"], 3)
+        self.assertEqual(collection["retention_days"], 30)
 
         store = RuntimeConfigStore(default_runtime_config())
         with tempfile.TemporaryDirectory() as tmp:

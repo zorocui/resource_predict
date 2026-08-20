@@ -20,8 +20,17 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(set(payload), {"collection", "prediction", "decision"})
         self.assertEqual(payload["collection"]["step_seconds"], 600)
         self.assertEqual(payload["collection"]["rate_window"], "15m")
+        self.assertEqual(payload["collection"]["retention_days"], 30)
         self.assertNotIn("fail_fast", payload["collection"])
-        self.assertEqual(sum(len(v) for v in payload.values()), 26)
+        self.assertEqual(sum(len(v) for v in payload.values()), 27)
+
+    def test_retention_days_must_be_positive_integer(self):
+        for invalid in (0, -1, True, 30.5, "30"):
+            payload = runtime_config_to_dict(default_runtime_config())
+            payload["collection"]["retention_days"] = invalid
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(RuntimeConfigValidationError, "retention_days"):
+                    normalize_runtime_config(payload)
 
     def test_unknown_field_reports_stable_path(self):
         with self.assertRaises(RuntimeConfigValidationError) as caught:

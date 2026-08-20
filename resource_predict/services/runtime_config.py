@@ -30,6 +30,7 @@ class CollectionConfig:
     scheduled_update_enabled: bool = True
     scheduled_update_interval_minutes: int = 360
     history_days: int = 7
+    retention_days: int = 30
     step_seconds: int = 600
     rate_window: str = "15m"
     request_timeout_seconds: int = 300
@@ -169,6 +170,7 @@ def normalize_runtime_config(payload: Any) -> RuntimeConfig:
         scheduled_update_enabled=_bool(c["scheduled_update_enabled"], "runtime.collection.scheduled_update_enabled"),
         scheduled_update_interval_minutes=_positive_int(c["scheduled_update_interval_minutes"], "runtime.collection.scheduled_update_interval_minutes"),
         history_days=_positive_int(c["history_days"], "runtime.collection.history_days"),
+        retention_days=_positive_int(c["retention_days"], "runtime.collection.retention_days"),
         step_seconds=_positive_int(c["step_seconds"], "runtime.collection.step_seconds"),
         rate_window=rate_window,
         request_timeout_seconds=_positive_int(c["request_timeout_seconds"], "runtime.collection.request_timeout_seconds"),
