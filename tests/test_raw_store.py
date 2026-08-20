@@ -83,6 +83,27 @@ def _write_forecast_items(base, items):
 
 
 class RawResourceStoreTest(unittest.TestCase):
+    def test_trim_series_retains_exact_thirty_day_boundary(self):
+        idx = pd.DatetimeIndex([
+            "2026-06-30 23:59:59",
+            "2026-07-01 00:00:00",
+            "2026-07-20 12:00:00",
+            "2026-07-31 00:00:00",
+        ])
+        series = pd.Series([0.1, 0.2, 0.3, 0.4], index=idx)
+
+        trimmed = updater._trim_series_to_retention(series, 30)
+
+        self.assertEqual(trimmed.index.tolist(), idx[1:].tolist())
+        self.assertEqual(
+            updater._trim_series_to_retention(series.iloc[-1:], 30).tolist(),
+            [0.4],
+        )
+        for invalid in (0, -1, True, 30.5):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    updater._trim_series_to_retention(series, invalid)
+
     def test_roundtrip_vm_and_k8s_resources(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -319,6 +340,101 @@ class RawResourceStoreTest(unittest.TestCase):
             self.assertEqual({item["resource_id"] for item in forecasts}, {rid_a, rid_b})
             markers = {item["resource_id"]: item["observed_stats"]["marker"] for item in forecasts}
             self.assertEqual(markers, {rid_a: "new-a", rid_b: "old-b"})
+
+    def test_existing_k8s_upsert_trims_aggregate_and_container_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rid = "k8s:a:prod:deployment:api"
+            idx = pd.DatetimeIndex([
+                "2026-06-30 23:59:59",
+                "2026-07-01 00:00:00",
+                "2026-07-20 12:00:00",
+                "2026-07-31 00:00:00",
+            ])
+            values = pd.Series([0.1, 0.2, 0.3, 0.4], index=idx)
+            resource = _k8s(rid)
+            for metric in ("cpu_limit", "cpu_request", "memory_limit", "memory_request"):
+                resource[metric] = values.copy()
+                resource["container_metrics"]["api"][metric] = values.copy()
+            write_raw_resource_dataset(base, [resource], freq="10min")
+            latest = pd.Timestamp("2026-07-31 00:10:00")
+            latest_ms = int(latest.timestamp() * 1000)
+            incoming = {
+                "resource_id": rid,
+                "resource_type": "k8s_workload",
+                "metrics": {
+                    metric: {"timestamps": [latest_ms], "values": [0.5]}
+                    for metric in ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
+                },
+                "container_metrics": {
+                    "api": {
+                        metric: {"timestamps": [latest_ms], "values": [0.5]}
+                        for metric in (
+                            "cpu_limit", "cpu_request", "memory_limit", "memory_request"
+                        )
+                    }
+                },
+            }
+
+            with patch("resource_predict.pipeline.generate_predictions_only", return_value=[]):
+                result = run_upsert_with_data(
+                    [incoming], out_dir=base, fail_if_busy=True, freq_hint="10min"
+                )
+
+            self.assertTrue(result["success"], result.get("error"))
+            loaded = RawResourceStore(base).get(rid)
+            aggregate = loaded["cpu_limit"]
+            container = loaded["container_metrics"]["api"]["cpu_limit"]
+            self.assertGreaterEqual(
+                aggregate.index[0], aggregate.index[-1] - pd.Timedelta(days=30)
+            )
+            self.assertGreaterEqual(
+                container.index[0], container.index[-1] - pd.Timedelta(days=30)
+            )
+            self.assertNotIn(idx[0], aggregate.index)
+            self.assertNotIn(idx[0], container.index)
+
+    def test_new_k8s_upsert_trims_before_first_raw_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rid = "k8s:a:prod:deployment:new-api"
+            idx = pd.DatetimeIndex([
+                "2026-06-01 00:00:00",
+                "2026-07-01 00:00:00",
+                "2026-07-31 00:00:00",
+            ])
+            timestamps = [int(value.timestamp() * 1000) for value in idx]
+            metric_payload = {"timestamps": timestamps, "values": [0.1, 0.2, 0.3]}
+            incoming = {
+                "resource_id": rid,
+                "resource_type": "k8s_workload",
+                "spec": {"cluster": "a", "namespace": "prod", "containers": {"api": {}}},
+                "metrics": {
+                    metric: dict(metric_payload)
+                    for metric in ("cpu_limit", "cpu_request", "memory_limit", "memory_request")
+                },
+                "container_metrics": {
+                    "api": {
+                        metric: dict(metric_payload)
+                        for metric in (
+                            "cpu_limit", "cpu_request", "memory_limit", "memory_request"
+                        )
+                    }
+                },
+            }
+
+            with patch("resource_predict.pipeline.generate_predictions_only", return_value=[]):
+                result = run_upsert_with_data(
+                    [incoming], out_dir=base, fail_if_busy=True, freq_hint="10min"
+                )
+
+            self.assertTrue(result["success"], result.get("error"))
+            loaded = RawResourceStore(base).get(rid)
+            self.assertEqual(loaded["cpu_limit"].index.tolist(), idx[1:].tolist())
+            self.assertEqual(
+                loaded["container_metrics"]["api"]["cpu_limit"].index.tolist(),
+                idx[1:].tolist(),
+            )
 
     def test_pull_provider_runs_inside_update_exclusive_lock(self):
         with tempfile.TemporaryDirectory() as tmp:

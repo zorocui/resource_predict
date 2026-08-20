@@ -32,6 +32,7 @@ from resource_predict.pipeline.output_paths import scoped_out_dir, split_items_b
 from resource_predict.pipeline.windowing import infer_series_freq
 from resource_predict.providers.mock import mock_incremental_provider
 from resource_predict.resource_types import metric_names_for_resource
+from resource_predict.services.runtime_config import runtime_config_store
 from resource_predict.services.update_history import append_update_history
 
 logger = logging.getLogger(__name__)
@@ -414,6 +415,54 @@ def _merge_incremental_into_series(
     combined = combined.sort_index()
 
     return combined
+
+
+def _trim_series_to_retention(series: pd.Series, retention_days: int) -> pd.Series:
+    """Keep one metric's observations within its latest retention window."""
+    if (
+        isinstance(retention_days, bool)
+        or not isinstance(retention_days, int)
+        or retention_days <= 0
+    ):
+        raise ValueError("retention_days must be a positive integer")
+    if series.empty:
+        return series
+
+    normalized = series.sort_index()
+    normalized = normalized[~normalized.index.duplicated(keep="last")]
+    cutoff = normalized.index[-1] - pd.Timedelta(days=retention_days)
+    return normalized[normalized.index >= cutoff]
+
+
+def _trim_resource_to_retention(
+    resource: Dict[str, Any],
+    retention_days: int,
+) -> bool:
+    """Trim aggregate and container metric series; return whether data changed."""
+    changed = False
+    for metric in metric_names_for_resource(resource):
+        series = resource.get(metric)
+        if not isinstance(series, pd.Series):
+            continue
+        trimmed = _trim_series_to_retention(series, retention_days)
+        if not trimmed.equals(series):
+            resource[metric] = trimmed
+            changed = True
+
+    container_metrics = resource.get("container_metrics")
+    if not isinstance(container_metrics, dict):
+        return changed
+    for metrics in container_metrics.values():
+        if not isinstance(metrics, dict):
+            continue
+        for metric, series in list(metrics.items()):
+            if not isinstance(series, pd.Series):
+                continue
+            trimmed = _trim_series_to_retention(series, retention_days)
+            if not trimmed.equals(series):
+                metrics[metric] = trimmed
+                changed = True
+    return changed
 
 
 def _build_new_resource_from_upsert(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -829,6 +878,7 @@ def _do_update(
 
         cfg_u = settings.update
         use_sw = bool(cfg_u.sliding_window)
+        retention_days = int(runtime_config_store.snapshot().collection.retention_days)
 
         new_by_id: Dict[str, Dict[str, Any]] = {}
         for item in new_data_list:
@@ -924,7 +974,11 @@ def _do_update(
                         has_new = True
                         changed_metrics.append(metric)
 
-            if has_new or spec_changed:
+            retention_changed = _trim_resource_to_retention(res, retention_days)
+            if retention_changed:
+                changed_metrics = list(metric_names_for_resource(res))
+
+            if has_new or spec_changed or retention_changed:
                 updated_count += 1
                 updated_resource_ids.append(rid)
                 if changed_metrics:
@@ -936,6 +990,7 @@ def _do_update(
                 if rid in existing_ids:
                     continue
                 new_res = _build_new_resource_from_upsert(new_info)
+                _trim_resource_to_retention(new_res, retention_days)
                 prepared.append(new_res)
                 existing_ids.add(rid)
                 created_count += 1
