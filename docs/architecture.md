@@ -344,9 +344,10 @@ sequenceDiagram
 - 支持混合时间戳格式（秒/毫秒/ISO 字符串）
 - 去重保留最新值（`duplicated(keep="last")`）
 - 可选滑动窗口：合并后裁切到原始长度
+- **30 天 raw 保留**：增量合并和新资源规范化后，VM、Workload 汇总及 `container_metrics` 的每条序列都独立保留从自身最新样本向前 `retention_days` 的时间窗口（默认 30 天，截止点包含）；离线资源保留最后已知的有界窗口
 - 并发安全：`_update_exclusive`（排他锁）+ `_lock`（状态锁）
 - 变更检测：仅在 spec 或指标值真正变化时触发重预测
-- 原始数据提交：只为变化资源写入新的内容寻址分片，最后原子替换 `raw_index.json`；旧快照分片保留短暂宽限期后清理
+- 原始数据提交：裁剪视为资源变更，只为变化资源写入新的内容寻址分片，最后原子替换 `raw_index.json`；旧快照分片保留短暂宽限期后清理
 - 可插拔数据源：通过 `incremental_provider_path`（`module:function` 格式）指定自定义增量 provider，未配置时使用默认 mock provider
 
 ### 调配执行（`services/scaling/`）

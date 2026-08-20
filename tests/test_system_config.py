@@ -116,6 +116,8 @@ class SystemConfigTest(unittest.TestCase):
             "k8s_prometheus_clusters: cached.k8s_prometheus_clusters || []", script
         )
         self.assertIn("runtime: cached.runtime || {}", script)
+        self.assertIn('"retention_days"', script)
+        self.assertIn('retention_days: rowValue(collection, "retention_days")', script)
         self.assertNotIn('/api/forecast-config', script)
 
     def test_save_writes_all_sections_and_swaps_snapshot(self):

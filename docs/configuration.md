@@ -123,14 +123,14 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 `settings.py` 已精简为启动设置，只保留静态/模板/输出目录、日志和 Flask host/port/debug。
 业务运行配置请在 Web 的“系统配置”页面修改，保存到 `deploy/runtime_config.json` 后立即对新任务生效。
 
-页面运行配置只保留三组常用字段：数据采集（定时开关、周期、历史、步长、rate 窗口、超时、分片与重试）、
+页面运行配置只保留三组常用字段：数据采集（定时开关、周期、拉取历史、本地保留、步长、rate 窗口、超时、分片与重试）、
 预测（VM/K8S 验证与预测窗口、候选模型、Ensemble）以及决策（策略等级、扩缩容阈值、确认轮次、
 冷却时间和命名空间策略）。Prophet 底层参数、缓存、分页、mock 随机种子等实现细节不再作为用户配置。
 
 保存时服务端先校验完整配置；任何字段或集群配置错误都会整体拒绝。调度配置变化会唤醒唯一的
 K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 
-### K8S 数据采集可靠性
+### 数据采集与本地保留
 
 `deploy/runtime_config.json` 的 `collection` 段包含以下 Prometheus 采集参数：
 
@@ -140,6 +140,7 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
     "scheduled_update_enabled": true,
     "scheduled_update_interval_minutes": 360,
     "history_days": 7,
+    "retention_days": 30,
     "step_seconds": 600,
     "rate_window": "15m",
     "request_timeout_seconds": 300,
@@ -153,6 +154,8 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
+| `history_days` | `7` | K8S Prometheus 首次或全量拉取的历史范围；不是本地数据保留期 |
+| `retention_days` | `30` | 本地 raw 监控数据保留窗口；VM、Workload 汇总及 Container 序列均按各自最新有效样本向前保留 30 天 |
 | `range_query_chunk_hours` | `24` | `query_range` 单个时间分片的最大时长（小时） |
 | `request_max_attempts` | `3` | 每个 Prometheus HTTP 请求的最大尝试次数，包含首次请求 |
 | `retry_backoff_seconds` | `1.0` | 首次重试等待秒数；后续按指数退避增长 |
@@ -161,6 +164,8 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 连接失败、超时、HTTP 429 和 5xx 会在最大尝试次数内重试；其他 4xx 参数或认证错误不会重试。`query_range` 的分片结果按完整 Prometheus 标签集合与时间戳合并，并在边界时间戳重复时保留后一个分片的样本。任一分片在重试耗尽后失败，会使该集群的本轮查询整体失败，不会提交不完整的时间范围。
 
 同一轮中其他成功集群仍会按 `resource_id` 增量 upsert。本轮未返回或失败集群所属的 Workload 不会被当作删除，也不会清空已有 raw 历史和预测产物。采集端仅补齐短缺口；预测端使用最近连续且足够长的数据段，连续段不足测试窗口时跳过该指标或 Workload 的本轮重算并保留旧预测。
+
+增量合并后，系统会使用 `retention_days` 按时间戳裁剪每条序列，保留大于或等于“该序列最新时间戳减 30 天”的样本。不规则采样和缺口不会改用点数估算；暂时离线的资源保留最后已知的有界 30 天窗口，不按墙上时间整体删除。
 
 旧版 `deploy/forecast_config.json` 仅在 `runtime_config.json` 不存在时作为模型开关迁移来源。
 
@@ -178,6 +183,7 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 `rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值 `15m`。默认 `step_seconds=600` 表示每 10 分钟返回一个结果点，两个参数彼此独立。
 
 K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_refresh=true` 时，会按 `history_days` 拉取全量历史窗口（默认最近 7 天）。已有本地基线后的普通拉取会使用增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认 `360 + 60 = 420` 分钟，即最近 7 小时。
+这两个拉取窗口都与本地 `retention_days=30` 保留窗口独立。
 
 通过 `python app.py` 启动时，将 `scheduled_update_enabled` 设为 `True` 会启用 K8S Prometheus 后台定时拉取：启动后等待 `scheduled_update_startup_delay_seconds`（默认 60 秒）执行首次拉取，此后按 `scheduled_update_interval_minutes` 执行。VM 数据更新仍需通过页面按钮、更新 API 或 CLI 手动触发。
 

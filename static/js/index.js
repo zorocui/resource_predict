@@ -405,6 +405,7 @@
         ${configInput("启用定时拉取", "scheduled_update_enabled", collection.scheduled_update_enabled !== false, { type: "checkbox" })}
         ${configInput("拉取周期（分钟）", "scheduled_update_interval_minutes", collection.scheduled_update_interval_minutes || 360, { type: "number" })}
         ${configInput("全量历史（天）", "history_days", collection.history_days || 7, { type: "number" })}
+        ${configInput("本地保留（天）", "retention_days", collection.retention_days || 30, { type: "number" })}
         ${configInput("采样步长（秒）", "step_seconds", collection.step_seconds || 600, { type: "number" })}
         ${configInput("CPU Rate 窗口", "rate_window", collection.rate_window || "15m", { placeholder: "15m" })}
         ${configInput("请求超时（秒）", "request_timeout_seconds", collection.request_timeout_seconds || 300, { type: "number" })}
@@ -698,7 +699,8 @@
       collection: {
         scheduled_update_enabled: rowValue(collection, "scheduled_update_enabled"),
         scheduled_update_interval_minutes: rowValue(collection, "scheduled_update_interval_minutes"),
-        history_days: rowValue(collection, "history_days"), step_seconds: rowValue(collection, "step_seconds"),
+        history_days: rowValue(collection, "history_days"), retention_days: rowValue(collection, "retention_days"),
+        step_seconds: rowValue(collection, "step_seconds"),
         rate_window: rowValue(collection, "rate_window"), request_timeout_seconds: rowValue(collection, "request_timeout_seconds"),
         range_query_chunk_hours: rowValue(collection, "range_query_chunk_hours"),
         request_max_attempts: rowValue(collection, "request_max_attempts"),
