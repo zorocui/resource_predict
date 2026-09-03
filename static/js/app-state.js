@@ -66,7 +66,6 @@
       systemConfigMessage: document.getElementById("system-config-message"),
       clusterConfigSave: document.getElementById("cluster-config-save"),
       clusterConfigMessage: document.getElementById("cluster-config-message"),
-      forecastModelList: document.getElementById("forecast-model-list"),
       vmClusterAdd: document.getElementById("vm-cluster-add"),
       k8sScalingClusterAdd: document.getElementById("k8s-scaling-cluster-add"),
       vmClusterList: document.getElementById("vm-cluster-list"),

@@ -299,7 +299,7 @@ def _validate_incoming_data(
     校验新数据与现有数据的时间连续性，返回警告信息。
 
     检测项：
-    - 重复时间点（与现有数据重叠）
+    - 重复时间点（与现有数据重叠，仅统计 duplicate_count，不产生逐条警告）
     - 时间不连续（新旧数据间存在较大间隔）
     - 时间倒序（新数据早于现有数据末点）
     - 新数据内部乱序
@@ -340,11 +340,6 @@ def _validate_incoming_data(
     existing_set = set(existing_ts_ms)
     duplicates = [t for t in ts_ms if t in existing_set]
     duplicate_count = len(duplicates)
-    if duplicate_count > 0:
-        warnings.append(
-            f"{tag}{duplicate_count}/{len(ts_ms)} 个新数据点的时间戳与现有数据重复，"
-            f"将被覆盖为最新值"
-        )
 
     # ----- 新数据内乱序检测 -----
     raw_ts = _normalize_timestamps_ms(new_timestamps)
@@ -887,6 +882,7 @@ def _do_update(
                 new_by_id[rid] = item
 
         all_warnings: List[str] = []
+        total_duplicate_pts = 0
         updated_count = 0
         created_count = 0
         total_new_pts = 0
@@ -954,6 +950,7 @@ def _do_update(
                         raise ValueError(msg)
                     if validation.get("warnings"):
                         all_warnings.extend(validation["warnings"])
+                    total_duplicate_pts += int(validation.get("duplicate_count") or 0)
 
                     before_series = res[metric]
                     before_len = len(before_series)
@@ -1000,6 +997,11 @@ def _do_update(
                 updated_metrics_by_resource[rid] = changed_metrics
                 total_new_pts += sum(len(new_res[metric]) for metric in changed_metrics)
 
+        if total_duplicate_pts:
+            logger.info(
+                "[updater] %d 个新数据点时间戳与现有数据重复，已覆盖为最新值",
+                total_duplicate_pts,
+            )
         if all_warnings:
             for w in all_warnings:
                 logger.warning("[updater] ⚠ %s", w)

@@ -20,12 +20,11 @@
 │   ├── api-reference.md             #   API 接口文档与使用示例
 │   └── development.md               #   开发指南与 FAQ
 │
-├── deploy/                          # 运行时敏感配置（.gitignore 忽略）
+├── deploy/                          # 部署配置（凭据类文件由 .gitignore 忽略）
 │   ├── clusters.example.json        # 集群配置示例
-│   ├── clusters.json                # VM / K8S 调配集群配置
-│   ├── k8s_prometheus_clusters.json # K8S Prometheus 集群配置
-│   ├── runtime_config.json           # 页面统一管理的运行配置
-│   └── forecast_config.json         # 预测模型开关配置
+│   ├── clusters.json                # VM / K8S 调配集群配置（忽略）
+│   ├── k8s_prometheus_clusters.json # K8S Prometheus 集群配置（忽略）
+│   └── runtime_config.json          # 页面统一管理的运行配置（含预测模型开关）
 │
 ├── resource_predict/                # 核心业务包
 │   ├── __init__.py
@@ -39,7 +38,7 @@
 │   │   ├── updates.py               #   数据更新（pull / push / upsert）
 │   │   ├── scaling.py               #   调配任务创建 / 查询 / 确认
 │   │   ├── cluster_configs.py       #   集群配置读写与 K8S 诊断/拉取
-│   │   ├── forecast_config.py       #   预测模型开关读写
+│   │   ├── system_config.py         #   统一运行配置读写（含预测模型开关）
 │   │   └── pages.py                 #   HTML 页面路由
 │   │
 │   ├── core/                        # 核心业务逻辑
@@ -88,9 +87,11 @@
 │       │   └── snapshot.py          #     调配成功后更新本地产物快照
 │       ├── urgency.py               #   紧急度评分（资源排序优先级）
 │       ├── output_health.py         #   产物健康检查逻辑
-│       ├── forecast_config.py       #   预测配置管理
+│       ├── runtime_config.py        #   统一运行配置模型、校验与持久化
+│       ├── system_config.py         #   系统配置聚合读写与失败回滚
+│       ├── forecast_config.py       #   由 settings 派生本轮预测模型开关
 │       ├── cluster_configs.py       #   集群配置服务
-│       ├── k8s_ingest.py            #   K8S Prometheus 拉取
+│       ├── k8s_ingest.py            #   K8S Prometheus 拉取与后台定时调度
 │       ├── update_tasks.py          #   更新任务同步/异步执行
 │       └── update_history.py        #   最近更新历史持久化
 │
@@ -214,6 +215,8 @@ Prometheus range window
 
 每个 range 分片独立对连接失败、超时、HTTP 429 和 5xx 执行有限次数指数退避重试，分片按完整标签集合和时间戳合并。任一必需查询或分片最终失败时，该集群本轮不会提交部分时间范围；其他成功集群仍继续更新。upsert 只触及本轮成功返回的 `resource_id`，因此失败集群或本轮未出现的 Workload 会保留既有 raw 历史和预测产物。
 
+容器指标聚合到控制器粒度依赖 `kube_pod_owner` 瞬时查询（只回看约 5 分钟），其可用性与数小时的 range 查询并不同步。查询成功却聚合不出任何 Workload 时，provider 会按 15 秒、30 秒退避整轮重拉该集群，最多 3 次尝试；错误消息与日志会指出具体断点（容器使用率序列为空 / `kube_pod_owner` 无结果或查询异常 / owner 标签不匹配 / CPU 与内存序列无法配对）以及各序列计数，避免把 kube-state-metrics 重启或查询限流这类临时故障误记为集群配置问题。
+
 采集正则化只插值不超过 `max_interpolation_gap_steps` 的完整短缺口，大缺口保持稀疏。预测使用 K8S 配置的 `step_seconds` 作为权威采样间隔，并从每个指标最近的连续数据段评估可用性；连续段不足测试窗口时跳过重算、记录 `prediction_skips` 并保留旧产物。模型未来值统一重建为从真实测试终点 `test_end_ms + sample_interval_seconds` 开始的规范时间轴。
 
 前端仍执行防御性边界检查：只绘制严格晚于 `test_end_ms` 的未来点，黄色预测区域从最后测试点开始，到最后一个有效未来点结束，与当前时间无关。历史线和测试线在大缺口处插入空点并保持 `connectNulls=false`，避免跨越采集中断直接连线。
@@ -255,6 +258,10 @@ K8S Fetch:  POST /api/cluster-configs/k8s-fetch -> run_k8s_prometheus_upsert（�
 ```
 
 K8S Prometheus 拉取窗口由 `run_k8s_prometheus_upsert()` 决定：如果 `outputs/k8s/raw_index.json` 缺失、指定集群没有本地基线，或请求传入 `full_refresh=true`，则按 `history_days` 拉取全量历史窗口（默认 7 天）；否则按 `scheduled_update_interval_minutes + incremental_overlap_minutes` 拉取增量窗口（默认 6 小时周期 + 1 小时 overlap = 最近 7 小时）。通过 `python app.py` 启动且 `scheduled_update_enabled=true` 时，应用会在 `scheduled_update_startup_delay_seconds` 后启动首次 K8S 拉取，此后按配置间隔执行；也可通过页面按钮、API 或 CLI 手动触发。
+
+调度线程的等待挂在 `_k8s_reload_event` 上，因此保存系统配置（`PUT /api/system-config`）会立刻唤醒它重读开关和周期，无需重启应用。唤醒本身不触发拉取：循环每轮按 `last_start + max(60 秒, scheduled_update_interval_minutes)` 重新推导到期时刻并继续等待剩余部分，所以周期既不会被重置也不会被提前。其中 `last_start` 是上一次拉取**开始**时的 monotonic 时刻，拉取异常同样占用本轮，因此失败后不会快速重试而是等满一个周期；`last_start` 为 `None`（从未拉取过）时视为已到期。只有重算后已逾期的配置变更才会立即取数：把周期改短到已过期、关闭超过一个周期后重新打开，或线程启动后还没拉取过。首次成功拉取之前 `trigger_source` 都是 `scheduled_startup`，之后为 `scheduled`。VM 侧的 `_scheduler_loop` 没有接入该事件，且 `start_background_updater()` 当前无调用方，因此 VM 数据不会被自动拉取。
+
+锚定开始时刻而非完成时刻是数据完整性的要求。增量回看窗口固定为 `scheduled_update_interval_minutes + incremental_overlap_minutes`，而窗口末端取的是 `_fetch_target()` 里构建查询时的 `time.time()`，也就是本轮拉取的起点。若按完成时刻计时，两轮起点的实际间隔会变成 `周期 + 拉取耗时`，一旦耗时超过 `incremental_overlap_minutes`（默认 60 分钟），窗口就盖不住上一轮的末端，中间那段数据永远不会被任何一轮取到，漏掉的时长等于 `拉取耗时 - incremental_overlap_minutes`。按开始时刻计时后实际间隔是 `max(周期, 拉取耗时)`，默认配置下拉取耗时不超过 420 分钟都不会漏；耗时超过周期时循环会记录 warning 并立即开始下一轮。漏掉的时间段若超过 `step_seconds × (max_interpolation_gap_steps + 1)`（默认 40 分钟），`recent_contiguous_segment()` 会判定断档并把可用历史截断到最近一段，该段点数不足 `test_size` 时 `prepare_recent_contiguous_forecast_data()` 记入 `prediction_skips` 并沿用旧预测。
 
 关键线程原语（`data/updater.py`）：
 
@@ -308,7 +315,7 @@ sequenceDiagram
 | Rolling Mean | 近期滚动均值作为稳定基线 |
 | Ensemble | RMSE 倒数加权融合（可选启用） |
 
-**模型选择**：正常情况按 `selection_rmse`（0.65 * 回测 RMSE + 0.35 * 滚动回测 RMSE）最小选择；存在异常时优先鲁棒候选（ensemble / seasonal_naive / rolling_mean）。滚动回测折数由 `rolling_backtest_folds`（默认 3）控制。
+**模型选择**：正常情况按 `selection_rmse`（0.65 * 回测 RMSE + 0.35 * 滚动回测 RMSE）最小选择；存在异常时优先鲁棒候选（ensemble / seasonal_naive / rolling_mean）。滚动回测折数由 `rolling_backtest_folds`（默认 1，即只保留单次留出窗口回测）控制。
 
 ### VM 决策引擎（`core/decision.py`）
 

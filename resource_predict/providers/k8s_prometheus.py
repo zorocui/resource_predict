@@ -24,6 +24,21 @@ from resource_predict.services.cluster_configs import (
 logger = logging.getLogger(__name__)
 
 
+class K8SWorkloadAggregationError(RuntimeError):
+    """Prometheus 查询成功，但结果无法聚合出任何 K8S Workload。
+
+    消息中带具体断点（容器序列 / owner 映射 / CPU 与内存配对），
+    用于区分监控侧临时缺数据和配置或标签不匹配。
+    """
+
+
+# owner 映射或容器序列临时缺失时，整轮拉取的最大尝试次数（含首次）。
+# kube-state-metrics 重启、Prometheus 查询限流等通常在数十秒内自愈，
+# 因此按指数退避重试整轮，而不是把一次临时故障直接记为集群失败。
+AGGREGATION_MAX_ATTEMPTS = 3
+AGGREGATION_RETRY_BACKOFF_SECONDS = 15.0
+
+
 def _is_retryable_http_status(status: int) -> bool:
     return status == 429 or 500 <= status <= 599
 
@@ -177,6 +192,54 @@ def _missing_cluster_result(cluster: str) -> Dict[str, Any]:
     )
 
 
+def _fetch_error_text(exc: Exception) -> str:
+    """把重试次数并入错误消息，便于在更新历史里区分偶发故障和持续故障。"""
+    attempts = getattr(exc, "attempts", 1)
+    if isinstance(exc, K8SWorkloadAggregationError) and attempts > 1:
+        return f"{exc}（已连续尝试 {attempts} 次）"
+    return str(exc)
+
+
+def _fetch_target_with_retry(
+    target: PrometheusTarget,
+    limit: int,
+    *,
+    history_hours: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """聚合不出 Workload 时整轮重试该集群，最多 AGGREGATION_MAX_ATTEMPTS 次。
+
+    只重试 K8SWorkloadAggregationError：HTTP 层已有 request_max_attempts 重试，
+    认证或表达式错误重试也不会变好。
+    """
+    max_attempts = max(1, int(AGGREGATION_MAX_ATTEMPTS))
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _fetch_target(target, limit, history_hours=history_hours)
+        except K8SWorkloadAggregationError as exc:
+            exc.attempts = attempt
+            if attempt >= max_attempts:
+                logger.error(
+                    "[k8s_prometheus] fetch target gave up after %d attempts: cluster=%s reason=%s",
+                    max_attempts,
+                    target.cluster,
+                    exc,
+                )
+                raise
+            delay = AGGREGATION_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "[k8s_prometheus] fetch target attempt %d/%d aggregated no workload, "
+                "retrying in %.1fs: cluster=%s reason=%s",
+                attempt,
+                max_attempts,
+                delay,
+                target.cluster,
+                exc,
+            )
+            time.sleep(delay)
+
+
 def fetch_k8s_workload_prometheus_result(
     *,
     resources: int,
@@ -242,10 +305,13 @@ def fetch_k8s_workload_prometheus_result(
                 history_hours if history_hours is not None else "default",
                 target_started_at,
             )
-            items = _fetch_target(target, remaining, history_hours=history_hours)
+            items = _fetch_target_with_retry(target, remaining, history_hours=history_hours)
             fetched_count = len(items)
             if not items:
-                raise RuntimeError("Prometheus 未返回可聚合的 K8S Workload")
+                # _fetch_target 已按断点抛出带根因的错误，这里只兜底意外情况。
+                raise K8SWorkloadAggregationError(
+                    f"集群 {target.cluster} 未返回可聚合的 K8S Workload（未取得细分原因）"
+                )
             out.extend(items)
             target_finished_at = _utc_timestamp()
             cluster_results.append(
@@ -267,13 +333,14 @@ def fetch_k8s_workload_prometheus_result(
             )
         except Exception as exc:
             target_finished_at = _utc_timestamp()
+            error_text = _fetch_error_text(exc)
             cluster_results.append(
                 _cluster_fetch_result(
                     target.cluster,
                     "failed",
                     resources_fetched=fetched_count,
                     elapsed_seconds=time.perf_counter() - target_started_perf,
-                    error=str(exc),
+                    error=error_text,
                 )
             )
             logger.error(
@@ -284,7 +351,7 @@ def fetch_k8s_workload_prometheus_result(
                 time.perf_counter() - target_started_perf,
                 target_started_at,
                 target_finished_at,
-                exc,
+                error_text,
             )
 
     cluster_results.extend(_missing_cluster_result(cluster) for cluster in missing)
@@ -386,7 +453,8 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
         query_counts["cpu_usage_series"] = len(cpu_usage)
         query_counts["memory_usage_series"] = len(mem_usage)
 
-        pod_owners_raw = _pod_owner_values(client, owner_selector)
+        owner_diagnostics: Dict[str, Any] = {}
+        pod_owners_raw = _pod_owner_values(client, owner_selector, owner_diagnostics)
         replicaset_owners = _replicaset_owner_values(client, replicaset_owner_selector)
         pod_owners = _resolve_controller_owners(pod_owners_raw, replicaset_owners)
         replica_values = _replica_values_by_workload(client, replicaset_owner_selector)
@@ -433,6 +501,11 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
             errors.append("内存使用率查询无结果")
         if not pod_owners_raw:
             errors.append("kube_pod_owner 查询无结果，无法聚合到控制器粒度")
+            owner_query_errors = [
+                str(item) for item in owner_diagnostics.get("owner_query_errors") or []
+            ]
+            if owner_query_errors:
+                errors.append(f"kube_pod_owner 查询异常: {' | '.join(owner_query_errors)}")
         if all_container_keys and not workload_keys:
             errors.append("未解析出任何 Workload；请检查 kube_pod_owner/kube_replicaset_owner 标签")
         if not cpu_request and not cpu_limit:
@@ -472,6 +545,41 @@ def _diagnose_target(target: PrometheusTarget) -> Dict[str, Any]:
             "counts": query_counts,
             "sample_workloads": [],
         }
+
+
+def _ensure_aggregatable(
+    target: PrometheusTarget,
+    *,
+    cpu_series: int,
+    memory_series: int,
+    container_series: int,
+    pod_owner_rows: int,
+    workloads_resolved: int,
+    orphan_series: int,
+    owner_query_errors: List[str],
+) -> None:
+    """按聚合链路的断点抛出带根因的错误，不再统一报“未返回可聚合的 Workload”。"""
+    if container_series <= 0:
+        raise K8SWorkloadAggregationError(
+            f"集群 {target.cluster} 的 Prometheus 未返回容器使用率序列"
+            f"（cpu_series={cpu_series}, memory_series={memory_series}）："
+            f"请检查 cAdvisor 抓取、namespace_regex='{target.namespace_regex}' "
+            f"与 rate_window='{target.rate_window}'"
+        )
+    if pod_owner_rows <= 0:
+        detail = f"；owner 查询异常: {' | '.join(owner_query_errors)}" if owner_query_errors else ""
+        raise K8SWorkloadAggregationError(
+            f"集群 {target.cluster} 的 kube_pod_owner 查询无结果，"
+            f"无法把 {container_series} 条容器序列聚合到控制器粒度"
+            "（瞬时查询只回看约 5 分钟，kube-state-metrics 未上报或刚重启时即为空）"
+            f"{detail}"
+        )
+    if workloads_resolved <= 0:
+        raise K8SWorkloadAggregationError(
+            f"集群 {target.cluster} 未解析出任何 Workload："
+            f"{orphan_series}/{container_series} 条容器序列的 (namespace, pod) "
+            "在 kube_pod_owner 中没有匹配项，请检查两侧标签是否一致"
+        )
 
 
 def _fetch_target(
@@ -539,19 +647,46 @@ def _fetch_target(
         f"kube_pod_container_resource_limits_memory_bytes{{{selector}}}",
         f'kube_pod_container_resource_limits{{{selector},resource="memory",unit="byte"}}',
     ])
-    pod_owners = _pod_owner_values(client, owner_selector)
+    owner_diagnostics: Dict[str, Any] = {}
+    pod_owners_raw = _pod_owner_values(client, owner_selector, owner_diagnostics)
     replicaset_owners = _replicaset_owner_values(client, replicaset_owner_selector)
-    if replicaset_owners:
-        pod_owners = _resolve_controller_owners(pod_owners, replicaset_owners)
+    pod_owners = (
+        _resolve_controller_owners(pod_owners_raw, replicaset_owners)
+        if replicaset_owners
+        else pod_owners_raw
+    )
     replica_values = _replica_values_by_workload(client, replicaset_owner_selector)
 
+    container_keys = set(cpu_usage) | set(mem_usage)
+    owner_by_container = {key: _workload_key(key, pod_owners) for key in container_keys}
+    orphan_keys = [key for key, workload_key in owner_by_container.items() if workload_key is None]
     workload_keys = sorted(
-        wk
-        for wk in {
-            _workload_key(key, pod_owners)
-            for key in set(cpu_usage) | set(mem_usage)
-        }
-        if wk is not None
+        workload_key for workload_key in set(owner_by_container.values()) if workload_key is not None
+    )
+    owner_query_errors = [str(item) for item in owner_diagnostics.get("owner_query_errors") or []]
+    logger.info(
+        "[k8s_prometheus] fetch target aggregation: cluster=%s cpu_series=%d memory_series=%d "
+        "container_series=%d pod_owner_rows=%d replicaset_owner_rows=%d workloads_resolved=%d "
+        "orphan_container_series=%d owner_query_errors=%s",
+        target.cluster,
+        len(cpu_usage),
+        len(mem_usage),
+        len(container_keys),
+        len(pod_owners_raw),
+        len(replicaset_owners),
+        len(workload_keys),
+        len(orphan_keys),
+        owner_query_errors or "none",
+    )
+    _ensure_aggregatable(
+        target,
+        cpu_series=len(cpu_usage),
+        memory_series=len(mem_usage),
+        container_series=len(container_keys),
+        pod_owner_rows=len(pod_owners_raw),
+        workloads_resolved=len(workload_keys),
+        orphan_series=len(orphan_keys),
+        owner_query_errors=owner_query_errors,
     )
     cpu_usage_by_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners)
     mem_usage_by_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners)
@@ -571,7 +706,7 @@ def _fetch_target(
     mem_usage_by_request_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners, include_keys=set(mem_request))
     metadata_by_workload = _workload_metadata(
         target.cluster,
-        set(cpu_usage) | set(mem_usage),
+        container_keys,
         pod_owners,
         cpu_usage,
         mem_usage,
@@ -767,6 +902,11 @@ def _fetch_target(
         out.append(item)
         if limit > 0 and len(out) >= limit:
             break
+    if not out:
+        raise K8SWorkloadAggregationError(
+            f"集群 {target.cluster} 解析出 {len(workload_keys)} 个 Workload，"
+            "但没有一个同时具备 CPU 与内存使用率序列，无法聚合"
+        )
     return out
 
 
@@ -879,7 +1019,12 @@ def _instant_values(client: PrometheusClient, queries: List[str]) -> Dict[Contai
     for query in queries:
         try:
             rows = client.query(query)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[k8s_prometheus] request/limit 瞬时查询失败，改用下一个候选查询: query=%s error=%s",
+                query,
+                exc,
+            )
             continue
         for row in rows:
             metric = row.get("metric", {})
@@ -898,7 +1043,11 @@ def _instant_values(client: PrometheusClient, queries: List[str]) -> Dict[Contai
     return merged
 
 
-def _pod_owner_values(client: PrometheusClient, selector: str) -> Dict[Tuple[str, str], Tuple[str, str]]:
+def _pod_owner_values(
+    client: PrometheusClient,
+    selector: str,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Dict[Tuple[str, str], Tuple[str, str]]:
     queries = [
         f'kube_pod_owner{{{selector},owner_is_controller="true"}}',
         f"kube_pod_owner{{{selector}}}",
@@ -907,7 +1056,20 @@ def _pod_owner_values(client: PrometheusClient, selector: str) -> Dict[Tuple[str
     for query in queries:
         try:
             rows = client.query(query)
-        except Exception:
+        except Exception as exc:
+            # 这里的异常以前被静默吞掉，最终只会表现为“聚合不出 Workload”。
+            # 记录并回传原因，才能在日志和错误消息里看到真实根因。
+            logger.warning(
+                "[k8s_prometheus] kube_pod_owner 查询失败，改用下一个候选查询: query=%s error=%s",
+                query,
+                exc,
+            )
+            if diagnostics is not None:
+                # 两个候选查询通常是同一个根因，去重后消息更短。
+                recorded_errors = diagnostics.setdefault("owner_query_errors", [])
+                detail = f"{type(exc).__name__}: {exc}"
+                if detail not in recorded_errors:
+                    recorded_errors.append(detail)
             continue
         for row in rows:
             metric = row.get("metric", {})
@@ -934,7 +1096,12 @@ def _replicaset_owner_values(client: PrometheusClient, selector: str) -> Dict[Tu
     for query in queries:
         try:
             rows = client.query(query)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[k8s_prometheus] kube_replicaset_owner 查询失败，改用下一个候选查询: query=%s error=%s",
+                query,
+                exc,
+            )
             continue
         for row in rows:
             metric = row.get("metric", {})
@@ -978,7 +1145,12 @@ def _replica_values_by_workload(client: PrometheusClient, selector: str) -> Dict
     for kind, label_name, query in queries:
         try:
             rows = client.query(query)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[k8s_prometheus] 副本数查询失败，回退到指标中观测到的 Pod 数: query=%s error=%s",
+                query,
+                exc,
+            )
             continue
         for row in rows:
             metric = row.get("metric", {})

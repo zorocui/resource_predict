@@ -224,6 +224,59 @@ class AsymmetricResourcePrometheusClient:
         return []
 
 
+class _NoPodOwnerClient(FakePrometheusClient):
+    """kube_pod_owner 返回空结果：模拟 kube-state-metrics 未上报或刚重启。"""
+
+    def query(self, query: str, *, ts=None):
+        if "kube_pod_owner" in query:
+            return []
+        return super().query(query, ts=ts)
+
+
+class _PodOwnerQueryErrorClient(FakePrometheusClient):
+    """kube_pod_owner 查询失败：模拟限流或超时被静默吞掉的场景。"""
+
+    def query(self, query: str, *, ts=None):
+        if "kube_pod_owner" in query:
+            raise RuntimeError("Prometheus query failed: max samples exceeded")
+        return super().query(query, ts=ts)
+
+
+class _MismatchedPodOwnerClient(FakePrometheusClient):
+    """kube_pod_owner 有数据，但 (namespace, pod) 与容器指标对不上。"""
+
+    def query(self, query: str, *, ts=None):
+        if "kube_pod_owner" in query:
+            return [
+                FakePrometheusClient._instant_row(
+                    {
+                        "namespace": "other",
+                        "pod": "other-0",
+                        "owner_kind": "Deployment",
+                        "owner_name": "other",
+                    },
+                    1,
+                )
+            ]
+        return super().query(query, ts=ts)
+
+
+class _NoUsageSeriesClient(FakePrometheusClient):
+    """容器使用率 range 查询全空：模拟 cAdvisor 未抓取或选择器不匹配。"""
+
+    def query_range(self, query: str, *, start: float, end: float, step: int):
+        return []
+
+
+class _NoMemorySeriesClient(FakePrometheusClient):
+    """只有 CPU 序列、没有内存序列：模拟指标缺失导致无法配对。"""
+
+    def query_range(self, query: str, *, start: float, end: float, step: int):
+        if "container_memory_working_set_bytes" in query:
+            return []
+        return super().query_range(query, start=start, end=end, step=step)
+
+
 class K8SWorkloadProviderTest(unittest.TestCase):
     def setUp(self):
         FakePrometheusClient.queries = []
@@ -425,6 +478,122 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         self.assertEqual(calls, ["cluster-a"])
         self.assertEqual([row["status"] for row in result["cluster_results"]], ["failed", "failed"])
         self.assertIn("fail_fast", result["cluster_results"][1]["error"])
+
+    def test_structured_fetch_retries_aggregation_failure_then_succeeds(self):
+        item = {"resource_id": "k8s:cluster-a:ns:deployment:api"}
+        side_effects = [
+            provider.K8SWorkloadAggregationError("集群 cluster-a 的 kube_pod_owner 查询无结果"),
+            [item],
+        ]
+
+        with patch.object(provider, "_resolve_targets", return_value=[_target("cluster-a")]):
+            with patch.object(provider, "_fetch_target", side_effect=side_effects) as fetch:
+                with patch("resource_predict.providers.k8s_prometheus.time.sleep") as sleep:
+                    with patch.object(provider, "settings", SimpleNamespace(
+                        k8s_prometheus=SimpleNamespace(fail_fast=False)
+                    )):
+                        result = provider.fetch_k8s_workload_prometheus_result(
+                            resources=0, n=0, freq="5min"
+                        )
+
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15.0])
+        self.assertEqual(result["items"], [item])
+        self.assertEqual(result["cluster_results"][0]["status"], "success")
+        self.assertEqual(result["cluster_results"][0]["resources_fetched"], 1)
+
+    def test_structured_fetch_gives_up_after_three_aggregation_attempts(self):
+        error = provider.K8SWorkloadAggregationError("集群 cluster-a 的 kube_pod_owner 查询无结果")
+
+        with patch.object(provider, "_resolve_targets", return_value=[_target("cluster-a")]):
+            with patch.object(provider, "_fetch_target", side_effect=error) as fetch:
+                with patch("resource_predict.providers.k8s_prometheus.time.sleep") as sleep:
+                    with patch.object(provider, "settings", SimpleNamespace(
+                        k8s_prometheus=SimpleNamespace(fail_fast=False)
+                    )):
+                        result = provider.fetch_k8s_workload_prometheus_result(
+                            resources=0, n=0, freq="5min"
+                        )
+
+        self.assertEqual(fetch.call_count, provider.AGGREGATION_MAX_ATTEMPTS)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15.0, 30.0])
+        row = result["cluster_results"][0]
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("kube_pod_owner 查询无结果", row["error"])
+        self.assertIn("已连续尝试 3 次", row["error"])
+        self.assertEqual(result["items"], [])
+
+    def test_structured_fetch_does_not_retry_network_errors(self):
+        with patch.object(provider, "_resolve_targets", return_value=[_target("cluster-a")]):
+            with patch.object(
+                provider, "_fetch_target", side_effect=TimeoutError("Prometheus timeout")
+            ) as fetch:
+                with patch("resource_predict.providers.k8s_prometheus.time.sleep") as sleep:
+                    with patch.object(provider, "settings", SimpleNamespace(
+                        k8s_prometheus=SimpleNamespace(fail_fast=False)
+                    )):
+                        result = provider.fetch_k8s_workload_prometheus_result(
+                            resources=0, n=0, freq="5min"
+                        )
+
+        self.assertEqual(fetch.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(result["cluster_results"][0]["error"], "Prometheus timeout")
+
+    def test_fetch_target_reports_missing_pod_owner_root_cause(self):
+        with patch.object(provider, "PrometheusClient", _NoPodOwnerClient):
+            with self.assertLogs(provider.logger, level="INFO") as logs:
+                with self.assertRaises(provider.K8SWorkloadAggregationError) as ctx:
+                    provider._fetch_target(_target("cluster-a"), limit=0)
+
+        message = str(ctx.exception)
+        self.assertIn("kube_pod_owner 查询无结果", message)
+        self.assertIn("kube-state-metrics", message)
+        self.assertIn("3 条容器序列", message)
+        self.assertTrue(any("fetch target aggregation" in line for line in logs.output))
+        self.assertTrue(any("pod_owner_rows=0" in line for line in logs.output))
+
+    def test_fetch_target_surfaces_pod_owner_query_exception(self):
+        with patch.object(provider, "PrometheusClient", _PodOwnerQueryErrorClient):
+            with self.assertLogs(provider.logger, level="WARNING") as logs:
+                with self.assertRaises(provider.K8SWorkloadAggregationError) as ctx:
+                    provider._fetch_target(_target("cluster-a"), limit=0)
+
+        self.assertIn("max samples exceeded", str(ctx.exception))
+        self.assertTrue(any("kube_pod_owner 查询失败" in line for line in logs.output))
+
+    def test_fetch_target_reports_unmatched_owner_labels(self):
+        with patch.object(provider, "PrometheusClient", _MismatchedPodOwnerClient):
+            with self.assertRaises(provider.K8SWorkloadAggregationError) as ctx:
+                provider._fetch_target(_target("cluster-a"), limit=0)
+
+        message = str(ctx.exception)
+        self.assertIn("未解析出任何 Workload", message)
+        self.assertIn("3/3", message)
+
+    def test_fetch_target_reports_missing_container_series(self):
+        with patch.object(provider, "PrometheusClient", _NoUsageSeriesClient):
+            with self.assertRaises(provider.K8SWorkloadAggregationError) as ctx:
+                provider._fetch_target(_target("cluster-a"), limit=0)
+
+        message = str(ctx.exception)
+        self.assertIn("未返回容器使用率序列", message)
+        self.assertIn("namespace_regex=''", message)
+
+    def test_fetch_target_reports_missing_paired_memory_series(self):
+        with patch.object(provider, "PrometheusClient", _NoMemorySeriesClient):
+            with self.assertRaises(provider.K8SWorkloadAggregationError) as ctx:
+                provider._fetch_target(_target("cluster-a"), limit=0)
+
+        self.assertIn("没有一个同时具备 CPU 与内存使用率序列", str(ctx.exception))
+
+    def test_diagnose_target_reports_pod_owner_query_exception(self):
+        with patch.object(provider, "PrometheusClient", _PodOwnerQueryErrorClient):
+            report = provider._diagnose_target(_target("cluster-a"))
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("kube_pod_owner 查询无结果" in error for error in report["errors"]))
+        self.assertTrue(any("max samples exceeded" in error for error in report["errors"]))
 
     def test_list_provider_remains_compatible(self):
         structured = {

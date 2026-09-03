@@ -18,8 +18,11 @@
 | `test_output_health.py` | 产物健康检查逻辑 |
 | `test_output_isolation.py` | VM / K8S 产物隔离 |
 | `test_cluster_configs.py` | 集群配置读写 |
-| `test_forecast_config.py` | 预测模型配置读写 |
+| `test_runtime_config.py` | 统一运行配置白名单、字段校验、旧预测配置迁移与损坏文件兜底 |
+| `test_system_config.py` | 采集可靠性参数校验、页面视图分离、聚合保存与失败时整体不写入 |
+| `test_forecast_config.py` | 预测模型开关归一化与非法取值校验 |
 | `test_k8s_workload_provider.py` | K8S Prometheus 数据聚合 |
+| `test_k8s_scheduler_reload.py` | 保存配置只唤醒调度线程重读配置，不额外触发拉取 |
 | `test_utils.py` | 公共工具函数 |
 
 ## 运行测试
@@ -132,5 +135,5 @@ python -m benchmarks.resource_detail_benchmark --resources 1000 --points 2016 --
 | 产物结构不一致 | 运行 `python check_outputs.py --json` 查看具体错误 |
 | 测试工具缺失 | 运行 `python -m pip install -r requirements-dev.txt` |
 | 更新任务冲突（409） | 查询 `/api/update-status` 确认当前是否有更新在执行中，等待完成后重试 |
-| 预测模型未生效 | 在 Web 页面"预测模型"中修改后保存，再触发重新预测 |
+| 预测模型未生效 | 在 Web 的"系统配置"页面 → "预测配置"分区修改候选模型后保存，再触发重新预测；保存只影响新任务，已有产物需要重新生成 |
 | 资源详情返回 202 | 资源正在等待预测完成，稍后重试即可 |

@@ -93,25 +93,3 @@ def read_forecast_config(path: Path | str = DEFAULT_FORECAST_CONFIG_PATH) -> Dic
     except json.JSONDecodeError as exc:
         raise ForecastConfigValidationError(f"{p} is not valid JSON: {exc}") from exc
     return normalize_forecast_config_payload(payload)
-
-
-def write_forecast_config(
-    payload: Any,
-    path: Path | str = DEFAULT_FORECAST_CONFIG_PATH,
-) -> Dict[str, Any]:
-    normalized = normalize_forecast_config_payload(payload)
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(
-        json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return normalized
-
-
-def read_forecast_config_payload(path: Path | str = DEFAULT_FORECAST_CONFIG_PATH) -> Dict[str, Any]:
-    config = read_forecast_config(path)
-    return {
-        "supported_methods": list(SUPPORTED_FORECAST_METHODS),
-        **config,
-    }

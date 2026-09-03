@@ -74,6 +74,8 @@ K8S 指标的 `data_quality` 会附带 `recent_contiguous_points`、`recent_cont
 
 K8S 多集群拉取中，只要至少一个集群成功且后续 upsert/预测完成，同时另有集群失败，整体即为 `partial_success`。失败集群的具体异常写入对应 `cluster_results[].error`；成功集群的数据继续提交。失败集群所属或本轮未返回的 Workload 会保留已有 raw 历史和预测产物，不会因为一次稀疏结果被删除。一个 range 查询的任一分片在重试耗尽后失败时，该集群查询按整体失败处理，不会合并部分时间范围。
 
+集群查询成功但聚合不出任何 Workload 时，会先按 15 秒、30 秒退避整轮重试，最多 3 次尝试；仍失败才写入 `cluster_results[].error`。该字段会写明具体断点（容器使用率序列为空 / `kube_pod_owner` 无结果或查询异常 / owner 标签不匹配 / CPU 与内存序列无法配对）并附 `（已连续尝试 N 次）` 后缀，便于区分偶发的监控侧缺数据和持续的配置问题。网络与 HTTP 错误不在这层重试范围内，仍由请求级 `request_max_attempts` 处理。
+
 ```json
 {
   "records": [
@@ -193,12 +195,43 @@ queued -> running -> plan_built -> executing_command -> command_finished
 | --- | --- | --- |
 | GET | `/api/cluster-configs` | 读取集群配置 |
 | PUT | `/api/cluster-configs` | 保存集群配置 |
-| GET | `/api/forecast-config` | 读取预测模型开关 |
-| PUT | `/api/forecast-config` | 保存预测模型开关 |
 | POST | `/api/cluster-configs/k8s-diagnose` | 诊断 K8S Prometheus 连通性 |
 | POST | `/api/cluster-configs/k8s-fetch` | 拉取 K8S Prometheus 数据（异步） |
 | GET | `/api/system-config` | 读取页面统一运行配置与集群配置 |
 | PUT | `/api/system-config` | 校验、保存并立即应用统一配置 |
+
+### 统一运行配置读写
+
+预测模型开关（`enabled_methods`、`enable_ensemble`）没有独立端点，统一走 `/api/system-config`
+的 `runtime.prediction` 段。`GET` 返回 `runtime`、`vm_scaling_clusters`、`k8s_prometheus_clusters`、
+`supported_methods`、`warnings` 和 `paths`；`PUT` 请求体：
+
+```json
+{
+  "runtime": {
+    "collection": { ... },
+    "prediction": {
+      "vm_test_duration": "72h",
+      "vm_future_duration": "24h",
+      "workload_test_duration": "24h",
+      "workload_future_duration": "24h",
+      "enabled_methods": ["seasonal_naive", "prophet"],
+      "enable_ensemble": false
+    },
+    "decision": { ... }
+  },
+  "vm_scaling_clusters": { ... },
+  "k8s_prometheus_clusters": [ ... ]
+}
+```
+
+保存成功后写入 `deploy/runtime_config.json` 并替换内存中的运行配置快照，因此后续采集、预测和
+决策任务读到的都是新配置。保存还会唤醒 K8S 后台调度线程重读开关和周期，但唤醒本身不触发拉取：
+只有重算出的到期时刻（上一次拉取开始时刻 + 当前周期）已经落在过去时才会立即取数，例如把周期
+改短到已逾期，或关闭超过一个周期后重新打开。需要立即取数请显式调用
+`POST /api/cluster-configs/k8s-fetch`。校验失败返回 400，运行配置类错误会附带
+`field` 字段路径。`runtime`、`vm_scaling_clusters`、`k8s_prometheus_clusters` 三个文件按顺序
+写入，任一失败则全部回滚到修改前的内容。
 
 ### 集群配置读写
 

@@ -506,35 +506,6 @@
     `).join("");
   }
 
-  function renderForecastModelRows(payload) {
-    if (!app.els.forecastModelList) return;
-    const supported = Array.isArray(payload?.supported_methods) ? payload.supported_methods : [];
-    const enabled = new Set(payload?.enabled_methods || []);
-    const ensembleEnabled = Boolean(payload?.enable_ensemble);
-    const reuseEnabled = payload?.reuse_backtest_model_for_future !== false;
-    const prophetRoutingEnabled = payload?.prophet_routing_enabled !== false;
-    const prophetRoutingMode = payload?.prophet_routing_mode || "auto";
-    app.els.forecastModelList.innerHTML = `
-      <div class="config-row" data-config-kind="forecast">
-        <div class="config-row-title">
-          <strong>候选模型</strong>
-        </div>
-        <div class="config-grid">
-          ${supported.map((method) => configInput(
-            method.label || method.key,
-            `method:${method.key}`,
-            enabled.has(method.key),
-            { type: "checkbox" }
-          )).join("")}
-          ${configInput("Ensemble", "enable_ensemble", ensembleEnabled, { type: "checkbox" })}
-          ${configInput("多段预测复用", "reuse_backtest_model_for_future", reuseEnabled, { type: "checkbox" })}
-          ${configInput("Prophet 智能路由", "prophet_routing_enabled", prophetRoutingEnabled, { type: "checkbox" })}
-          ${configInput("Prophet 路由模式", "prophet_routing_mode", prophetRoutingMode, { placeholder: "auto" })}
-        </div>
-      </div>
-    `;
-  }
-
   function setPageConfigMessage(target, message, isError = false) {
     if (!target) return;
     target.textContent = message || "";
@@ -663,24 +634,6 @@
       });
     });
     return { vm_scaling_clusters: vm, k8s_prometheus_clusters: k8s };
-  }
-
-  function collectForecastConfig() {
-    const enabledMethods = [];
-    app.els.forecastModelList?.querySelectorAll('[data-config-name^="method:"]').forEach((input) => {
-      if (input.checked) enabledMethods.push(input.dataset.configName.replace("method:", ""));
-    });
-    const ensembleInput = app.els.forecastModelList?.querySelector('[data-config-name="enable_ensemble"]');
-    const reuseInput = app.els.forecastModelList?.querySelector('[data-config-name="reuse_backtest_model_for_future"]');
-    const prophetRoutingInput = app.els.forecastModelList?.querySelector('[data-config-name="prophet_routing_enabled"]');
-    const prophetRoutingModeInput = app.els.forecastModelList?.querySelector('[data-config-name="prophet_routing_mode"]');
-    return {
-      enabled_methods: enabledMethods,
-      enable_ensemble: Boolean(ensembleInput?.checked),
-      reuse_backtest_model_for_future: reuseInput ? Boolean(reuseInput.checked) : true,
-      prophet_routing_enabled: prophetRoutingInput ? Boolean(prophetRoutingInput.checked) : true,
-      prophet_routing_mode: prophetRoutingModeInput?.value?.trim() || "auto",
-    };
   }
 
   function splitNamespaces(value) {

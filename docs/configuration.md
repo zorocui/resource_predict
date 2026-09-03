@@ -10,7 +10,6 @@
 | `deploy/runtime_config.json` | 页面统一管理的数据采集、预测和决策运行配置 | 是 |
 | `deploy/clusters.json` | VM / K8S 调配集群配置（含 SSH 凭据） | 否 |
 | `deploy/k8s_prometheus_clusters.json` | K8S Prometheus 集群地址与认证 | 否 |
-| `deploy/forecast_config.json` | 预测模型开关 | 否 |
 | `.env` | 环境变量覆盖 | 否 |
 
 ## 集群配置（`deploy/clusters.json`）
@@ -96,27 +95,44 @@ cp deploy/clusters.example.json deploy/clusters.json
 export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 ```
 
-## 预测模型配置（`deploy/forecast_config.json`）
+## 预测模型配置（`deploy/runtime_config.json` 的 `prediction` 段）
+
+预测模型开关由统一运行配置管理，可在 Web 的“系统配置”页面 →“预测配置”分区中修改，
+保存后写入 `deploy/runtime_config.json` 并立即对新任务生效：
 
 ```json
 {
-  "enabled_methods": ["seasonal_naive", "prophet"],
-  "enable_ensemble": false,
-  "reuse_backtest_model_for_future": true,
-  "prophet_routing_enabled": true,
-  "prophet_routing_mode": "auto"
+  "prediction": {
+    "vm_test_duration": "72h",
+    "vm_future_duration": "24h",
+    "workload_test_duration": "24h",
+    "workload_future_duration": "24h",
+    "enabled_methods": ["seasonal_naive", "prophet"],
+    "enable_ensemble": false
+  }
 }
 ```
 
-速度优化开关：
-
 | 字段 | 作用 |
 | --- | --- |
-| `reuse_backtest_model_for_future` | `true` 表示每个模型只在训练窗口拟合一次，并预测 `test_size + future_steps`；前半段用于 holdout 评分，后半段用于未来预测。`false` 保持旧逻辑：用 `y_full` 重新训练未来预测。 |
-| `prophet_routing_enabled` | `true` 表示仅在轻量统计特征显示存在明显趋势或季节性时运行 Prophet。若 Prophet 是唯一启用模型，则仍会运行。 |
-| `prophet_routing_mode` | `auto` 使用自动路由规则，`always` 表示启用 Prophet 时总是运行，`never` 表示存在其他兜底模型时跳过 Prophet。 |
+| `enabled_methods` | 参与竞选的候选模型，取值 `arima` / `sarima` / `prophet` / `seasonal_naive` / `rolling_mean`，至少一个。 |
+| `enable_ensemble` | `true` 表示额外生成一个按 `selection_rmse` 倒数加权融合的 `ensemble` 候选，与其他模型一起参与最优选择。融合本身不产生额外拟合开销，但只有在两个以上模型实际运行时才有意义。 |
 
-可在 Web 页面的"预测模型"中启用或关闭模型，保存后写入此文件。
+以下开关是 `resource_predict/internal_settings.py` 中 `ForecastConfig` 的代码级默认值，
+不通过页面或配置文件暴露，需要调整时直接改代码：
+
+| 字段 | 默认值 | 作用 |
+| --- | --- | --- |
+| `reuse_backtest_model_for_future` | `True` | `True` 表示每个模型只在训练窗口拟合一次，并预测 `test_size + future_steps`；前半段用于 holdout 评分，后半段用于未来预测。`False` 保持旧逻辑：用 `y_full` 重新训练未来预测。 |
+| `prophet_routing_enabled` | `True` | `True` 表示仅在轻量统计特征显示存在明显趋势或季节性时运行 Prophet。若 Prophet 是唯一启用模型，则仍会运行。 |
+| `prophet_routing_mode` | `auto` | `auto` 使用自动路由规则，`always` 表示启用 Prophet 时总是运行，`never` 表示存在其他兜底模型时跳过 Prophet。 |
+| `rolling_backtest_folds` | `1` | 滚动回测折数，参与 `selection_rmse` 的 0.35 权重项；`1` 表示只保留单次留出窗口回测。 |
+| `anomaly_route_zscore_threshold` | `3.5` | 近期鲁棒 z-score 超过该值时，最优选择收窄到 `ensemble` / `seasonal_naive` / `rolling_mean`。 |
+
+旧版 `deploy/forecast_config.json` 已从仓库和工作区移除，预测流程也不再读取它。
+`services/runtime_config.py` 仍保留一次性迁移逻辑：只有当 `deploy/runtime_config.json`
+不存在、而升级前遗留的 `deploy/forecast_config.json` 还在时，才从中读取 `enabled_methods`
+和 `enable_ensemble` 作为初始值。部署包不会打包该文件，因此全新部署不会触发迁移。
 
 ## 全局默认配置（`resource_predict/settings.py`）
 
@@ -130,6 +146,30 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 保存时服务端先校验完整配置；任何字段或集群配置错误都会整体拒绝。调度配置变化会唤醒唯一的
 K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 
+唤醒本身不等于拉取。调度循环只在一个条件下取数：到期时刻已经过去。到期时刻按
+`last_start + max(60 秒, scheduled_update_interval_minutes)` 计算，`last_start` 是上一次拉取
+**开始**时的时刻（拉取失败同样占用本轮，因此不会快速重试），从未拉取过时视为已到期。保存配置只是让
+循环提前重新评估这个条件，于是有四种结果：
+
+- 新的到期时刻仍在未来：不拉取，继续等待剩余时间，周期既不被重置也不被提前。
+- 把周期改短到 `last_start + 新周期` 已经落在过去：立即拉取一轮。
+- 关闭定时拉取后再打开：关闭时长不足一个周期则等到原到期时刻，超过则立即拉取一轮。
+- 应用启动后从未拉取过（含线程启动时开关是关闭、之后才打开的情况）：立即执行首轮。
+
+首轮以及此后任何一次成功拉取之前的重试都标记为 `scheduled_startup`，之后标记为 `scheduled`。
+需要马上取数请显式调用 `POST /api/cluster-configs/k8s-fetch` 或页面上的拉取按钮。
+
+计时锚定在**开始**时刻而不是完成时刻，是为了让两轮拉取的实际间隔严格等于配置周期。增量回看
+窗口固定为 `scheduled_update_interval_minutes + incremental_overlap_minutes`（默认 360 + 60
+= 420 分钟），只有实际间隔不超过这个窗口才不会留下永久取不到的时间段。按开始时刻计时时实际
+间隔是 `max(周期, 拉取耗时)`，所以默认配置下拉取耗时不超过 420 分钟都是安全的；如果按完成
+时刻计时，实际间隔会变成 `周期 + 拉取耗时`，耗时一旦超过 60 分钟的 overlap 就开始每轮漏数据，
+漏掉的时长等于 `拉取耗时 - incremental_overlap_minutes`。拉取耗时超过配置周期时会记录一条
+warning 并立即开始下一轮。
+
+漏掉的时间段如果超过 `step_seconds × (max_interpolation_gap_steps + 1)`（默认 600 × 4 = 40
+分钟），预测端会认为数据断档，只取最近一段连续数据；该段不足验证窗口时会跳过重算并沿用旧预测，
+详见 [architecture.md](architecture.md) 的预测数据可用性说明。
 ### 数据采集与本地保留
 
 `deploy/runtime_config.json` 的 `collection` 段包含以下 Prometheus 采集参数：
@@ -163,11 +203,13 @@ K8S 后台调度线程重新读取开关和周期，不需要重启应用。
 
 连接失败、超时、HTTP 429 和 5xx 会在最大尝试次数内重试；其他 4xx 参数或认证错误不会重试。`query_range` 的分片结果按完整 Prometheus 标签集合与时间戳合并，并在边界时间戳重复时保留后一个分片的样本。任一分片在重试耗尽后失败，会使该集群的本轮查询整体失败，不会提交不完整的时间范围。
 
+HTTP 层重试之外还有一层整轮重试：某个集群查询成功但聚合不出任何 Workload 时（容器使用率序列为空、`kube_pod_owner` 瞬时查询无结果或失败、owner 标签不匹配、CPU 与内存序列无法配对），会按 15 秒、30 秒退避重拉该集群，最多 3 次尝试（`AGGREGATION_MAX_ATTEMPTS`，不通过页面配置），全部失败才记为该集群 `failed`。这类失败多数是 kube-state-metrics 重启、Prometheus 刚启动或查询限流造成的临时现象，因为 `kube_pod_owner` 走的是只回看约 5 分钟的瞬时查询，而 CPU/内存走的是数小时的 range 查询，两者可用性并不同步。
+
+错误消息会写明具体断点和序列计数，不再统一报“未返回可聚合的 K8S Workload”。日志中每轮拉取都会输出一行 `fetch target aggregation`，包含 `cpu_series`、`memory_series`、`container_series`、`pod_owner_rows`、`replicaset_owner_rows`、`workloads_resolved`、`orphan_container_series` 以及 owner 查询异常原文，可直接用于区分监控侧临时缺数据和配置或标签不匹配。`kube_pod_owner`、`kube_replicaset_owner`、request/limit 与副本数这些瞬时查询失败时会各自记录 warning，不再被静默吞掉。
+
 同一轮中其他成功集群仍会按 `resource_id` 增量 upsert。本轮未返回或失败集群所属的 Workload 不会被当作删除，也不会清空已有 raw 历史和预测产物。采集端仅补齐短缺口；预测端使用最近连续且足够长的数据段，连续段不足测试窗口时跳过该指标或 Workload 的本轮重算并保留旧预测。
 
 增量合并后，系统会使用 `retention_days` 按时间戳裁剪每条序列，保留大于或等于“该序列最新时间戳减 30 天”的样本。不规则采样和缺口不会改用点数估算；暂时离线的资源保留最后已知的有界 30 天窗口，不按墙上时间整体删除。
-
-旧版 `deploy/forecast_config.json` 仅在 `runtime_config.json` 不存在时作为模型开关迁移来源。
 
 历史默认配置组（仅供理解内部默认值，不再由用户直接编辑）：
 

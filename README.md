@@ -211,7 +211,6 @@ VM 和 K8S 产物完全物理隔离，API 层透明合并。
 | `deploy/clusters.json` | VM / K8S 调配集群配置（含 SSH 凭据） |
 | `deploy/k8s_prometheus_clusters.json` | K8S Prometheus 集群地址与认证 |
 | `deploy/runtime_config.json` | 页面管理的数据采集、预测与扩缩容运行配置 |
-| `deploy/forecast_config.json` | 预测模型开关 |
 | `.env` | 环境变量覆盖 |
 
 从示例复制集群配置：`cp deploy/clusters.example.json deploy/clusters.json`
@@ -238,8 +237,10 @@ VM 和 K8S 产物完全物理隔离，API 层透明合并。
 | POST | `/api/resources/<id>/scale` | 创建调配任务 |
 | GET | `/api/scaling-tasks/<id>` | 查询调配任务 |
 | POST | `/api/scaling-tasks/<id>/confirm` | 确认 resize |
+| GET | `/api/resources/<id>/scaling-history` | 资源调配历史 |
 | GET/PUT | `/api/cluster-configs` | 集群配置读写 |
-| GET/PUT | `/api/forecast-config` | 预测模型开关读写 |
+| GET/PUT | `/api/system-config` | 统一运行配置读写（含预测模型开关） |
+| POST | `/api/cluster-configs/k8s-diagnose` | 诊断 K8S Prometheus 连通性 |
 | POST | `/api/cluster-configs/k8s-fetch` | 拉取 K8S 数据（异步） |
 
 详细参数、请求体格式和 curl 示例见 [docs/api-reference.md](docs/api-reference.md)。
