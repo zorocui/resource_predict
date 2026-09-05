@@ -275,3 +275,4 @@ python -m pytest -q
 | [docs/configuration.md](docs/configuration.md) | 部署配置文件详解、全局参数默认值、输出产物结构 |
 | [docs/api-reference.md](docs/api-reference.md) | API 端点详细参数、请求体格式、curl 使用示例 |
 | [docs/development.md](docs/development.md) | 测试策略、代码约定、Provider 接口、安全规范、常见问题 |
+| [docs/innovation.md](docs/innovation.md) | 成果创新性与先进性说明、实测技术指标、与现有技术对比 |
