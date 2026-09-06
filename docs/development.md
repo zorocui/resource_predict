@@ -113,7 +113,23 @@ python -m benchmarks.resource_detail_benchmark --resources 1000 --points 2016 --
 (prepared_resources: List[Dict], points_to_add: int) -> List[Dict]
 ```
 
-## 安全约定
+## 可信预测基线的验证
+
+第一阶段设计见 [预测评估设计](superpowers/specs/2026-09-05-forecast-evaluation-design.md)，实施记录见 [实施计划](superpowers/plans/2026-09-05-forecast-evaluation.md)。
+
+使用 `python generate_forecasts.py predict` 可在现有数据上重新生成独立测试误差报告与预测留档。科研比较应固定输入快照、候选模型、窗口与运行版本；误差报告的基础指标是独立测试误差，选型用的是另行记录的训练段内部验证误差。多个滚动验证折用于选型，不应冒充多个独立测试实验。需要多个独立预测起点时，应逐次截断输入数据重复运行，不能先读取未来数据再裁剪结果。
+
+定向回归覆盖测试标签不影响选型或权重、最新观测影响未来曲线、集成真实误差、短历史降级、失败模型身份、分钟级日周期和留档发布/保留：
+
+```bash
+python -m pytest -q tests/test_forecast_evaluation.py tests/test_forecast_optimizations.py tests/test_forecasting.py tests/test_forecast_archive.py tests/test_forecast_error_report.py
+```
+
+留档只保存预测与当时规格，不代表已经完成生产收益评估。必须后续对齐真实观测并进行回放/受控执行，才能报告容量不足、预留量或服务质量收益。万级资源测试按容器与指标展开后的序列数衡量；图表历史点数上限不等于模型训练点数上限。
+
+独立测试的输入契约是按时间可获得的序列。K8S 新采集短缺口只向前填补；已有 raw 缓存可能来自旧版双向插值，不能逆向恢复为原始观测，严格实验应重新采集或使用未插值输入。自定义 Provider 必须保证清洗、规格归一化与特征构造不使用预测起点之后的信息。填补值仍属于加工数据，生产评分应以后续真实采样点为准。
+
+## 执行安全约定
 
 - 调配命令中所有用户可控值使用 `shlex.quote()` 转义
 - 不拼接未转义的字符串构建 shell 命令

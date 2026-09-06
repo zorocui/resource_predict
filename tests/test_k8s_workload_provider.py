@@ -884,7 +884,7 @@ class K8SWorkloadProviderTest(unittest.TestCase):
 
         result = provider._regularize_series(original, 300, max_gap_steps=3)
 
-        self.assertAlmostEqual(result.loc[pd.Timestamp("2026-08-01 00:05")], 1.0)
+        self.assertAlmostEqual(result.loc[pd.Timestamp("2026-08-01 00:05")], 0.0)
         large_gap_points = pd.date_range(
             "2026-08-01 00:15", "2026-08-01 00:55", freq="5min"
         )
@@ -895,6 +895,13 @@ class K8SWorkloadProviderTest(unittest.TestCase):
         quality = provider._data_quality(original, step_seconds=300)
         self.assertEqual(quality["max_gap_seconds"], 3000)
         self.assertGreater(quality["missing_ratio"], 0.5)
+
+    def test_gap_before_split_does_not_use_next_observation(self):
+        idx = pd.to_datetime(["2026-08-01 00:00", "2026-08-01 00:10"])
+        first = provider._regularize_series(pd.Series([0.2, 0.4], index=idx), 300, 3)
+        second = provider._regularize_series(pd.Series([0.2, 0.9], index=idx), 300, 3)
+        pd.testing.assert_series_equal(first.iloc[:-1], second.iloc[:-1])
+        self.assertEqual(first.iloc[1], 0.2)
 
     def test_fetch_target_applies_configured_gap_limit_to_every_series(self):
         target = _target("cluster-a")

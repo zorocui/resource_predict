@@ -34,6 +34,7 @@ def write_prediction_outputs(
     total_elapsed: float,
     raw_stats: Dict[str, int],
     prediction_skips: Optional[List[Dict[str, str]]] = None,
+    forecast_archive: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     prediction_skips = list(prediction_skips or [])
     details_dir = out_base / DETAILS_DIRNAME
@@ -168,6 +169,7 @@ def write_prediction_outputs(
         "total_elapsed_seconds": total_elapsed,
         "total_output_bytes": total_bytes,
         "forecast_error_report_file": FORECAST_ERROR_REPORT_FILENAME,
+        "forecast_archive": dict(forecast_archive or {}),
         "raw": dict(raw_stats),
         "prediction_skips": prediction_skips,
     }
@@ -204,55 +206,43 @@ def _build_forecast_error_report(
     for item in resources_items:
         rid = str(item.get("resource_id"))
         rtype = resource_type_of(item)
-        metrics_out: Dict[str, Dict[str, Any]] = {}
-        metrics_by_kind = item.get("metrics", {})
-        if not isinstance(metrics_by_kind, dict):
-            continue
-        for metric in metric_names_for_resource(item):
-            kind_metrics = metrics_by_kind.get(metric, {})
-            if not isinstance(kind_metrics, dict):
+        resource = {"resource_id": rid, "resource_type": rtype,
+                    "metrics": {}, "container_metrics": {},
+                    "evaluation": {}, "container_evaluation": {}}
+        diagnostics_by_metric = item.get("forecast_diagnostics", {})
+        groups = [(None, item.get("metrics", {}), diagnostics_by_metric)]
+        for container, charts in item.get("container_charts_forecast", {}).items():
+            groups.append((container,
+                           {metric: chart.get("metrics", {}) for metric, chart in charts.items()},
+                           {metric: chart.get("forecast_diagnostics", {}) for metric, chart in charts.items()}))
+        for container, metric_group, diagnostics_group in groups:
+            if not isinstance(metric_group, dict):
                 continue
-            model_metrics: Dict[str, Dict[str, Any]] = {}
-            methods = _ordered_methods(kind_metrics, active_methods)
-            for method in methods:
-                metric_obj = kind_metrics.get(method, {})
-                if not isinstance(metric_obj, dict):
+            for metric in dict.fromkeys([*metric_group, *diagnostics_group]):
+                kind_metrics = metric_group.get(metric, {})
+                if not isinstance(kind_metrics, dict):
                     continue
-                errors = {
-                    "rmse": _json_float(metric_obj.get("rmse")),
-                    "mae": _json_float(metric_obj.get("mae")),
-                    "mape": _json_float(metric_obj.get("mape")),
-                    "p95_error": _json_float(metric_obj.get("p95_error")),
-                    "selection_rmse": _json_float(metric_obj.get("selection_rmse")),
-                    "rolling_rmse": _json_float(metric_obj.get("rolling_rmse")),
-                    "rolling_mae": _json_float(metric_obj.get("rolling_mae")),
-                    "rolling_folds": _json_float(metric_obj.get("rolling_folds")),
-                    "window": window_info,
-                }
-                model_metrics[method] = errors
-                rows.append(
-                    {
-                        "resource_id": rid,
-                        "resource_type": rtype,
-                        "metric": metric,
-                        "model": method,
-                        **errors,
-                    }
-                )
-            if model_metrics:
-                metrics_out[metric] = model_metrics
-        if metrics_out:
-            resources.append(
-                {
-                    "resource_id": rid,
-                    "resource_type": rtype,
-                    "metrics": metrics_out,
-                }
-            )
+                diagnostics = diagnostics_group.get(metric, {})
+                model_metrics = _error_model_metrics(kind_metrics, diagnostics, active_methods, window_info)
+                if not model_metrics:
+                    continue
+                evaluation = {key: value for key, value in diagnostics.get("evaluation", {}).items()
+                              if key != "validation_metrics"}
+                if container is None:
+                    resource["metrics"][metric] = model_metrics
+                    resource["evaluation"][metric] = evaluation
+                else:
+                    resource["container_metrics"].setdefault(container, {})[metric] = model_metrics
+                    resource["container_evaluation"].setdefault(container, {})[metric] = evaluation
+                for method, errors in model_metrics.items():
+                    rows.append({"resource_id": rid, "resource_type": rtype,
+                                 "container": container, "metric": metric, "model": method, **errors})
+        if resource["metrics"] or resource["container_metrics"]:
+            resources.append(resource)
     return {
         "meta": {
             "generated_at_epoch_ms": int(time.time() * 1000),
-            "resources": len(resources),
+            "resources": len({resource["resource_id"] for resource in resources}),
             "rows": len(rows),
             "active_methods": active_methods,
             "window": window_info,
@@ -261,6 +251,47 @@ def _build_forecast_error_report(
         "resources": resources,
         "rows": rows,
     }
+
+
+def _error_model_metrics(
+    kind_metrics: Dict[str, Any], diagnostics: Dict[str, Any],
+    active_methods: List[str], window_info: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    evaluation = diagnostics.get("evaluation", {})
+    validation = evaluation.get("validation_metrics", {})
+    phases = diagnostics.get("phase_failures", {})
+    candidates = dict(kind_metrics)
+    candidates.update({method: {} for method in validation if method not in candidates})
+    for failures in phases.values():
+        candidates.update({method: {} for method in failures if method not in candidates})
+    window = dict(window_info)
+    for key in ("test_start_ms", "test_end_ms", "test_train_end_ms", "routing_train_end_ms"):
+        window[key] = evaluation.get(key)
+    validation_windows = evaluation.get("validation_windows", [])
+    for key, aggregate in (("validation_start_ms", min), ("validation_end_ms", max)):
+        values = [entry[key] for entry in validation_windows if entry.get(key) is not None]
+        window[key] = aggregate(values) if values else None
+    result = {}
+    for method in _ordered_methods(candidates, active_methods):
+        metric_obj = kind_metrics.get(method, {})
+        if not isinstance(metric_obj, dict):
+            continue
+        # Failed test candidates can still have genuine training-only validation scores.
+        values = {**validation.get(method, {}), **metric_obj}
+        errors = {key: _json_float(values.get(key)) for key in (
+            "rmse", "mae", "mape", "p95_error", "selection_rmse",
+            "rolling_rmse", "rolling_mae", "rolling_folds",
+            "validation_rmse", "validation_mae", "validation_mape",
+            "validation_p95_error", "validation_folds",
+        )}
+        errors.update(
+            window=window, evaluation_role=evaluation.get("role", "legacy_holdout"),
+            selection_status=evaluation.get("selection_status", "legacy_unknown"),
+            provenance=diagnostics.get("provenance", {}),
+            phase_failures={phase: failures[method] for phase, failures in phases.items() if method in failures},
+        )
+        result[method] = errors
+    return result
 
 
 def _ordered_methods(kind_metrics: Dict[str, Any], active_methods: List[str]) -> List[str]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -257,6 +257,51 @@ class ForecastArimaTest(unittest.TestCase):
 
 
 class ForecastSarimaTest(unittest.TestCase):
+    def test_high_frequency_daily_harmonics_continue_into_forecast(self):
+        from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+        for freq, period in (("5min", 288), ("15min", 96)):
+            with self.subTest(freq=freq):
+                y = _make_series(n=period + 17, freq=freq)
+                steps = period + 3
+                fitted = Mock()
+                fitted.get_forecast.return_value.predicted_mean = pd.Series([0.5] * steps)
+                with patch("statsmodels.tsa.statespace.sarimax.SARIMAX") as constructor:
+                    constructor.return_value.fit.return_value = fitted
+                    forecast_sarima(y, steps)
+
+                kwargs = constructor.call_args.kwargs
+                self.assertEqual(kwargs["seasonal_order"], (0, 0, 0, 0))
+                train = kwargs["exog"]
+                future = fitted.get_forecast.call_args.kwargs["exog"]
+                self.assertEqual(train.shape, (len(y), 6))
+                self.assertEqual(future.shape, (steps, 6))
+                np.testing.assert_allclose(train[:17], train[period:])
+                np.testing.assert_allclose(future[0], train[17])
+                np.testing.assert_allclose(future[:3], future[period:])
+                self.assertFalse(np.allclose(train[0], train[24]))
+                # Real model construction verifies the Kalman state stays small;
+                # no costly optimizer is needed for this structural regression.
+                self.assertEqual(SARIMAX(y, **kwargs).k_states, 3)
+
+    def test_low_frequency_and_explicit_seasonal_orders(self):
+        cases = (
+            ("h", None, (1, 1, 1, 24)),
+            ("2h", None, (1, 1, 1, 12)),
+            ("D", None, (0, 0, 0, 0)),
+            ("3D", None, (0, 0, 0, 0)),
+            ("5min", (1, 0, 0, 48), (1, 0, 0, 48)),
+        )
+        for freq, explicit, expected in cases:
+            with self.subTest(freq=freq, explicit=explicit):
+                with patch("statsmodels.tsa.statespace.sarimax.SARIMAX") as constructor:
+                    fitted = constructor.return_value.fit.return_value
+                    fitted.get_forecast.return_value.predicted_mean = pd.Series([0.5] * 3)
+                    forecast_sarima(_make_series(n=72, freq=freq), 3, seasonal_order=explicit)
+                self.assertEqual(constructor.call_args.kwargs["seasonal_order"], expected)
+                self.assertIsNone(constructor.call_args.kwargs["exog"])
+                self.assertIsNone(fitted.get_forecast.call_args.kwargs["exog"])
+
     def test_returns_forecast_result_with_correct_length(self):
         y = _make_series(n=200, freq="h")
         steps = 24

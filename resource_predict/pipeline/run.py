@@ -17,6 +17,7 @@ from resource_predict.pipeline.action_gate_state import (
 )
 from resource_predict.pipeline._types import WorkerContext
 from resource_predict.pipeline.constants import MANIFEST_FILENAME
+from resource_predict.pipeline.forecast_archive import archive_forecasts
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
 from resource_predict.pipeline.prepare import (
@@ -289,6 +290,18 @@ def generate_forecasts(
         item.pop("_timings", None)
         item.pop("_slot", None)
 
+    try:
+        archive_metadata = archive_forecasts(
+            out_base,
+            resources_items,
+            enabled=bool(getattr(settings.forecast, "archive_enabled", True)),
+            retention_days=int(getattr(settings.forecast, "archive_retention_days", 7)),
+        )
+        logger.info("[forecast_archive] %s", archive_metadata)
+    except Exception as exc:
+        archive_metadata = {"status": "failed", "path": None, "count": 0, "error": str(exc)}
+        logger.warning("[forecast_archive] status=failed; forecasts will continue: %s", exc)
+
     predicted_count = len(resources_items)
     predicted_resource_ids = {
         str(item.get("resource_id"))
@@ -356,6 +369,7 @@ def generate_forecasts(
         total_elapsed=total_elapsed,
         raw_stats=raw_stats,
         prediction_skips=prediction_skips,
+        forecast_archive=archive_metadata,
     )
     try:
         write_action_gate_state(out_base, action_gate_state)

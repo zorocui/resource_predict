@@ -71,8 +71,8 @@ def worker(
     for metric_name, result in results:
         computed[metric_name] = result
         timing_part = result[4]
-        for m in active_methods:
-            timing_by_model[m] += float(timing_part.get(m, 0.0))
+        for m, seconds in timing_part.items():
+            timing_by_model[m] = timing_by_model.get(m, 0.0) + float(seconds)
 
     best_methods: Dict[str, str] = {}
     metrics_out: Dict[str, Dict[str, Dict[str, float]]] = {}
@@ -206,8 +206,8 @@ def _fit_container_metrics(
             y_train = series.iloc[:-ctx.test_size]
             y_test = series.iloc[-ctx.test_size:]
             pred, metric_scores, best, future_pred, timing_part, diagnostics = fit_one_metric(y_train, y_test, series, ctx=ctx)
-            for method in ctx.active_methods:
-                timing_by_model[method] += float(timing_part.get(method, 0.0))
+            for method, seconds in timing_part.items():
+                timing_by_model[method] = timing_by_model.get(method, 0.0) + float(seconds)
             charts.setdefault(name, {})[metric_name] = {
                 "preds": {m: series_to_lists(pred[m]) for m in pred.keys()},
                 "x_pred_ms": to_ms(next(iter(future_pred.values())).index),

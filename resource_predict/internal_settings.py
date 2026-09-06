@@ -93,12 +93,15 @@ class ForecastConfig:
     prophet_changepoint_prior_scale: float = 0.05
     # Prophet 季节性强度先验；越大季节性曲线越灵活。
     prophet_seasonality_prior_scale: float = 10.0
-    # 滚动回测折数，用于提升模型选择稳定性；1 表示只保留单次留出窗口回测行为。
+    # 训练段内的验证折数；外层独立测试窗口不参与选型。
     rolling_backtest_folds: int = 1
     # 是否加入按误差倒数加权的集成候选模型。
     enable_ensemble: bool = False
-    # 是否复用回测模型，一次性预测留出窗口和未来窗口。
-    reuse_backtest_model_for_future: bool = True
+    # 旧字段仅用于兼容配置读取；在线预测始终使用最新完整历史重新拟合。
+    reuse_backtest_model_for_future: bool = False
+    # 按 scope 保存本轮新预测（gzip JSONL），用于后续真实误差核验。
+    archive_enabled: bool = True
+    archive_retention_days: int = 7
     # 是否仅在值得承担训练成本的序列上运行 Prophet。
     prophet_routing_enabled: bool = True
     # Prophet 路由模式；auto 在速度和质量之间自动取舍。

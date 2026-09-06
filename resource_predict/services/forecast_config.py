@@ -29,7 +29,7 @@ def default_forecast_config_payload() -> Dict[str, Any]:
     return {
         "enabled_methods": list(settings.forecast.enabled_methods),
         "enable_ensemble": bool(settings.forecast.enable_ensemble),
-        "reuse_backtest_model_for_future": bool(settings.forecast.reuse_backtest_model_for_future),
+        "reuse_backtest_model_for_future": False,
         "prophet_routing_enabled": bool(settings.forecast.prophet_routing_enabled),
         "prophet_routing_mode": settings.forecast.prophet_routing_mode,
     }
@@ -69,12 +69,7 @@ def normalize_forecast_config_payload(payload: Any) -> Dict[str, Any]:
     return {
         "enabled_methods": enabled_methods,
         "enable_ensemble": bool(payload.get("enable_ensemble", settings.forecast.enable_ensemble)),
-        "reuse_backtest_model_for_future": bool(
-            payload.get(
-                "reuse_backtest_model_for_future",
-                settings.forecast.reuse_backtest_model_for_future,
-            )
-        ),
+        "reuse_backtest_model_for_future": False,
         "prophet_routing_enabled": bool(
             payload.get("prophet_routing_enabled", settings.forecast.prophet_routing_enabled)
         ),

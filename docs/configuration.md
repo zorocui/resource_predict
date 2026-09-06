@@ -116,17 +116,19 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | 字段 | 作用 |
 | --- | --- |
 | `enabled_methods` | 参与竞选的候选模型，取值 `arima` / `sarima` / `prophet` / `seasonal_naive` / `rolling_mean`，至少一个。 |
-| `enable_ensemble` | `true` 表示额外生成一个按 `selection_rmse` 倒数加权融合的 `ensemble` 候选，与其他模型一起参与最优选择。融合本身不产生额外拟合开销，但只有在两个以上模型实际运行时才有意义。 |
+| `enable_ensemble` | `true` 表示在至少两个模型完成验证时生成集成候选。独立测试和未来预测的权重只来自训练段内验证分数；首个验证折等权，后续验证折使用此前折的分数。 |
 
 以下开关是 `resource_predict/internal_settings.py` 中 `ForecastConfig` 的代码级默认值，
 不通过页面或配置文件暴露，需要调整时直接改代码：
 
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
-| `reuse_backtest_model_for_future` | `True` | `True` 表示每个模型只在训练窗口拟合一次，并预测 `test_size + future_steps`；前半段用于 holdout 评分，后半段用于未来预测。`False` 保持旧逻辑：用 `y_full` 重新训练未来预测。 |
+| `reuse_backtest_model_for_future` | `False` | 已停用的兼容读取字段，旧输入 `True` 也不会启用延伸预测。未来预测始终用最新完整历史重新拟合。 |
+| `archive_enabled` | `True` | 是否将本轮新生成的入选预测写入各 scope 的 `forecast_history/`。 |
+| `archive_retention_days` | `7` | 留档保留天数，须为正数；成功写入非空批次后清理过期批次。代码级配置，不在页面暴露。 |
 | `prophet_routing_enabled` | `True` | `True` 表示仅在轻量统计特征显示存在明显趋势或季节性时运行 Prophet。若 Prophet 是唯一启用模型，则仍会运行。 |
 | `prophet_routing_mode` | `auto` | `auto` 使用自动路由规则，`always` 表示启用 Prophet 时总是运行，`never` 表示存在其他兜底模型时跳过 Prophet。 |
-| `rolling_backtest_folds` | `1` | 滚动回测折数，参与 `selection_rmse` 的 0.35 权重项；`1` 表示只保留单次留出窗口回测。 |
+| `rolling_backtest_folds` | `1` | 训练段内的时间验证折数；每折长度等于 `test_size`，外层独立测试另计。多折时选型分数为 `0.65 × 最近验证折RMSE + 0.35 × 全部验证残差RMSE`。不足折数时记录实际折数；候选须完成全部可用折。 |
 | `anomaly_route_zscore_threshold` | `3.5` | 近期鲁棒 z-score 超过该值时，最优选择收窄到 `ensemble` / `seasonal_naive` / `rolling_mean`。 |
 
 旧版 `deploy/forecast_config.json` 已从仓库和工作区移除，预测流程也不再读取它。
@@ -199,7 +201,7 @@ warning 并立即开始下一轮。
 | `range_query_chunk_hours` | `24` | `query_range` 单个时间分片的最大时长（小时） |
 | `request_max_attempts` | `3` | 每个 Prometheus HTTP 请求的最大尝试次数，包含首次请求 |
 | `retry_backoff_seconds` | `1.0` | 首次重试等待秒数；后续按指数退避增长 |
-| `max_interpolation_gap_steps` | `3` | 只对不超过该采样步数的完整内部缺口插值；更大的缺口保持断开 |
+| `max_interpolation_gap_steps` | `3` | 只对不超过该采样步数的完整内部缺口用此前观测向前填补；更大的缺口保持断开 |
 
 连接失败、超时、HTTP 429 和 5xx 会在最大尝试次数内重试；其他 4xx 参数或认证错误不会重试。`query_range` 的分片结果按完整 Prometheus 标签集合与时间戳合并，并在边界时间戳重复时保留后一个分片的样本。任一分片在重试耗尽后失败，会使该集群的本轮查询整体失败，不会提交不完整的时间范围。
 
@@ -217,7 +219,7 @@ HTTP 层重试之外还有一层整轮重试：某个集群查询成功但聚合
 | --- | --- | --- |
 | `AppConfig` | `host` / `port` / `out_dir` / `log_file` / `debug` | `0.0.0.0` / `5000` / `outputs` / `resource_predict.log` / `False` |
 | `GenerationConfig` | `default_test_size` / `default_future_steps` / `freq` / `detail_chunk_size` / `detail_history_points_default` / `detail_history_points_max` / `raw_resource_cache_items` | `72` / `24` / `h` / `25` / `1000` / `10000` / `100` |
-| `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `True` / `True` / `auto` / `3.5` |
+| `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `False` / `True` / `auto` / `3.5` |
 | `DecisionConfig` | `scale_out_threshold` / `scale_in_threshold` / `scale_in_max_reduction_ratio` / `scale_out_confirmations` / `scale_in_confirmations` / `action_gate_state_retention_days` | `0.8` / `0.2` / `0.5` / `2` / `3` / `30` |
 | `UpdateConfig` | `enabled` / `interval_minutes` / `startup_delay_seconds` / `sliding_window` | `False` / `60` / `60` / `False` |
 | `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` / `range_query_chunk_hours` / `request_max_attempts` / `retry_backoff_seconds` / `max_interpolation_gap_steps` | `7` / `60` / `600` / `15m` / `True` / `360` / `24` / `3` / `1.0` / `3` |
@@ -320,6 +322,18 @@ outputs/
 ### `forecast_error_report.json`
 
 预测误差报告，按资源、指标、模型和窗口展开，输出 `rmse`、`mae`、`mape`、`p95_error` 等指标。`rows` 提供扁平记录，`resources` 提供按资源聚合的嵌套结构，便于报表、审计和模型效果对比。
+
+新生成预测的基础误差来自外层独立测试；`validation_*` 是训练段内部验证误差，`selection_rmse` 只使用验证数据。缺少验证历史时不根据测试误差选择模型，标记 `insufficient_validation_history`；历史充足但验证全部失败标记 `validation_failed`。降级优先采用已配置的 Seasonal Naive、Rolling Mean，否则按配置顺序；在线预测失败再使用 Rolling Mean。
+
+报告包含容器维度（聚合指标的 `container` 为 `null`），实际测试时间边界、评估角色和来源。失败模型保留失败原因与空误差；不能把空误差当作零。旧产物缺少来源时标记为 `legacy_holdout`，不追认独立测试。`p95_error` 是绝对误差的分位值；未来曲线 P95 和规则 `confidence_score` 都不是统计预测覆盖率。
+
+### `forecast_history/forecast_<timestamp>_<uuid>.jsonl.gz`
+
+每轮按 scope 保存独立 gzip JSONL 文件，一行一个新预测资源，含 `forecasts`、`container_forecasts`、容器规格、数据质量和当轮原始建议。每条预测仅保存入选模型、未来时间轴、预测值和 `provenance`，不重复保存训练曲线或全部候选模型。
+
+`provenance` 包含 `generated_at_epoch_ms`、`data_end_ms`、`train_end_ms`、`forecast_start_ms`、`forecast_end_ms`、`config_hash`、`model_version`、`actual_future_methods`、`ensemble_members`。模型降级时入选名称和实际曲线名称一致，原选型记录在诊断中。
+
+留档发生在旧预测恢复、增量合并和跨轮次 action-gate 确认之前，因此仅记录本轮实际生成的预测，建议不是最终执行凭证。失败的批次不会发布半个文件；留档失败不阻止预测产物更新，日志与 `generation_stats.json.forecast_archive` 记录状态。留档只为后续在线评分提供数据，本批尚未实现真实值到达后的自动评分或概率区间。
 
 ### `generation_stats.json`
 

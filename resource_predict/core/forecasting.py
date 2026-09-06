@@ -275,7 +275,13 @@ def forecast_sarima(
     order: Optional[Tuple[int, int, int]] = None,
     seasonal_order: Optional[Tuple[int, int, int, int]] = None,
 ) -> ForecastResult:
-    """SARIMA 预测未来 steps 步；如 seasonal_order 未给则按“一天采样点数”推断 s。"""
+    """预测未来 steps 步，默认按一天采样点数建模季节性。
+
+    每天 2–24 点使用完整季节滞后；更高频率使用三阶日周期 Fourier
+    外生变量和非季节 ARIMA 残差，避免状态空间随采样频率增长。
+    每天不超过一点时禁用日季节项。显式 seasonal_order 原样传给
+    statsmodels（包括由其校验无效的周期），不自动替换为 Fourier 模式。
+    """
     try:
         from statsmodels.tsa.statespace.sarimax import SARIMAX  # type: ignore
         from statsmodels.tools.sm_exceptions import ConvergenceWarning  # type: ignore
@@ -285,14 +291,25 @@ def forecast_sarima(
     y_train = ensure_regular_freq(y_train)
     if order is None:
         order = SARIMA_ORDER
+    t0 = time.perf_counter()
+    train_exog = future_exog = None
     if seasonal_order is None:
         s = infer_steps_per_day(y_train.index)
-        s = max(1, min(int(s), int(SARIMA_MAX_SEASONAL_PERIOD)))
-        p_s, d_s, q_s = SARIMA_SEASONAL_PDQ
-        seasonal_order = (p_s, d_s, q_s, s)
-    t0 = time.perf_counter()
+        if s > SARIMA_MAX_SEASONAL_PERIOD:
+            # Continue the training phase through the forecast boundary.
+            phase = 2 * np.pi * (np.arange(len(y_train) + steps) % s) / s
+            angles = phase[:, None] * np.arange(1, 4)
+            exog = np.column_stack((np.sin(angles), np.cos(angles)))
+            train_exog, future_exog = exog[:len(y_train)], exog[len(y_train):]
+            seasonal_order = (0, 0, 0, 0)
+        elif s <= 1:
+            seasonal_order = (0, 0, 0, 0)
+        else:
+            p_s, d_s, q_s = SARIMA_SEASONAL_PDQ
+            seasonal_order = (p_s, d_s, q_s, s)
     model = SARIMAX(
         y_train,
+        exog=train_exog,
         order=order,
         seasonal_order=seasonal_order,
         simple_differencing=SARIMA_SIMPLE_DIFFERENCING,
@@ -313,7 +330,9 @@ def forecast_sarima(
                 maxiter=SARIMA_MAXITER * 2,
             )
     cap = usage_forecast_upper_bound(y_train)
-    yhat = clip_usage_range(res.get_forecast(steps=steps).predicted_mean, upper=cap)
+    yhat = clip_usage_range(
+        res.get_forecast(steps=steps, exog=future_exog).predicted_mean, upper=cap
+    )
     seconds = time.perf_counter() - t0
     return ForecastResult(yhat=yhat, seconds=seconds)
 

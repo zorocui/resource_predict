@@ -19,7 +19,7 @@ class ForecastConfigTest(unittest.TestCase):
         self.assertEqual(list(settings.forecast.enabled_methods), ["seasonal_naive", "prophet"])
         self.assertEqual(config["enabled_methods"], ["seasonal_naive", "prophet"])
         self.assertFalse(config["enable_ensemble"])
-        self.assertTrue(config["reuse_backtest_model_for_future"])
+        self.assertFalse(config["reuse_backtest_model_for_future"])
         self.assertTrue(config["prophet_routing_enabled"])
         self.assertEqual(config["prophet_routing_mode"], "auto")
 
@@ -61,7 +61,7 @@ class ForecastConfigTest(unittest.TestCase):
 
         self.assertEqual(config["enabled_methods"], ["rolling_mean"])
         self.assertFalse(config["enable_ensemble"])
-        self.assertTrue(config["reuse_backtest_model_for_future"])
+        self.assertFalse(config["reuse_backtest_model_for_future"])
         self.assertTrue(config["prophet_routing_enabled"])
         self.assertEqual(config["prophet_routing_mode"], "auto")
 

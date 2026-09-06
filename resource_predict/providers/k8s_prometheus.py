@@ -1362,15 +1362,13 @@ def _regularize_series(
     if not missing.any() or int(max_gap_steps) <= 0:
         return resampled.dropna()
 
-    # ``interpolate(limit=N)`` still fills N samples at the edge of a gap
-    # longer than N.  Instead, classify complete missing runs and allow values
-    # only when the whole interior run fits within the configured bound.
+    # Fill only complete bounded gaps. Use past values rather than two-sided
+    # interpolation: preprocessing happens before temporal evaluation splits.
     run_ids = missing.ne(missing.shift(fill_value=False)).cumsum()
     run_lengths = missing.groupby(run_ids).transform("sum")
     bounded_missing = missing & (run_lengths <= max(0, int(max_gap_steps)))
-    interpolated = resampled.interpolate(method="time", limit_area="inside")
     filled = resampled.copy()
-    filled.loc[bounded_missing] = interpolated.loc[bounded_missing]
+    filled.loc[bounded_missing] = resampled.ffill().loc[bounded_missing]
     return filled.dropna()
 
 
