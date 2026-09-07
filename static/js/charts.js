@@ -594,6 +594,15 @@
       });
     }
 
+    const upper = chartData.calibration?.upper;
+    if (Array.isArray(upper) && upper.length === xPredFuture.length && upper.some(v => v != null && Number.isFinite(Number(v)))) {
+      const upperData = xPredFuture.map((t, i) => [normalizeTsMs(t), upper[i] == null ? null : Number(upper[i])])
+        .filter(p => Number.isFinite(p[0]) && p[0] > testEndMs && (p[1] === null || Number.isFinite(p[1])));
+      legendData.push("校准上界");
+      series.push({ name: "校准上界", type: "line", data: filterPairsByWindow(upperData, windowInfo),
+        showSymbol: false, connectNulls: false, lineStyle: { color: "#0f766e", width: 2, type: "dotted" },
+        itemStyle: { color: "#0f766e" }, z: 5 });
+    }
     const bestRmse = chartData.metrics?.[bestMethod]?.rmse;
     const timeAxis = buildTimeAxisConfigFromPairs(series.map((item) => item.data), windowInfo);
     const containerScope = activeContainerSubtext(resource, metricKey) || metricContainerScope(resource, metricKey, displayUnit);
@@ -617,6 +626,10 @@
           let html = `${formatMs(t, "full")}<br/>`;
           for (const p of params) {
             const raw = Array.isArray(p.value) ? p.value[1] : p.value;
+            if (raw == null) {
+              html += `${p.marker}${p.seriesName}: —<br/>`;
+              continue;
+            }
             const num = Number(raw);
             html += Number.isFinite(num)
               ? `${p.marker}${p.seriesName}: ${list.formatStatValue(num, displayUnit)}<br/>`
@@ -1190,6 +1203,7 @@
       app.els.detailTitle.textContent = displayDetailTitle(resource, resourceId);
       app.els.detailTitle.title = resource.resource_id || resourceId;
       app.els.detailSubtitle.textContent = list.subtitleFor(resource);
+      window.ResourceFeedback?.load(resource);
       renderAdvice(resource);
       renderSpec(resource);
       renderMetricTabs(resource, activeMetric);

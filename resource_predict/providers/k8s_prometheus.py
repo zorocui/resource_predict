@@ -752,6 +752,7 @@ def _fetch_target(
         mem_request_quality = _data_quality(mem_request_norm, step)
         meta = metadata_by_workload.get(key, {})
         container_metrics: Dict[str, Dict[str, Any]] = {}
+        observed_containers: Dict[str, Dict[str, Any]] = {}
         container_quality: Dict[str, Dict[str, Any]] = {}
         container_modes: Dict[str, Dict[str, str]] = {}
         container_names = sorted(meta.get("containers", []))
@@ -810,6 +811,15 @@ def _fetch_target(
                 "memory_limit": _data_quality(mem_limit_container_norm, step),
                 "memory_request": _data_quality(mem_request_container_norm, step),
             }
+            observed_containers[container] = {
+                name: _series_payload(_regularize_series(series, step, 0))
+                for name, series in (
+                    ("cpu_limit", cpu_limit_container_norm),
+                    ("cpu_request", cpu_request_container_norm),
+                    ("memory_limit", mem_limit_container_norm),
+                    ("memory_request", mem_request_container_norm),
+                )
+            }
             container_metrics[container] = {
                 "cpu_limit": _series_payload(_regularize_series(
                     cpu_limit_container_norm, step, max_interpolation_gap_steps
@@ -830,6 +840,13 @@ def _fetch_target(
                 "memory_limit": mem_limit_container_metric,
                 "memory_request": mem_request_container_metric,
             }
+        observed_metrics = {
+            name: _series_payload(_regularize_series(series, step, 0))
+            for name, series in (
+                ("cpu_limit", cpu_limit_norm), ("cpu_request", cpu_request_norm),
+                ("memory_limit", mem_limit_norm), ("memory_request", mem_request_norm),
+            )
+        }
         cpu_limit_norm = _regularize_series(
             cpu_limit_norm, step, max_interpolation_gap_steps
         )
@@ -899,6 +916,15 @@ def _fetch_target(
             item["container_metrics"] = container_metrics
             item["container_data_quality"] = container_quality
             item["container_metric_modes"] = container_modes
+        item["observation_evidence"] = {
+            "schema_version": 1,
+            "source": "k8s_prometheus_unfilled",
+            "resource_type": "k8s_workload",
+            "spec": spec,
+            "container_metric_modes": container_modes,
+            "metrics": observed_metrics,
+            "container_metrics": observed_containers,
+        }
         out.append(item)
         if limit > 0 and len(out) >= limit:
             break

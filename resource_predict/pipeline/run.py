@@ -18,6 +18,10 @@ from resource_predict.pipeline.action_gate_state import (
 from resource_predict.pipeline._types import WorkerContext
 from resource_predict.pipeline.constants import MANIFEST_FILENAME
 from resource_predict.pipeline.forecast_archive import archive_forecasts
+from resource_predict.pipeline.calibration import calibrate_forecasts, refresh_calibration_advice
+from resource_predict.pipeline.controlled_activation import apply_controlled_advice
+from resource_predict.pipeline.shadow import build_shadow_advice
+from resource_predict.pipeline.realized_error import try_score_realized_forecasts
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
 from resource_predict.pipeline.prepare import (
@@ -165,6 +169,8 @@ def generate_forecasts(
             raw_stats["files_reused"],
             raw_stats["files_removed"],
         )
+    # Preserve untrimmed evidence even when a metric cannot currently be forecast.
+    realized_items = prepared_data
     prediction_skips: List[Dict[str, str]] = []
     if resource_family == "workload":
         prepared_data, prediction_skips = prepare_recent_contiguous_forecast_data(
@@ -290,6 +296,12 @@ def generate_forecasts(
         item.pop("_timings", None)
         item.pop("_slot", None)
 
+    calibration_started = time.perf_counter()
+    calibrate_forecasts(out_base, resources_items, retention_days=settings.forecast.archive_retention_days)
+    calibration_seconds = time.perf_counter()-calibration_started
+    shadow_started = time.perf_counter()
+    build_shadow_advice(resources_items)
+    shadow_seconds = time.perf_counter()-shadow_started
     try:
         archive_metadata = archive_forecasts(
             out_base,
@@ -302,6 +314,9 @@ def generate_forecasts(
         archive_metadata = {"status": "failed", "path": None, "count": 0, "error": str(exc)}
         logger.warning("[forecast_archive] status=failed; forecasts will continue: %s", exc)
 
+    realized_metadata = try_score_realized_forecasts(out_base, realized_items)
+    realized_metadata["calibration_seconds"] = calibration_seconds
+    realized_metadata["shadow_generation_seconds"] = shadow_seconds
     predicted_count = len(resources_items)
     predicted_resource_ids = {
         str(item.get("resource_id"))
@@ -338,12 +353,25 @@ def generate_forecasts(
         else:
             logger.warning("[progress] 未找到既有预测产物，本次仅输出已重算资源")
 
+    refresh_calibration_advice(resources_items)
+    for item in resources_items:
+        comparison = item.get("shadow_comparison")
+        if (isinstance(comparison, dict) and comparison.get("status") == "paired"
+                and comparison.get("source_spec") != item.get("spec", {})):
+            item["shadow_comparison"] = {**comparison, "status": "unavailable", "reason": "current_spec_changed"}
+    apply_controlled_advice(resources_items, fresh_ids=predicted_resource_ids,
+                            report_path=out_base / "forecast_realized_report.json",
+                            archive_metadata=archive_metadata,feedback_metadata=realized_metadata)
+    refresh_calibration_advice(resources_items)
     action_gate_state = apply_action_gate_confirmations(
         resources_items,
         eligible_resource_ids=predicted_resource_ids,
         prior_state=load_action_gate_state(out_base),
         retention_days=int(settings.decision.action_gate_state_retention_days),
     )
+    for item in resources_items:
+        if isinstance(item.get("resource_profile"),dict):
+            item["resource_profile"]["metric_actions"] = item.get("scaling_advice",{}).get("metric_actions",{})
 
     total_elapsed = time.perf_counter() - t_start
     manifest_items = write_prediction_outputs(
@@ -370,6 +398,7 @@ def generate_forecasts(
         raw_stats=raw_stats,
         prediction_skips=prediction_skips,
         forecast_archive=archive_metadata,
+        forecast_realized=realized_metadata,
     )
     try:
         write_action_gate_state(out_base, action_gate_state)

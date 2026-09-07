@@ -477,6 +477,8 @@ def _build_new_resource_from_upsert(item: Dict[str, Any]) -> Dict[str, Any]:
     resource_type = str(item.get("resource_type") or "")
     if resource_type:
         prepared["resource_type"] = resource_type
+    if isinstance(item.get("observation_evidence"), dict):
+        prepared["observation_evidence"] = item["observation_evidence"]
     if isinstance(item.get("data_quality"), dict):
         prepared["data_quality"] = item["data_quality"]
 
@@ -911,6 +913,10 @@ def _do_update(
                 res["resource_type"] = incoming_type
                 spec_changed = True
             incoming_dq = new_info.get("data_quality")
+            evidence = new_info.get("observation_evidence")
+            if isinstance(evidence, dict) and res.get("observation_evidence") != evidence:
+                res["observation_evidence"] = evidence
+                spec_changed = True
             if isinstance(incoming_dq, dict) and res.get("data_quality") != incoming_dq:
                 res["data_quality"] = incoming_dq
                 spec_changed = True

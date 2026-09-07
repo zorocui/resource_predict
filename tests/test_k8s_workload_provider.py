@@ -915,13 +915,33 @@ class K8SWorkloadProviderTest(unittest.TestCase):
                 items = provider._fetch_target(target, limit=0)
 
         self.assertEqual(len(items), 1)
-        self.assertEqual(regularize.call_count, 12)
+        self.assertEqual(regularize.call_count, 24)
         self.assertTrue(
             all(
-                call.args[2] == provider.settings.k8s_prometheus.max_interpolation_gap_steps
+                call.args[2] in (0, provider.settings.k8s_prometheus.max_interpolation_gap_steps)
                 for call in regularize.call_args_list
             )
         )
+
+    def test_observation_evidence_excludes_filled_gap(self):
+        class GappedClient(FakePrometheusClient):
+            def query_range(self, query, **kwargs):
+                rows = super().query_range(query, **kwargs)
+                for row in rows:
+                    row["values"][-1][0] += 300
+                return rows
+
+        with patch.object(provider, "PrometheusClient", GappedClient):
+            item, = provider._fetch_target(_target("cluster-a"), limit=0)
+        evidence = item["observation_evidence"]
+        self.assertEqual(evidence["source"], "k8s_prometheus_unfilled")
+        for metric, block in evidence["metrics"].items():
+            self.assertEqual(len(block["timestamps"]), 2)
+            self.assertEqual(len(item["metrics"][metric]["timestamps"]), 3)
+        for container, metrics in evidence["container_metrics"].items():
+            for metric, block in metrics.items():
+                self.assertEqual(len(block["timestamps"]), 2)
+                self.assertEqual(len(item["container_metrics"][container][metric]["timestamps"]), 3)
 
 
 if __name__ == "__main__":

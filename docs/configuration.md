@@ -333,9 +333,103 @@ outputs/
 
 `provenance` 包含 `generated_at_epoch_ms`、`data_end_ms`、`train_end_ms`、`forecast_start_ms`、`forecast_end_ms`、`config_hash`、`model_version`、`actual_future_methods`、`ensemble_members`。模型降级时入选名称和实际曲线名称一致，原选型记录在诊断中。
 
-留档发生在旧预测恢复、增量合并和跨轮次 action-gate 确认之前，因此仅记录本轮实际生成的预测，建议不是最终执行凭证。失败的批次不会发布半个文件；留档失败不阻止预测产物更新，日志与 `generation_stats.json.forecast_archive` 记录状态。留档只为后续在线评分提供数据，本批尚未实现真实值到达后的自动评分或概率区间。
+留档发生在旧预测恢复、增量合并和跨轮次 action-gate 确认之前，因此仅记录本轮实际生成的预测，建议不是最终执行凭证。失败的批次不会发布半个文件；留档失败不阻止预测产物更新，日志与 `generation_stats.json.forecast_archive` 记录状态。真实值评分见下节；尚未实现概率区间校准。
 
-### `generation_stats.json`
+### `forecast_realized.sqlite3` / `forecast_realized_report.json`
+
+各 scope 的 raw 提交后、预测留档后自动回填历史预测误差。SQLite 的 `batches`、`curves`、`points` 分别保存导入批次、入选曲线及逐点评分，唯一键避免重复导入和计分。首次真实评分保留不变，迟到数据可以补评未评分点。只读取未导入的压缩批次，按资源和指标索引匹配，不把全部历史加载到内存。
+
+性能优化后，raw 提交只持久化评分及执行保留期清理，延迟生成 JSON 汇总；预测结束或显式评分 CLI 才发布报告，避免一轮两次扫描完整账本。若 raw 已提交但后续预测失败，数据库评分仍有效，报告可能较旧，可运行下方 CLI 更新。返回状态 `report_published=false`、`coverage=null` 表示本次未汇总，不是零覆盖。`generation_stats.json.forecast_realized` 记录导入、评分、保留期/报告、校准和影子建议生成的阶段耗时。
+
+评分必须有 `observation_evidence`（schema_version=1）：`source`、`resource_type`、`spec`、`container_metric_modes`、`metrics` 和 `container_metrics`。两种指标映射中的每个指标使用 `timestamps`（整数毫秒）和 `values` 数组，只能包含未填补的真实采样。K8S provider 自动生成同频聚合的真实采样证据；证据以独立规格快照写入 raw 分片。VM/自定义 provider 需显式提供此契约；mock 和无证据的旧 raw 不追认为真实观测。证据当前仅保留最近接收批次，连续多轮评分失败后的完整恢复需要重新提供遗漏批次。
+
+目标时间必须精确匹配且已到达，并严格晚于数据截止及留档批次开始时间/模型生成时间的较大值。缺失来源、非有限观测、规格、口径或 K8S 观测成员变化均不计分。K8S 规格来自拉取时快照，仍无法证明整个历史窗口规格不变；该限制适用于跨规格变更的实验。
+
+JSON 报告 `evaluation_role=realized_selected_forecast`，按模型、指标、单位口径、资源/容器层级和数据截止提前量分组（0–1h、1–6h、6–24h、>24h），输出 `count`、`mae`、`rmse`、`underestimate_rate`、`mean_underestimate`。最后一项是所有评分点的 `max(actual-predicted,0)` 均值。`coverage` 区分 scored、awaiting_target、awaiting_observation、missing_provenance、not_future_at_publication、nonfinite_observation、basis_mismatch；未评分不是零误差。仅统计当时入选的模型，不能据此公平比较所有候选。
+
+保留期沿用 `archive_retention_days`（默认 7 天），按批次时间清理账本记录。SQLite 空闲页复用，文件不会每轮缩小；该周期之外的迟到数据不再补评。日志和 `generation_stats.json.forecast_realized` 记录评分状态，失败不撤销已提交 raw/预测。账本可查询预测来源、原预测值、真实值、评分时间，以及 `target_ms-data_end_ms` 和 `target_ms-issued_ms` 两种提前量；`issued_ms` 是保守批次时间代理，并非前端实际可见时间。
+
+重试（按 scope 分别运行）：
+
+```bash
+python -m resource_predict.pipeline.realized_error --out-dir outputs/k8s
+```
+
+### 经验预测上界（观察阶段）
+
+新预测图表的 `calibration` 保存与 `x_pred_ms` 对齐的 `upper`，资源和容器详情 API 均保留该字段。`scaling_advice.prediction_upper_bound` 给出指标上界峰值及 `complete`；`mode=observe`、`applied_to_targets=false` 表示仅用于观察，现有规格目标、action、confidence 和执行门控继续使用原策略。上界不等于预测曲线自身的 P95，也不是规则置信分数。
+
+按同一资源、容器、指标、模型、模型版本、配置哈希、规格和单位口径收集预测生成前已经评分的真实残差 `actual-predicted`，目标时间必须不晚于当前数据截止。提前量分组沿用 0–1h、1–6h、6–24h、>24h；同一目标时间仅取最后发布的可比预测。每组取最近最多 500 个目标、至少需要 60 个；使用第 `ceil((n+1)*0.95)` 个有序残差作为余量，下限为 0。预测上界为入选预测加余量，不截断到 100%。这些是代码级固定基线，未新增页面配置。
+
+`status` 为 calibrated、partial、insufficient_samples、missing_provenance 或 failed；样本不足的点 `upper=null`，不能按零解释，也不能把部分时段的峰值当成完整窗口上界。`buckets` 记录样本数、余量、样本时间范围和摘要，基准时间与口径随上界保存。增量合并保留旧指标原上界；当前规格不再匹配时，建议摘要标记 basis_changed 并隐藏峰值。
+
+上界随原曲线留档，SQLite 增加 `calibrations`（参数 JSON）和 `upper_bounds`（逐点原上界），旧库自动增表。`forecast_realized_report.json.calibration_rows` 按模型、指标、层级、单位和提前量统计 `count`、`empirical_coverage`（actual≤upper 的比例）、`mean_exceedance`（max(actual-upper,0) 的均值）、`mean_margin`（upper-predicted 的均值）。仅核验当时留档的上界，不事后重算；旧预测没有上界时不追补覆盖记录。
+
+95% 是经验校准目标，尚非生产实测覆盖保证；时序相关、业务漂移及 K8S 历史规格证据的限制仍适用。严格分组可能长期样本不足，这是保留原策略的正常状态。当前还不能据此声称降低资源预留或费用。
+
+### 影子建议对照
+
+资源详情与摘要增加 `shadow_comparison`（version=1、mode=shadow、executable=false）。校准完整时 `status=paired`，冻结 `baseline` 和 `candidate` 的 action、target_spec、policy_tier；candidate 复用现有建议算法，把输入换成校准上界。baseline 是跨轮次确认之前的建议快照，`baseline_stage=before_cross_run_confirmation`，不是最终执行授权。正式建议及其门控不读取 candidate。
+
+只有全部指标、K8S 全部已知容器都具有完整且同口径的校准上界才生成对照。缺样本、部分校准、局部重算或缺容器时 `status=unavailable` 并记录 reason。对照保存 source_spec、forecast_windows 和 budgets；当前规格变化时，旧对照不作为当前有效方案展示。旧留档不追补影子结果。
+
+SQLite 增加 `shadow_runs`（每批资源的两套快照）和 `shadow_budgets`（对应曲线的资源量和比例），和原批次一起原子导入、去重、按 archive_retention_days 级联清理。真实报告增加 `shadow_comparison`：
+
+| 字段 | 含义 |
+| --- | --- |
+| run_counts / unavailable_reasons | 有效配对数、不可用及其原因；缺样本不是零误差 |
+| allocation_rows | 按资源类型、指标、单位和 role 统计建议配对数量、两套资源量均值与差值；一条曲线只计一次，不按预测点重复累计 |
+| actual_rows | 在完全相同的已评分观测点上，统计两套方案的超出率和平均超出比例；matched_points 是分母 |
+| budget_skip_reasons | 缺规格、非比值口径、副本数变化等不能评分的原因 |
+| change_rows | 相邻同资源同规格有效建议之间的 action/target_spec/policy_tier 变更次数和比例；不可用轮次切断比较 |
+
+VM 比较目标 CPU/内存/磁盘规格；K8S 在容器粒度分别比较 request 和 limit，建议资源量为每副本规格乘目标副本数。`role=request_budget` 的超出表示预留预算不足，不等同于实际容量故障。只有两套方案副本数都等于观测副本数、且指标为比值口径时，才用真实值评分；副本变化仍展示资源量差异，但标记 replicas_changed。其他成员或口径变化沿用真实误差回填的可比性检查。
+
+这里的超出幅度是相对原规格的归一化值，不是 cores/GiB；allocation_rows 才使用实际资源单位。结果假设资源需求保持观测值不变，不模拟限流、OOM、调度、执行延迟及负载再分配，也不代表 SLA 或费用收益。现有算法的固定余量仍保留，校准方案不保证比原策略省资源；必须等后续真实数据再判断效果。
+
+### 校准策略启用判定（仅供评审）
+
+`forecast_realized_report.json.activation_assessment` 按单个资源评估完整指标集合，`mode=review_only`、`automatic_activation=false`，不修改正式建议或执行授权。`status=no_shadow_evidence` 表示尚无影子轮次；否则 `resources[]` 中每个资源输出 continue_observing（继续观察）或 eligible_for_review（具备启用评审条件）。判定不是已经启用，也不是统计安全保证。
+
+规则版本为 `empirical_review_v1`，阈值存于报告 `rules` 和 `pipeline/activation_assessment.py`，当前没有页面开关：
+
+| 条件 | 默认要求 |
+| --- | --- |
+| 连续可比影子轮次 | 至少 12 轮；不可用轮次、规格/口径、policy tier、模型/版本/配置变化后重新积累 |
+| 建议相邻转换 | 至少 10 次，candidate 的变更率不得高于 baseline |
+| 每个指标真实样本 | 至少 100 个不同目标时间，跨度至少 72 小时 |
+| 已到期点观测完整率 | 至少 95%；先按最新发布预测去重，再判断是否有真实评分 |
+| 新鲜度 | 最新预测发布时间、数据截止时间、各指标最新真实目标均不超过 24 小时 |
+| 每个指标风险 | 超出比例及平均超出幅度不得增加 |
+| 每个指标分配量 | 同一组真实匹配点上的平均分配量不得增加 |
+| 预留收益 | 至少一个维度减少 5%；K8S 只把 request 的减少计为预留收益，limit 单独减少不算 |
+
+K8S 全部容器的 request/limit 必须通过检查；某一指标失败不能由其他容器的改善抵消。缺容量、副本变化或缺来源等无法比较的最新指标会阻止判定，`budget_skip_reasons` 和 `missing_metrics` 提供原因。资源和容器之间不合并样本。
+
+`resources[]` 保存最新/最早连续批次、有效轮数、稳定性统计、逐指标 due_targets/matched_targets、观测完整率、时间范围、两套方案风险与分配量、checks/failed_checks 和资源级 reasons。去重时最新曲线尚无观测的目标仍计入待评分母，不拿旧曲线的已评分结果代替。所有风险和收益检查使用同一组真实配对点；仅对浮点累计采用 `1e-12` 数值容差。
+
+判定带 generated_at_epoch_ms 和每资源 valid_until_epoch_ms。消费旧报告时必须核对截止时间，并重新检查当前规格/配置是否仍匹配；新数据或策略变化需要重新生成报告。原 raw 提交仍只评分，判定随预测结束或评分 CLI 生成报告时计算。阈值是保守工程判据，样本时序相关性、历史规格证据、离线反事实及真实执行影响等限制仍然存在；具备评审条件不意味着已证明生产 SLA 或节省费用。
+
+### 按资源受控采用校准建议
+
+`internal_settings.py` 的 `DecisionConfig` 新增代码级参数（不在页面或 runtime_config.json 暴露）：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| calibrated_advice_enabled | False | 是否允许受控采用校准建议 |
+| calibrated_advice_resource_ids | () | 明确允许的资源 ID；开关打开但列表为空仍不会采用 |
+
+本版本默认保持观察模式，没有自动选资源或自动启用 API。运维评审后可修改以上代码级配置并重启；本次实现未为任何资源开启配置。ID 必须是具体资源标识，不支持通配符。
+
+只有本轮完整新预测、同规格的 paired 影子结果、成功留档、成功发布的当前批次报告，以及仍有效的 eligible_for_review 判定全部匹配，才采用校准建议。重新计算整套 action、target_spec、confidence 和 K8S 策略，并核对其关键字段与本轮冻结 candidate 一致。不会把影子对象直接当作执行授权。
+
+正式 `scaling_advice.calibration_activation.status=active` 表示已采用；元数据包含报告路径、批次、有效期、规格/口径和策略摘要、目标摘要，以及供回退的完整 baseline_advice。`prediction_upper_bound.applied_to_targets=true`、mode=active 同步标注。失败时 status=baseline 并记录 reason。配置关闭、移出列表、非本轮预测、局部重算、过期/旧报告或策略不匹配均在下一次预测流程回退原建议；期间旧校准建议不能通过新增执行检查。
+
+基线/校准切换或校准策略配置改变时，action_gate 的跨轮次确认从第 1 轮重新计数。确认账本新增 strategy 字段，旧记录按 baseline 读取。原有 action_gate、confidence、data_quality、cooldown、policy_tier 等门控保留；非手工覆盖的 execute 入队、任务开始和首条远程命令之前还会复核校准配置、来源、目标、期限及当前账本判定。raw 已评分但报告未更新时，会从 SQLite 重新评估该资源，失效则拒绝并要求重新预测。
+
+影子留档仍冻结切换之前的 baseline/candidate，保持对照实验定义；实际采用情况保存在当前正式建议元数据，执行任务继续记录实际计划。本功能不创建扩缩容任务，不部署生产策略，不证明资源收益；缺少足够证据时即使开关打开也继续使用基线。
+
+### `generation_stats.json` 统计内容
 
 本次预测的统计信息：资源数、预测模型、窗口参数、耗时、输出大小、误差报告文件名等。
 

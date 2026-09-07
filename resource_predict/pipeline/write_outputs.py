@@ -35,6 +35,7 @@ def write_prediction_outputs(
     raw_stats: Dict[str, int],
     prediction_skips: Optional[List[Dict[str, str]]] = None,
     forecast_archive: Optional[Dict[str, Any]] = None,
+    forecast_realized: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     prediction_skips = list(prediction_skips or [])
     details_dir = out_base / DETAILS_DIRNAME
@@ -85,6 +86,8 @@ def write_prediction_outputs(
         }
         if isinstance(item.get("data_quality"), dict):
             row["data_quality"] = item["data_quality"]
+        if isinstance(item.get("shadow_comparison"), dict):
+            row["shadow_comparison"] = item["shadow_comparison"]
         summary_resources.append(row)
 
     summary_resources.sort(
@@ -170,6 +173,7 @@ def write_prediction_outputs(
         "total_output_bytes": total_bytes,
         "forecast_error_report_file": FORECAST_ERROR_REPORT_FILENAME,
         "forecast_archive": dict(forecast_archive or {}),
+        "forecast_realized": dict(forecast_realized or {}),
         "raw": dict(raw_stats),
         "prediction_skips": prediction_skips,
     }

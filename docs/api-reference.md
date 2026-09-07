@@ -15,6 +15,7 @@
 | GET | `/api/resources` | 资源列表（支持分页、筛选、搜索） |
 | GET | `/api/resources/<id>` | 资源元数据详情；可选返回 charts |
 | GET | `/api/resources/<id>/charts` | 按指标、容器和时间范围加载目标资源图表 |
+| GET | `/api/resources/<id>/feedback` | 当前资源的启用评审、规则、报告更新时间与受控配置状态；只读，不触发评分 |
 | GET | `/api/resources/details?ids=a,b` | 批量详情（最多 100 个） |
 | GET | `/api/resources/advice-summary` | 建议统计（action/confidence 计数） |
 | GET | `/api/resources/<id>/scaling-history` | 资源调配历史 |
@@ -433,3 +434,19 @@ curl -X POST http://127.0.0.1:5000/api/scaling-tasks/<task_id>/confirm \
   -H 'Content-Type: application/json' \
   -d '{"confirm":true,"operator":"ops"}'
 ```
+
+## 预测上界附加字段
+
+页面资源详情新增“校准与验证”，显示正式采用/观察/待重新核验状态、上界完整性、影子分配量、评审有效期及未通过项。图例“校准上界”可开关预测上界曲线；null 时段保留断开。旧预测或缺少真实报告时展示等待状态，不生成演示评分。
+
+`GET /api/resources/<id>/feedback` 返回 resource_id、server_time_ms、report_status（available/missing/stale/error）、report_generated_at_ms、assessment（仅当前资源，可能为 null）、rules、policy_enabled、resource_allowlisted。24 小时以上或时间异常的报告标记 stale，资源不存在返回 404。页面展示的是最近发布报告，不代替执行前的实时核验。
+
+受控启用能力默认关闭。配置开关及显式资源列表开启后，满足当前批次判定的正式建议可带 `scaling_advice.calibration_activation.status=active`；其 baseline_advice 为回退快照，valid_until_epoch_ms 为授权证据期限。`prediction_upper_bound.mode=active` 且 applied_to_targets=true 表示正式采用，其余仍为观察。此能力没有新增启用 API，具体配置和失败回退规则见 configuration.md。
+
+启用评审判定位于各 scope 的 `forecast_realized_report.json.activation_assessment`，本轮未新增自动启用 API。`resources[].status=eligible_for_review` 只表示满足报告中的经验评审条件；消费者必须校验 valid_until_epoch_ms、当前规格/配置及最新数据，不能将它作为 execute 授权。
+
+资源摘要与详情还可返回 `shadow_comparison`：version、mode=shadow、executable=false、status、reason、baseline、candidate、source_spec、forecast_windows、budgets。只有完整新预测才生成 paired；部分校准或局部重算返回 unavailable。baseline/candidate 是确认前的 action/target_spec/policy_tier 快照，既有 scaling_advice 仍是正式建议。实际配对评分在各 scope 的 `forecast_realized_report.json.shadow_comparison`，本轮未增加执行或报表 API。
+
+资源详情图表及容器详情图表增加可选 `calibration`：`status`、`mode=observe`、`target_coverage=0.95`、与 `x_pred_ms` 对齐的 `upper`、`buckets` 样本统计及口径。`upper=null` 表示该时段样本不足；partial 不代表全窗口有效。
+
+建议对象增加 `prediction_upper_bound`：默认 `applied_to_targets=false`、`metrics[]`（container、metric、status、upper_peak、complete、unit）。默认观察模式不修改既有 action、confidence、规格目标或扩缩容授权；显式受控采用时按上文标记 active。旧产物可以没有该字段。完整算法及覆盖率报告见 [configuration.md](configuration.md)。

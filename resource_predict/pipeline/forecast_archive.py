@@ -20,19 +20,22 @@ def _selected_forecast(chart: dict, diagnostics: dict) -> dict:
     values = chart["preds_future"][selected]
     if not timestamps or len(timestamps) != len(values):
         raise ValueError("selected forecast timestamps and values must be nonempty and aligned")
-    return {
+    record = {
         "x_pred_ms": timestamps,
         "yhat": values,
         "selected_model": selected,
         "provenance": diagnostics.get("provenance", {}),
     }
+    if isinstance(chart.get("calibration"), dict):
+        record["calibration"] = chart["calibration"]
+    return record
 
 
 def _archive_record(item: dict, run_id: str) -> dict:
     record = {"schema_version": 1, "run_id": run_id}
     for field in (
         "resource_id", "resource_type", "spec", "data_quality",
-        "container_data_quality", "container_metric_modes", "scaling_advice",
+        "container_data_quality", "container_metric_modes", "scaling_advice", "shadow_comparison",
     ):
         if field in item:
             record[field] = item[field]

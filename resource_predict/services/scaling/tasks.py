@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from resource_predict.resource_types import metric_names_for_resource, resource_type_of
 from resource_predict.settings import settings
+from resource_predict.pipeline.controlled_activation import calibrated_execution_failure
 from resource_predict.services.scaling.cluster_config import get_cluster_config
 from resource_predict.services.scaling.command_runner import run_ssh_command
 from resource_predict.services.scaling.executor import build_openstack_resize_confirm_command, build_scaling_plan
@@ -122,6 +123,9 @@ def _execution_gate_failures(
         failures.append("policy_tier is missing or invalid")
 
     if not manual_target:
+        calibrated_failure = calibrated_execution_failure(resource,now_ms=now_ms)
+        if calibrated_failure:
+            failures.append(calibrated_failure)
         gate = advice.get("action_gate", {})
         gate_state = str(gate.get("state") if isinstance(gate, dict) else "").strip().lower()
         if not operator_confirmed and gate_state != "ready":
@@ -385,6 +389,10 @@ def _run_task(task_id: str, resource: Dict[str, Any]) -> None:
         cluster_cfg = get_cluster_config(cluster)
         task = get_task(task_id) or task
         mode = str(task.get("mode", "dry_run"))
+        if mode == "execute" and task.get("target_source") != "manual":
+            calibrated_failure = calibrated_execution_failure(resource)
+            if calibrated_failure:
+                raise RuntimeError(calibrated_failure)
         plan = build_scaling_plan(
             resource,
             cluster_cfg,
@@ -424,6 +432,10 @@ def _run_task(task_id: str, resource: Dict[str, Any]) -> None:
 
         results = []
         for idx, remote_command in enumerate(plan.commands, start=1):
+            if idx == 1 and task.get("target_source") != "manual":
+                calibrated_failure = calibrated_execution_failure(resource)
+                if calibrated_failure:
+                    raise RuntimeError(calibrated_failure)
             _patch_task(
                 task_id,
                 {

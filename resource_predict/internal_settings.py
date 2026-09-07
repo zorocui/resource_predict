@@ -112,6 +112,9 @@ class ForecastConfig:
 
 @dataclass(frozen=True)
 class DecisionConfig:
+    # 校准建议受控启用：默认关闭，且必须显式列出资源 ID。
+    calibrated_advice_enabled: bool = False
+    calibrated_advice_resource_ids: Tuple[str, ...] = ()
     # VM 指标 P95 达到该使用率时，触发扩容判断。
     scale_out_threshold: float = 0.8
     # VM 指标平均值低于该使用率时，进入缩容候选判断。

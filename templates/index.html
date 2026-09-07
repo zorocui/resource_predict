@@ -283,6 +283,7 @@
               <button class="active" type="button" data-detail-tab="summary">结论</button>
               <button type="button" data-detail-tab="metrics">指标</button>
               <button type="button" data-detail-tab="spec">规格</button>
+              <button type="button" data-detail-tab="feedback">校准与验证</button>
             </div>
 
             <section class="detail-card detail-tab-panel active" data-detail-panel="summary">
@@ -306,6 +307,9 @@
               <div id="detail-chart" class="detail-chart"></div>
             </section>
 
+            <section class="detail-card detail-tab-panel feedback-panel" data-detail-panel="feedback" aria-label="校准与验证">
+              <div id="feedback-content" aria-live="polite"><p class="feedback-note">选择资源后查看校准与验证结果。</p></div>
+            </section>
             <section class="detail-card detail-tab-panel" data-detail-panel="spec">
               <h3>资源规格</h3>
               <div id="detail-spec" class="spec-grid"></div>
@@ -357,6 +361,7 @@
     <script src="{{ url_for('static', filename='js/app-state.js') }}"></script>
     <script src="{{ url_for('static', filename='js/api.js') }}"></script>
     <script src="{{ url_for('static', filename='js/resource-list.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/feedback.js') }}"></script>
     <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
     <script src="{{ url_for('static', filename='js/scaling.js') }}"></script>
     <script src="{{ url_for('static', filename='js/index.js') }}"></script>

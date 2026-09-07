@@ -44,6 +44,17 @@ const T0 = 1_800_000_000_000;
 const HOUR = 60 * 60 * 1000;
 const times = Array.from({ length: 9 }, (_, index) => T0 + index * HOUR);
 
+test("calibrated upper bound preserves missing intervals and real zero", () => {
+  const option = buildChartOption({x_train_ms:[times[0]],y_train:[0.1],x_test_ms:[times[1]],y_test:[0.2],
+    test_end_ms:times[1],x_pred_ms:[times[2],times[3],times[4]],preds_future:{rolling_mean:[0.2,0.3,0]},
+    calibration:{upper:[0.4,null,0]},preds:{},metrics:{},best_method:"rolling_mean"},"cpu","percent",{resource_type:"openstack_vm"});
+  const upper = option.series.find(s=>s.name==="校准上界");
+  assert.deepEqual(upper.data,[[times[2],0.4],[times[3],null],[times[4],0]]);
+  assert.equal(upper.connectNulls,false);
+  assert.ok(option.legend.data.includes("校准上界"));
+  assert.match(option.tooltip.formatter([{value:[times[3],null],seriesName:"校准上界",marker:""}]),/校准上界: —/);
+});
+
 test("chart axis labels use Asia/Shanghai time", () => {
   const timestamp = Date.UTC(2026, 7, 4, 4, 0, 0);
   const option = buildChartOption(

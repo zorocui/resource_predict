@@ -7,6 +7,7 @@ from flask import Flask, jsonify, request
 from resource_predict.resource_types import resource_type_of
 from resource_predict.settings import settings
 from resource_predict.services.urgency import compute_urgency_breakdown
+from resource_predict.services.forecast_feedback import resource_feedback
 
 
 def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) -> None:
@@ -191,6 +192,13 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         if detail is None:
             return jsonify({"error": "resource not found"}), 404
         return jsonify({"resource": detail})
+
+    @app.get("/api/resources/<resource_id>/feedback")
+    def api_resource_feedback(resource_id: str):
+        detail = get_resource_detail(resource_id,include_charts=False)
+        if detail is None:
+            return jsonify({"error":"resource not found"}),404
+        return jsonify(resource_feedback(detail))
 
     @app.get("/api/resources/<resource_id>/charts")
     def api_resource_charts(resource_id: str):

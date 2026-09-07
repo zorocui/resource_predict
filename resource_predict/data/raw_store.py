@@ -221,6 +221,11 @@ def write_raw_resource_dataset(
     # 上一次提交中处于安全宽限期的旧分片，不再出现在当前 old_files 中；
     # 每轮提交都扫描一次孤立分片，保证纯增量运行也能最终回收它们。
     removed += _remove_orphan_raw_files(base, new_files)
+    from resource_predict.pipeline.realized_error import try_score_realized_forecasts
+
+    try_score_realized_forecasts(base, (
+        item for rid, item in prepared_by_id.items() if changed is None or rid in changed
+    ), publish_report=False)
     return {
         "resources": len(new_resources),
         "files_total": len(new_files),

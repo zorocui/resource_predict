@@ -56,6 +56,20 @@ vulture app.py check_outputs.py generate_forecasts.py ingest_k8s_workloads.py re
 python -m pytest -q
 ```
 
+## 预测反馈账本性能基准
+
+```bash
+python -m benchmarks.forecast_feedback_benchmark --resources 10000 --containers 1 --batches 7 --points 24 --result outputs/feedback_benchmark_result.json
+```
+
+默认在临时目录构造 1 万资源、每资源 1 个容器、每容器 4 指标、7 个每日批次和每曲线 24 个点，共 672 万点。最后一天 96 万点用于补评；测量评分、报告和 4 万条指标校准，输出进程峰值 RSS、读写计数（Windows）或块写计数（Linux）、数据库体积和结果摘要。不访问生产监控或生成生产扩缩容任务。
+
+可用 `--database outputs/feedback_benchmark.sqlite3` 保留合成库复测，现存库会检查批次命名、资源标识和规模，不符合时拒绝修改。`--containers`、`--batches`、`--points` 可扩大负载；务必按实际预测频率选择批次规模。数据不包含完整影子配对/上界留档，不计模型拟合、raw 序列化、Prometheus 拉取、真实磁盘竞争或持续到期清理的吞吐，不能直接作生产 SLA。
+
+2026-09-06 本机单进程重复负载测量：旧实现报告 23.4–26.5 秒，优化后 12.3–13.2 秒；校准旧实现 39.3–44.7 秒，优化后 33.6 秒。补评约 6–7 秒基本不变。优化版峰值 RSS 67.0 MiB，旧版复测 63.9 MiB；复用库约 590 MiB，文件空闲页复用，不承诺每轮收缩。Windows 进程累计写入约 2.73 GiB 降至 1.28 GiB，包含合成重置、SQLite 日志及临时排序文件，不能等同于物理磁盘写入。该测量不是多次统计置信区间。
+
+校准通过单次有序游标选取相同样本，每组最多保留 500 个；报告先汇总曲线/提前量，再按模型与单位汇总，并保持按实际点数加权。浮点累加顺序变化可能产生末位差异。raw 提交延迟报告，预测结束统一发布，减少一次完整汇总。回归命令：`python -m pytest -q tests/test_feedback_performance.py tests/test_calibration.py tests/test_realized_error.py`。
+
 ## 详情加载性能基准
 
 该基准生成大规模资源分片但跳过模型拟合，测量单资源元数据与单指标图表读取的 P50/P95：
@@ -129,7 +143,52 @@ python -m pytest -q tests/test_forecast_evaluation.py tests/test_forecast_optimi
 
 独立测试的输入契约是按时间可获得的序列。K8S 新采集短缺口只向前填补；已有 raw 缓存可能来自旧版双向插值，不能逆向恢复为原始观测，严格实验应重新采集或使用未插值输入。自定义 Provider 必须保证清洗、规格归一化与特征构造不使用预测起点之后的信息。填补值仍属于加工数据，生产评分应以后续真实采样点为准。
 
+### 真实误差回填验证
+
+`tests/test_realized_error.py` 覆盖重复评分、迟到补评、原曲线保留、精确时间、未来观测排除、规格变化、容器/scope 隔离、非有限值、导入回滚、保留期和 raw/upsert 自动链路。provider 测试验证采集证据不包含填补点。
+
+```bash
+python -m pytest -q tests/test_realized_error.py tests/test_k8s_workload_provider.py tests/test_forecast_archive.py
+python -m resource_predict.pipeline.realized_error --out-dir outputs/k8s
+```
+
+逐点追溯可使用 SQLite 查询（`container=''` 表示资源聚合指标）：
+
+```sql
+SELECT c.batch, c.resource_id, c.container, c.metric, c.model, c.unit,
+       p.target_ms, p.predicted, p.actual, p.scored_at_ms, p.observation_source,
+       p.target_ms-c.data_end_ms AS data_horizon_ms,
+       p.target_ms-c.issued_ms AS publication_horizon_ms, p.skip_reason
+FROM points p JOIN curves c ON c.id=p.curve_id;
+```
+
+原始证据仅保存最新接收批次，首次真实评分固定；监控修订不覆盖既有评分。生产性能应测量实际容器数、预测频率、窗口点数下的数据库大小和评分耗时。不以 mock 精度证明生产收益；基于真实残差的经验上界见下节。
+
+### 经验上界验证
+
+```bash
+python -m pytest -q tests/test_calibration.py tests/test_realized_error.py tests/test_io.py
+```
+
+校准测试验证历史已评分样本的时间隔离、同目标去重、配置/版本/模型/容器/规格隔离、分提前量缺样本降级、负残差余量下限、只读账本异常、留档覆盖评分、增量合并和 API 输出。新增表通过 CREATE TABLE IF NOT EXISTS 增量创建，不重写旧预测或评分。
+
+覆盖率必须用校准后真正到达的数据测量，不能拿训练余量的同一批残差证明效果；均值余量也不等同于资源费用。保留 7 天、单资源严格分组可能导致样本不足，默认保留原建议。生产验证应报告样本数、时段、业务漂移、覆盖率及运行耗时。
+
 ## 执行安全约定
+
+页面校准反馈验证：`python -m pytest -q tests/test_forecast_feedback.py`；前端状态与转义检查：`node tests/feedback_ui_check.cjs`。详情反馈接口按报告 mtime 缓存解析结果与资源索引，只返回当前资源；页面缺值使用破折号、报告陈旧/已过期单独提示，不将旧产物当作有效新评审。
+
+受控采用回归：`python -m pytest -q tests/test_controlled_activation.py tests/test_action_gate_state.py tests/test_scaling_tasks.py`。测试覆盖默认关闭、显式资源列表、完整建议重建、原建议保留/回退、非新预测、过期或错误报告、规格/配置/目标变化、策略切换确认重置、execute 入队及排队后失效拒绝，以及新评分推翻旧报告。所有测试使用本地夹具/替身，不执行真实远程命令。
+
+受控采用仅在生成正式建议时允许切换；文件/数据库异常拒绝校准授权。旧报告期限尚未到达也不代表当前账本仍通过判定，执行入口按具体资源重新评审。两个代码级开关默认 False/空列表，本次测试不修改生产配置。
+
+启用判定回归：`python -m pytest -q tests/test_activation_assessment.py`。测试涵盖只读性、满足条件、风险或超出幅度增加、无预留收益、完整率门槛、未来评分、陈旧预测/观测、连续证据重置、变化增多、去重先于观测筛选、资源/容器隔离、K8S limit 不算预留收益、缺基准和报告入口幂等。`eligible_for_review` 不启用策略；当前规则是代码级工程判据，不是覆盖率置信区间或生产 SLA。
+
+2026-09-07 合成判定负载：1000 个 K8S 资源 × 2 容器 × 4 指标 × 16 轮 × 12 点 = 1536000 点，判定约 5.56 秒，数据库约 160 MB。使用测试夹具构造满足规则的数据，仅测判定模块，不代表生产资源已具备启用条件；原始结果为 outputs/activation_benchmark.json。
+
+影子对照测试位于 `tests/test_shadow.py`：验证原建议不变、同算法换输入、缺校准/缺容器不配对、VM 数值、容器 request/limit 与小规格、副本变化不伪评分、留档幂等、变更率、保留期和部分重算。可运行 `python -m pytest -q tests/test_shadow.py`。`shadow_comparison.executable=false`，快照不包含执行 gate，不能作为 execute 请求的授权来源。
+
+生产观察应同时检查配对覆盖数、未评估原因、同一批次两方案的资源量/超出率和变更次数。资源量均值按建议曲线计算，风险比例按匹配真实点计算，二者分母不同；不得把监控缺失当作风险为零。
 
 - 调配命令中所有用户可控值使用 `shlex.quote()` 转义
 - 不拼接未转义的字符串构建 shell 命令

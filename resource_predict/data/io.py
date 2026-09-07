@@ -144,6 +144,8 @@ def prepared_dict_to_raw_record(p: Dict[str, Any]) -> Dict[str, Any]:
     }
     if isinstance(p.get("data_quality"), dict):
         rec["data_quality"] = p["data_quality"]
+    if isinstance(p.get("observation_evidence"), dict):
+        rec["observation_evidence"] = p["observation_evidence"]
     container_metrics = _serialize_container_metric_series(p.get("container_metrics"))
     if container_metrics:
         rec["container_metrics"] = container_metrics
@@ -192,6 +194,8 @@ def raw_record_to_prepared(rec: Dict[str, Any]) -> Dict[str, Any]:
     resource_type = str(rec.get("resource_type") or "")
     if resource_type:
         item["resource_type"] = resource_type
+    if isinstance(rec.get("observation_evidence"), dict):
+        item["observation_evidence"] = rec["observation_evidence"]
     if isinstance(rec.get("data_quality"), dict):
         item["data_quality"] = rec["data_quality"]
     for metric in metric_names_for_resource(item):
@@ -288,6 +292,8 @@ def merge_charts_into_detail(
             "sample_interval_seconds": block.get("sample_interval_seconds"),
             "max_interpolation_gap_steps": block.get("max_interpolation_gap_steps"),
         }
+        if isinstance(block.get("calibration"), dict):
+            merged_charts[kind]["calibration"] = block["calibration"]
     out["charts"] = merged_charts
     container_charts = _merge_container_charts(
         raw,
@@ -362,6 +368,8 @@ def _merge_container_charts(
                 "sample_interval_seconds": block.get("sample_interval_seconds"),
                 "max_interpolation_gap_steps": block.get("max_interpolation_gap_steps"),
             }
+            if isinstance(block.get("calibration"), dict):
+                metric_out[str(metric)]["calibration"] = block["calibration"]
         if metric_out:
             out[str(container)] = metric_out
     return out
