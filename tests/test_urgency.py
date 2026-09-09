@@ -28,14 +28,14 @@ class UrgencyScoreTest(unittest.TestCase):
             },
         }
 
-    def test_k8s_analysis_only_scale_in_is_capped_to_low_priority(self):
+    def test_k8s_analysis_only_scale_in_keeps_savings_visible(self):
         item = self._k8s_scale_in_item(
             analysis_only=True,
             ready_for_execution=False,
             target_spec={},
         )
 
-        self.assertLessEqual(compute_urgency_score(item, settings.decision), 25.0)
+        self.assertGreater(compute_urgency_score(item, settings.decision), 25.0)
 
     def test_k8s_executable_candidate_keeps_full_urgency(self):
         executable = self._k8s_scale_in_item(
@@ -49,7 +49,7 @@ class UrgencyScoreTest(unittest.TestCase):
             target_spec={},
         )
 
-        self.assertGreater(
+        self.assertEqual(
             compute_urgency_score(executable, settings.decision),
             compute_urgency_score(analysis_only, settings.decision),
         )

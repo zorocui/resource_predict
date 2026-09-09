@@ -51,6 +51,8 @@ def _archive_record(item: dict, run_id: str) -> dict:
         }
         for container, metrics in item.get("container_charts_forecast", {}).items()
     }
+    if "_accuracy_holdout" in item:
+        record["holdout_forecasts"] = item["_accuracy_holdout"]
     return record
 
 
@@ -86,7 +88,7 @@ def archive_forecasts(
             with gzip.open(raw, "wt", encoding="utf-8") as stream:
                 for item in resources_items:
                     record = _archive_record(item, run_id)
-                    if not record["forecasts"] and not record["container_forecasts"]:
+                    if not record["forecasts"] and not record["container_forecasts"] and not record.get("holdout_forecasts"):
                         continue
                     json.dump(record, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
                     stream.write("\n")

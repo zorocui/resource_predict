@@ -42,6 +42,8 @@ class CollectionConfig:
 
 @dataclass(frozen=True)
 class PredictionConfig:
+    parallel_backend: str = "auto"
+    max_workers: int = 0
     vm_test_duration: str = "72h"
     vm_future_duration: str = "24h"
     workload_test_duration: str = "24h"
@@ -187,7 +189,15 @@ def normalize_runtime_config(payload: Any) -> RuntimeConfig:
     invalid = [x for x in methods if x not in SUPPORTED_FORECAST_METHODS]
     if invalid:
         raise _error("runtime.prediction.enabled_methods", f"不支持的预测模型: {invalid[0]}")
+    backend = p["parallel_backend"]
+    if not isinstance(backend, str) or backend not in ("auto", "process", "thread", "serial"):
+        raise _error("runtime.prediction.parallel_backend", "并行后端必须是 auto、process、thread 或 serial")
+    workers = p["max_workers"]
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 0 <= workers <= 256:
+        raise _error("runtime.prediction.max_workers", "max_workers 必须为 0 到 256 的整数（0 表示自动）")
     prediction = PredictionConfig(
+        parallel_backend=backend,
+        max_workers=workers,
         vm_test_duration=_duration(p["vm_test_duration"], "runtime.prediction.vm_test_duration"),
         vm_future_duration=_duration(p["vm_future_duration"], "runtime.prediction.vm_future_duration"),
         workload_test_duration=_duration(p["workload_test_duration"], "runtime.prediction.workload_test_duration"),

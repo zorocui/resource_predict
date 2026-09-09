@@ -1,207 +1,151 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict
 
+from resource_predict.core.decision import policy_thresholds
 from resource_predict.resource_types import resource_type_of
 from resource_predict.utils import parse_float_or_none
 
 
 def compute_urgency_score(item: Dict[str, Any], cfg: Any) -> float:
-    """Compute list sorting urgency from scaling advice and target spec changes."""
-    return float(compute_urgency_breakdown(item, cfg).get("score", 0.0))
+    """Return the bounded rule priority, independently of execution permission."""
+    return float(compute_urgency_breakdown(item, cfg)["score"])
+
+
+def _unit(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _number(value: Any) -> float | None:
+    parsed = parse_float_or_none(value)
+    return parsed if parsed is not None and math.isfinite(parsed) else None
+
+
+def _saving_ratio(item: Dict[str, Any], advice: Dict[str, Any], *, k8s: bool) -> float:
+    """Maximum dimension's reclaimable fraction; never add CPU and memory units."""
+    spec = item.get("spec", {})
+    target = advice.get("target_spec", {})
+    if not isinstance(spec, dict) or not isinstance(target, dict):
+        return 0.0
+    ratios = []
+    if not k8s:
+        for field in ("cpu_cores", "memory_gb", "disk_gb"):
+            current = _number(spec.get(field))
+            proposed = _number(target.get(field))
+            if current is not None and current > 0 and proposed is not None and proposed > 0:
+                ratios.append(_unit(1.0 - proposed / current))
+        return max(ratios, default=0.0)
+
+    containers = spec.get("containers", {})
+    targets = target.get("containers", {})
+    if not isinstance(containers, dict) or not isinstance(targets, dict):
+        return 0.0
+    current_replicas = _number(spec.get("replicas") or spec.get("replicas_observed"))
+    next_replicas = _number(target.get("replicas"))
+    replica_ratio = 1.0
+    if current_replicas is not None and current_replicas > 0 and next_replicas is not None and next_replicas > 0:
+        replica_ratio = next_replicas / current_replicas
+    for field in ("cpu_request_cores", "cpu_limit_cores", "memory_request_gb", "memory_limit_gb"):
+        current_total = target_total = 0.0
+        complete = bool(containers)
+        for name, container in containers.items():
+            proposed = targets.get(name, {})
+            if not isinstance(container, dict) or not isinstance(proposed, dict):
+                complete = False
+                break
+            current = _number(container.get(field))
+            following = _number(proposed.get(field, container.get(field)))
+            if current is None or current <= 0 or following is None or following <= 0:
+                complete = False
+                break
+            current_total += current
+            target_total += following
+        if complete and current_total > 0:
+            ratios.append(_unit(1.0 - target_total * replica_ratio / current_total))
+    return max(ratios, default=0.0)
 
 
 def compute_urgency_breakdown(item: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
-    """Compute urgency score with displayable additive components."""
+    """Version 2: explainable capacity-risk or savings rule score, not a probability.
+
+    Per-container evidence avoids masking hot containers with Workload averages.
+    """
+    result: Dict[str, Any] = {
+        "version": 2, "score_max": 100, "score": 0.0, "level": "unknown",
+        "kind": "unknown", "components": [], "metric_scores": [],
+    }
     advice = item.get("scaling_advice", {}) if isinstance(item, dict) else {}
     if not isinstance(advice, dict):
-        return {"score": 0.0, "components": []}
-    resource_type = resource_type_of(item)
-    urgency_metrics = ("cpu", "memory") if resource_type == "k8s_workload" else ("cpu", "memory", "disk")
-    action = str(advice.get("action", "hold")).lower()
-    confidence = str(advice.get("confidence", "medium")).lower()
+        return result
+    action = str(advice.get("action", "")).lower()
     if action == "hold":
-        return {"score": 0.0, "components": [{"label": "保持动作", "value": 0.0}]}
-    if action == "insufficient_data":
-        return {"score": 1.0, "components": [{"label": "数据不足", "value": 1.0}]}
-    stats = advice.get("stats", {})
-    if not isinstance(stats, dict):
-        stats = {}
-
-    metric_actions = advice.get("metric_actions", {})
-    if not isinstance(metric_actions, dict):
-        metric_actions = {}
-    risk_profile = advice.get("risk_profile", {})
-    if not isinstance(risk_profile, dict):
-        risk_profile = {}
-
-    def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
-        return max(lo, min(hi, v))
-
-    def _above(value: float, threshold: float, *, soft_cap: float = 1.0) -> float:
-        threshold = max(float(threshold), 0.001)
-        if value <= threshold:
-            return 0.0
-        if value <= soft_cap:
-            return _clamp((value - threshold) / max(soft_cap - threshold, 0.001))
-        return 1.0 + min(2.0, math.log1p(value - soft_cap))
-
-    def _below(value: float, threshold: float) -> float:
-        threshold = max(float(threshold), 0.001)
-        return _clamp((threshold - value) / threshold)
-
-    def _target_change_score() -> float:
-        spec = item.get("spec", {})
-        target = advice.get("target_spec", {})
-        if not isinstance(spec, dict) or not isinstance(target, dict):
-            return 0.0
-        ratios = []
-        vm_dims = ("cpu_cores", "memory_gb", "disk_gb")
-        k8s_dims = ("cpu_request_cores", "cpu_cores", "memory_request_gb", "memory_gb")
-        all_dims = k8s_dims if resource_type == "k8s_workload" else vm_dims
-        checked: set = set()
-        for dim in all_dims:
-            cur = parse_float_or_none(spec.get(dim)) or 0.0
-            nxt = parse_float_or_none(target.get(dim)) or 0.0
-            if cur <= 0 or nxt <= 0:
-                continue
-            # 避免同一物理维度重复计算（如 cpu_cores 与 cpu_request_cores）
-            base_key = dim.split("_")[0]  # "cpu" / "memory" / "disk"
-            if base_key in checked:
-                continue
-            checked.add(base_key)
-            if action in {"scale_out", "scale_out_candidate"}:
-                ratios.append(max(nxt / cur - 1.0, 0.0))
-            elif action in {"scale_in", "scale_in_candidate"}:
-                ratios.append(max(1.0 - nxt / cur, 0.0))
-        # K8S 副本数变化
-        if "replicas" in target:
-            cur_rep = parse_float_or_none(spec.get("replicas") or spec.get("replicas_observed")) or 0.0
-            nxt_rep = parse_float_or_none(target.get("replicas")) or 0.0
-            if cur_rep > 0 and nxt_rep > 0:
-                if action in {"scale_out", "scale_out_candidate"}:
-                    ratios.append(max(nxt_rep / cur_rep - 1.0, 0.0))
-                elif action in {"scale_in", "scale_in_candidate"}:
-                    ratios.append(max(1.0 - nxt_rep / cur_rep, 0.0))
-        return min(18.0, 18.0 * max(ratios, default=0.0))
-
-    confidence_bonus = {
-        "high": 6.0,
-        "medium": 3.0,
-        "low": 1.0,
-    }.get(confidence, 2.0)
-
-    metric_scores: List[Dict[str, Any]] = []
-    for metric in urgency_metrics:
-        st = stats.get(metric, {})
-        if not isinstance(st, dict):
+        result.update(level="none", kind="none", components=[{"label": "保持动作", "value": 0.0}])
+        return result
+    expanding = action in {"scale_out", "scale_out_candidate"}
+    if not expanding and action not in {"scale_in", "scale_in_candidate"}:
+        return result
+    k8s = resource_type_of(item) == "k8s_workload"
+    thresholds = policy_thresholds(str(advice.get("policy_tier", "balanced")), cfg)
+    metrics = ("cpu", "memory") if k8s else ("cpu", "memory", "disk")
+    direction = {"scale_out", "scale_out_candidate"} if expanding else {"scale_in", "scale_in_candidate"}
+    sources = advice.get("container_advice") if k8s else None
+    if not isinstance(sources, dict) or not sources:
+        sources = {"": advice}
+    saving = _saving_ratio(item, advice, k8s=k8s) if not expanding else 0.0
+    best_components = []
+    best_score = -1.0
+    for container, source in sources.items():
+        if not isinstance(source, dict):
             continue
-        metric_action = str(metric_actions.get(metric, action)).lower()
-        if metric_action not in {"scale_out", "scale_out_candidate", "scale_in", "scale_in_candidate"}:
+        stats = source.get("stats", {})
+        actions = source.get("metric_actions", {})
+        if not isinstance(stats, dict) or not isinstance(actions, dict):
             continue
-        avg = parse_float_or_none(st.get("avg")) or 0.0
-        p95 = parse_float_or_none(st.get("p95")) or 0.0
-        peak = parse_float_or_none(st.get("peak")) or 0.0
-        gap = parse_float_or_none(st.get("gap")) or 0.0
-        slope = parse_float_or_none(st.get("slope")) or 0.0
-        delta = parse_float_or_none(st.get("window_mean_delta")) or 0.0
-
-        if metric_action in {"scale_out", "scale_out_candidate"}:
-            trend_pressure = 0.0
-            if slope > 0:
-                trend_pressure += min(1.0, slope / max(float(cfg.uptrend_slope_threshold), 0.0001))
-            if delta > 0:
-                trend_pressure += min(1.0, delta / max(float(cfg.window_mean_delta_threshold), 0.0001))
-            value = (
-                32.0 * _above(p95, float(cfg.scale_out_threshold))
-                + 22.0 * _above(peak, float(cfg.peak_guard_threshold))
-                + 12.0 * _above(avg, float(cfg.scale_out_threshold))
-                + 6.0 * trend_pressure
-                + 4.0 * min(1.0, gap / max(float(cfg.peak_valley_gap_threshold), 0.0001))
-            )
-            metric_scores.append({"metric": metric, "action": metric_action, "value": value})
-        elif metric_action in {"scale_in", "scale_in_candidate"}:
-            trend_pressure = 0.0
-            if slope < 0:
-                trend_pressure += min(1.0, abs(slope) / max(abs(float(cfg.downtrend_slope_threshold)), 0.0001))
-            if delta < 0:
-                trend_pressure += min(1.0, abs(delta) / max(float(cfg.window_mean_delta_threshold), 0.0001))
-            value = (
-                20.0 * _below(avg, float(cfg.scale_in_threshold))
-                + 16.0 * _below(p95, float(cfg.scale_in_p95_guard))
-                + 5.0 * trend_pressure
-                + 4.0 * (1.0 - min(1.0, gap / 0.5))
-            )
-            metric_scores.append({"metric": metric, "action": metric_action, "value": value})
-
-    if not metric_scores:
-        return {
-            "score": round(confidence_bonus, 3),
-            "components": [{"label": "置信度加成", "value": round(confidence_bonus, 3)}],
-        }
-
-    base_score = 35.0 if action in {"scale_out", "scale_out_candidate"} else 18.0
-    risk_score = min(20.0, 0.2 * (parse_float_or_none(risk_profile.get("risk_score")) or 0.0))
-    metric_values = sorted((float(x["value"]) for x in metric_scores), reverse=True)
-    primary_metric_score = max(metric_values)
-    secondary_metric_score = 0.25 * sum(metric_values[1:])
-    multi_metric_bonus = 4.0 * max(0, len(metric_values) - 1)
-    mixed_signal_bonus = 4.0 if bool(advice.get("has_mixed_signals")) else 0.0
-    target_change = _target_change_score()
-    score = (
-        base_score
-        + confidence_bonus
-        + risk_score
-        + primary_metric_score
-        + secondary_metric_score
-        + multi_metric_bonus
-        + mixed_signal_bonus
-        + target_change
+        for metric in metrics:
+            metric_action = str(actions.get(metric, action)).lower()
+            st = stats.get(metric)
+            if metric_action not in direction or not isinstance(st, dict):
+                continue
+            if "sample_count" in st and (_number(st["sample_count"]) or 0) <= 0:
+                continue
+            avg, p95, peak = (_number(st.get(key)) for key in ("avg", "p95", "peak"))
+            if any(value is None or value < 0 for value in (avg, p95, peak)):
+                continue
+            if expanding:
+                out_threshold = thresholds["disk_scale_out_threshold" if metric == "disk" else "scale_out_threshold"]
+                peak_threshold = thresholds["disk_peak_guard_threshold" if metric == "disk" else "peak_guard_threshold"]
+                p95_pressure = _unit((p95 - out_threshold) / max(1.0 - out_threshold, 0.001))
+                peak_pressure = _unit((peak - peak_threshold) / max(1.0 - peak_threshold, 0.001))
+                breached = p95 >= out_threshold or peak >= peak_threshold
+                components = [
+                    {"label": "触及容量阈值", "value": 40.0 if breached else 0.0},
+                    {"label": "超阈值压力（P95与折减峰值取最大）", "value": 60.0 * max(p95_pressure, 0.75 * peak_pressure)},
+                ]
+            else:
+                headroom = min(
+                    _unit((thresholds["scale_in_threshold"] - avg) / max(thresholds["scale_in_threshold"], 0.001)),
+                    _unit((thresholds["scale_in_p95_guard"] - p95) / max(thresholds["scale_in_p95_guard"], 0.001)),
+                )
+                low_ratio = _unit(_number(st.get("low_ratio")) or 0.0)
+                components = [
+                    {"label": "保守空闲程度", "value": 60.0 * headroom},
+                    {"label": "持续低负载比例", "value": 25.0 * low_ratio},
+                    {"label": "目标总容量回收比例", "value": 15.0 * saving},
+                ]
+            score = round(sum(part["value"] for part in components), 3)
+            result["metric_scores"].append({
+                "metric": metric, "container": container or None, "action": metric_action, "value": score,
+            })
+            if score > best_score:
+                best_score = score
+                best_components = components
+    if best_score < 0:
+        return result
+    result.update(
+        score=best_score,
+        kind="capacity_risk" if expanding else "savings",
+        level="critical" if best_score >= 90 else "high" if best_score >= 70 else "medium" if best_score >= 40 else "low",
+        components=[{"label": part["label"], "value": round(part["value"], 3)} for part in best_components],
     )
-    components = [
-        {"label": "基础动作分", "value": base_score},
-        {"label": "置信度加成", "value": confidence_bonus},
-        {"label": "风险分贡献", "value": risk_score},
-        {"label": "最强指标贡献", "value": primary_metric_score},
-    ]
-    if secondary_metric_score:
-        components.append({"label": "其他指标贡献", "value": secondary_metric_score})
-    if multi_metric_bonus:
-        components.append({"label": "多指标加成", "value": multi_metric_bonus})
-    if mixed_signal_bonus:
-        components.append({"label": "混合信号加成", "value": mixed_signal_bonus})
-    if target_change:
-        components.append({"label": "目标变化分", "value": target_change})
-    if _is_k8s_analysis_only(advice, item):
-        cap = 35.0 if action in {"scale_out", "scale_out_candidate"} else 25.0
-        raw_score = score
-        score = min(cap, score * 0.35)
-        components.append({"label": "仅分析封顶/折扣", "value": score - raw_score})
-    return {
-        "score": round(score, 3),
-        "components": [
-            {"label": str(x["label"]), "value": round(float(x["value"]), 3)}
-            for x in components
-            if abs(float(x["value"])) > 0.0005 or str(x["label"]) in {"基础动作分", "置信度加成"}
-        ],
-        "metric_scores": [
-            {
-                "metric": str(x["metric"]),
-                "action": str(x["action"]),
-                "value": round(float(x["value"]), 3),
-            }
-            for x in metric_scores
-        ],
-    }
-
-
-def _is_k8s_analysis_only(advice: Dict[str, Any], item: Dict[str, Any]) -> bool:
-    if resource_type_of(item) != "k8s_workload":
-        return False
-    if not bool(advice.get("analysis_only")):
-        return False
-    policy = advice.get("target_k8s_policy", {})
-    if not isinstance(policy, dict):
-        return True
-    return not bool(policy.get("ready_for_execution"))
+    return result

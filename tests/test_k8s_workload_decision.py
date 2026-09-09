@@ -362,8 +362,8 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([0.05, 0.08, 0.1]),
-                "memory": np.array([0.05, 0.08, 0.1]),
+                "cpu_request": np.array([0.05, 0.08, 0.1]),
+                "memory_request": np.array([0.05, 0.08, 0.1]),
             },
             resource=resource,
         )
@@ -393,8 +393,8 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([0.92, 0.95, 0.98]),
-                "memory": np.array([0.2, 0.25, 0.3]),
+                "cpu_limit": np.array([0.92, 0.95, 0.98]),
+                "memory_limit": np.array([0.2, 0.25, 0.3]),
             },
             resource=resource,
         )
@@ -462,8 +462,8 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([0.02, 0.03, 0.04]),
-                "memory": np.array([0.03, 0.04, 0.05]),
+                "cpu_request": np.array([0.02, 0.03, 0.04]),
+                "memory_request": np.array([0.03, 0.04, 0.05]),
             },
             resource=resource,
         )
@@ -590,8 +590,8 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         advice = build_k8s_workload_advice(
             {
-                "cpu": np.array([0.05, 0.08, 0.1]),
-                "memory": np.array([0.06, 0.09, 0.12]),
+                "cpu_request": np.array([0.05, 0.08, 0.1]),
+                "memory_request": np.array([0.06, 0.09, 0.12]),
             },
             resource=resource,
         )

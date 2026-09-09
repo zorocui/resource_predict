@@ -49,11 +49,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="VM output directory. Defaults to outputs/vm.",
     )
+    parser.add_argument("--parallel-backend", choices=("auto", "process", "thread", "serial"), default=None)
+    parser.add_argument("--max-workers", type=_worker_count, default=None, help="0 = auto; maximum 256.")
     return parser
+
+
+def _worker_count(value: str) -> int:
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("max-workers must be an integer from 0 to 256") from exc
+    if not 0 <= workers <= 256:
+        raise argparse.ArgumentTypeError("max-workers must be an integer from 0 to 256")
+    return workers
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+    overrides = {key: getattr(args, key) for key in ("parallel_backend", "max_workers") if getattr(args, key) is not None}
 
     from resource_predict.logging_setup import setup_application_logging
     setup_application_logging()
@@ -71,7 +84,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Skipping {scope} predict: {raw_index_path} not found")
                 continue
             raw_before = _file_sha256(raw_index_path)
-            out = generate_predictions_only(out_dir=str(out_dir))
+            out = generate_predictions_only(out_dir=str(out_dir), **overrides)
             raw_after = _file_sha256(raw_index_path)
             if raw_before != raw_after:
                 raise RuntimeError(f"{raw_index_path} changed during predict-only generation")
@@ -90,6 +103,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             out = generate_forecasts(
                 out_dir=str(out_dir),
                 data_provider=lambda resources, n, freq, _items=scoped: _items,
+                **overrides,
             )
             print(f"Generated {scope} predictions for {len(out)} resources, dir: {out_dir}")
     return 0

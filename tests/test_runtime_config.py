@@ -22,7 +22,7 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(payload["collection"]["rate_window"], "15m")
         self.assertEqual(payload["collection"]["retention_days"], 30)
         self.assertNotIn("fail_fast", payload["collection"])
-        self.assertEqual(sum(len(v) for v in payload.values()), 27)
+        self.assertEqual(sum(len(v) for v in payload.values()), 29)
 
     def test_retention_days_must_be_positive_integer(self):
         for invalid in (0, -1, True, 30.5, "30"):
@@ -54,6 +54,8 @@ class RuntimeConfigTest(unittest.TestCase):
             migrated, _ = load_runtime_config(runtime_path, legacy_path)
             self.assertEqual(migrated.prediction.enabled_methods, ("rolling_mean",))
             self.assertTrue(migrated.prediction.enable_ensemble)
+            self.assertEqual(migrated.prediction.parallel_backend, "auto")
+            self.assertEqual(migrated.prediction.max_workers, 0)
             write_runtime_config(default_runtime_config(), runtime_path)
             loaded, _ = load_runtime_config(runtime_path, legacy_path)
             self.assertEqual(loaded, default_runtime_config())

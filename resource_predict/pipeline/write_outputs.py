@@ -36,8 +36,12 @@ def write_prediction_outputs(
     prediction_skips: Optional[List[Dict[str, str]]] = None,
     forecast_archive: Optional[Dict[str, Any]] = None,
     forecast_realized: Optional[Dict[str, Any]] = None,
+    execution_stats: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    output_started = time.perf_counter()
     prediction_skips = list(prediction_skips or [])
+    for item in resources_items:
+        item.pop("_accuracy_holdout", None)
     details_dir = out_base / DETAILS_DIRNAME
     details_dir.mkdir(parents=True, exist_ok=True)
     details_files: List[str] = []
@@ -176,6 +180,7 @@ def write_prediction_outputs(
         "forecast_realized": dict(forecast_realized or {}),
         "raw": dict(raw_stats),
         "prediction_skips": prediction_skips,
+        "execution": {**(execution_stats or {}), "output_write_seconds": time.perf_counter()-output_started},
     }
     atomic_write_json(
         out_base / GENERATION_STATS_FILENAME,

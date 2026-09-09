@@ -44,6 +44,37 @@ const T0 = 1_800_000_000_000;
 const HOUR = 60 * 60 * 1000;
 const times = Array.from({ length: 9 }, (_, index) => T0 + index * HOUR);
 
+test("detail advice renders backend scores, real zero, unknown and legacy without inferred formulas", () => {
+  const app = {
+    metricTitleMap: {}, viewMetricMap: { openstack_vm: [] },
+    els: { detailConfidence: {}, detailAdvice: {}, detailActions: {} },
+  };
+  const context = vm.createContext({ window: {
+    ResourcePredictApp: app, ResourceApi: {}, addEventListener() {},
+    ScalingUI: { buildControls: () => "" },
+  } });
+  vm.runInContext(fs.readFileSync("static/js/resource-list.js", "utf8"), context);
+  vm.runInContext(source, context);
+  const resource = { resource_id: "vm-1", resource_type: "openstack_vm", scaling_advice: {
+    action: "hold", confidence_score: 0, confidence_breakdown: {
+      version: 2, score: 0, components: [{ label: "基础信号", value: 45 }, { label: "质量扣分", value: -45 }],
+    },
+  }, urgency_breakdown: { version: 2, score: 0, kind: "none" } };
+  context.window.ResourceCharts.renderAdvice(resource);
+  assert.match(app.els.detailConfidence.innerHTML, /置信度 低 · 0\/100/);
+  assert.match(app.els.detailConfidence.innerHTML, /基础信号45 - 质量扣分45/);
+  assert.match(app.els.detailAdvice.innerHTML, /无需调整 · 0\/100/);
+  resource.scaling_advice.confidence_score = null;
+  delete resource.scaling_advice.confidence_breakdown;
+  delete resource.urgency_breakdown;
+  resource.urgency_score = 182;
+  context.window.ResourceCharts.renderAdvice(resource);
+  assert.match(app.els.detailConfidence.innerHTML, /置信度 待评估/);
+  assert.doesNotMatch(app.els.detailConfidence.innerHTML, /0\/100|默认中等置信度/);
+  assert.match(app.els.detailAdvice.innerHTML, /旧版排序分 · 182/);
+  assert.doesNotMatch(app.els.detailAdvice.innerHTML, /182\/100/);
+});
+
 test("calibrated upper bound preserves missing intervals and real zero", () => {
   const option = buildChartOption({x_train_ms:[times[0]],y_train:[0.1],x_test_ms:[times[1]],y_test:[0.2],
     test_end_ms:times[1],x_pred_ms:[times[2],times[3],times[4]],preds_future:{rolling_mean:[0.2,0.3,0]},

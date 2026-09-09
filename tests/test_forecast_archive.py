@@ -153,10 +153,19 @@ def test_pipeline_partial_archive_excludes_retained_resources_and_metrics(tmp_pa
     record, = _read(second)
     assert record["resource_id"] == "vm-a"
     assert set(record["forecasts"]) == {"cpu"}
+    holdout, = record["holdout_forecasts"]
+    assert holdout["metric"] == "cpu"
+    assert holdout["x_test_ms"] == (values.index[-4:].asi8 // 1_000_000).tolist()
+    assert holdout["actual"] == [0.8] * 4
+    assert holdout["evaluation"]["test_train_end_ms"] == values.index[-5].value // 1_000_000
     assert record["forecasts"]["cpu"]["provenance"]["train_end_ms"] == values.index[-1].value // 1_000_000
     assert Path(first["path"]).read_bytes() == first_bytes
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     assert len(manifest["resources"]) == 2
+    for path in (tmp_path / "details").glob("*.json"):
+        for detail in json.loads(path.read_text(encoding="utf-8"))["resources"]:
+            assert "_accuracy_holdout" not in detail
+            assert all("y_test" not in chart for chart in detail["charts_forecast"].values())
 
 
 def test_archive_failure_is_reported_without_aborting_forecasts(tmp_path):

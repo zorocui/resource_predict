@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import concurrent.futures
+from functools import wraps
 import logging
 import time
 from pathlib import Path
@@ -23,7 +23,8 @@ from resource_predict.pipeline.controlled_activation import apply_controlled_adv
 from resource_predict.pipeline.shadow import build_shadow_advice
 from resource_predict.pipeline.realized_error import try_score_realized_forecasts
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
-from resource_predict.pipeline.plan import normalize_metric_filter, resolve_parallel_plan
+from resource_predict.pipeline.plan import normalize_metric_filter, resolve_execution_plan
+from resource_predict.pipeline.parallel import execute_metric_jobs
 from resource_predict.pipeline.prepare import (
     ExternalProvider,
     build_prepared_data,
@@ -34,7 +35,7 @@ from resource_predict.pipeline.windowing import (
     resolve_forecast_window,
     resource_family_for_items,
 )
-from resource_predict.pipeline.worker import worker as _worker
+from resource_predict.pipeline.worker import iter_metric_inputs, worker as _worker
 from resource_predict.pipeline.write_outputs import write_prediction_outputs
 from resource_predict.resource_types import metric_names_for_resource
 from resource_predict.services.forecast_config import read_forecast_config
@@ -42,6 +43,15 @@ from resource_predict.services.forecast_config import read_forecast_config
 logger = logging.getLogger(__name__)
 
 
+def _frozen_configuration(function):
+    @wraps(function)
+    def run(*args, **kwargs):
+        with settings.use(settings.freeze()):
+            return function(*args, **kwargs)
+    return run
+
+
+@_frozen_configuration
 def generate_forecasts(
     *,
     out_dir: Optional[str] = None,
@@ -51,6 +61,7 @@ def generate_forecasts(
     future_steps: Optional[int] = None,
     base_seed: Optional[int] = None,
     max_workers: Optional[int] = None,
+    parallel_backend: Optional[str] = None,
     data_provider: Optional[ExternalProvider] = None,
     freq: Optional[str] = None,
     model_timing_mode: Optional[str] = None,
@@ -64,6 +75,7 @@ def generate_forecasts(
     输出分离：raw_index.json + raw/（观测）、details 分片（预测）、manifest（预测清单）。
     predict_only=True 时从资源级 raw 分片读取，不覆盖原始数据。
     """
+    run_started = time.perf_counter()
     cfg = settings.generation
     out_dir = out_dir or settings.app.out_dir
     explicit_test_size = test_size
@@ -208,6 +220,7 @@ def generate_forecasts(
                 "本次保留既有预测产物（test_size=%d）",
                 test_size,
             )
+    resources_ct = len(prepared_data)
     if resources_ct > 0:
         _log_input_stats(
             prepared_data,
@@ -219,12 +232,6 @@ def generate_forecasts(
             window_source=window.source,
             sample_interval_seconds=window.sample_interval_seconds,
         )
-
-    max_workers, parallel_metrics_enabled, inner_metric_workers = resolve_parallel_plan(
-        resources_ct=resources_ct,
-        cfg=cfg,
-        max_workers=max_workers,
-    )
 
     forecast_config = read_forecast_config()
     active_methods: List[str] = []
@@ -247,31 +254,44 @@ def generate_forecasts(
         max_interpolation_gap_steps=int(settings.k8s_prometheus.max_interpolation_gap_steps),
     )
 
-    logger.info(
-        "[progress] 线程池：max_workers=%d, parallel_metrics=%s, inner_workers=%d, metric_partial=%s",
-        max_workers,
-        parallel_metrics_enabled,
-        inner_metric_workers,
-        metric_partial_enabled,
-    )
+    metric_counts = [sum(1 for _ in iter_metric_inputs(source, ctx)) for source in prepared_data]
+    plan = resolve_execution_plan(sum(metric_counts), active_methods,
+                                  backend=parallel_backend or cfg.parallel_backend,
+                                  max_workers=max_workers if max_workers is not None else (cfg.max_workers or 0))
+    logger.info("[parallel] backend=%s workers=%d available_cpus=%d metric_tasks=%d max_in_flight=%d",
+                plan["backend"], plan["workers"], plan["available_cpus"], sum(metric_counts), plan["max_in_flight"])
 
     items: List[Optional[Dict[str, Any]]] = [None] * resources_ct
     t_start = time.perf_counter()
+    execution_stats: Dict[str, Any] = {"preparation_seconds": t_start-run_started, "assembly_seconds": 0.0}
 
     total_timing_by_model = {m: 0.0 for m in active_methods}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [
-            ex.submit(
-                _worker, i, prepared_data,
-                ctx=ctx,
-                parallel_metrics_enabled=parallel_metrics_enabled,
-                inner_metric_workers=inner_metric_workers,
-            )
-            for i in range(resources_ct)
-        ]
-        done_count = 0
-        for fut in concurrent.futures.as_completed(futures):
-            res = fut.result()
+    resource_started: Dict[int, float] = {}
+    def jobs():
+        for index, source in enumerate(prepared_data):
+            for container, metric, series in iter_metric_inputs(source, ctx):
+                resource_started.setdefault(index, time.perf_counter())
+                yield index, container, metric, series
+
+    computed: Dict[int, Dict[Any, Any]] = {}
+    done_count = 0
+    last_metric_log = t_start
+    for index, container, metric, result in execute_metric_jobs(jobs(), ctx, settings.freeze(), plan, execution_stats):
+        resource_results = computed.setdefault(index, {})
+        resource_results[(container, metric)] = result
+        now = time.perf_counter()
+        if now-last_metric_log >= 5 or execution_stats.get("completed") == plan["task_count"]:
+            logger.info("[progress] 指标任务 %d/%d，资源 %d/%d，backend=%s workers=%d",
+                        execution_stats.get("completed", 0), plan["task_count"], done_count, resources_ct,
+                        plan["backend"], plan["workers"])
+            last_metric_log = now
+        if len(resource_results) == metric_counts[index]:
+            assembly_started = time.perf_counter()
+            res = _worker(index, prepared_data, ctx=ctx, parallel_metrics_enabled=False,
+                          inner_metric_workers=1, precomputed=resource_results)
+            execution_stats["assembly_seconds"] += time.perf_counter()-assembly_started
+            del computed[index]
+            res.setdefault("_timings", {})["wall"] = time.perf_counter()-resource_started.pop(index)
             done_count += 1
             idx = int(res.pop("_slot"))
             items[idx] = res
@@ -290,6 +310,11 @@ def generate_forecasts(
                 wall_seconds,
                 elapsed,
             )
+
+    if done_count != resources_ct or any(item is None for item in items):
+        raise RuntimeError("incomplete metric results; refusing to publish partial forecasts")
+    execution_stats["fit_seconds"] = time.perf_counter()-t_start
+    post_started = time.perf_counter()
 
     resources_items: List[Dict[str, Any]] = [x for x in items if x is not None]
     for item in resources_items:
@@ -314,6 +339,8 @@ def generate_forecasts(
         archive_metadata = {"status": "failed", "path": None, "count": 0, "error": str(exc)}
         logger.warning("[forecast_archive] status=failed; forecasts will continue: %s", exc)
 
+    for item in resources_items:
+        item.pop("_accuracy_holdout", None)
     realized_metadata = try_score_realized_forecasts(out_base, realized_items)
     realized_metadata["calibration_seconds"] = calibration_seconds
     realized_metadata["shadow_generation_seconds"] = shadow_seconds
@@ -374,6 +401,11 @@ def generate_forecasts(
             item["resource_profile"]["metric_actions"] = item.get("scaling_advice",{}).get("metric_actions",{})
 
     total_elapsed = time.perf_counter() - t_start
+    execution_stats["postprocess_seconds"] = time.perf_counter()-post_started
+    execution_stats["elapsed_before_output_seconds"] = time.perf_counter()-run_started
+    logger.info("[parallel] fit_phase=%.2fs postprocess=%.2fs preparation=%.2fs completed=%d/%d worker_processes=%d",
+                execution_stats["fit_seconds"], execution_stats["postprocess_seconds"], execution_stats["preparation_seconds"],
+                execution_stats.get("completed", 0), sum(metric_counts), len(execution_stats.get("pids", [])))
     manifest_items = write_prediction_outputs(
         out_base=out_base,
         resources_items=resources_items,
@@ -399,6 +431,7 @@ def generate_forecasts(
         prediction_skips=prediction_skips,
         forecast_archive=archive_metadata,
         forecast_realized=realized_metadata,
+        execution_stats=execution_stats,
     )
     try:
         write_action_gate_state(out_base, action_gate_state)

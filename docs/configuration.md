@@ -2,7 +2,17 @@
 
 本文档详细说明系统的部署配置文件、参数设置和预测产物输出结构。
 
+## 评分口径与产物升级（v2）
+
+紧急度与置信度均显示中文等级和 `分数/100`，属于规则评分，不能解释为概率。紧急度默认低<40、中40–<70、高70–<90、容量风险≥90为紧急（节省机会≥90为极高）；阈值尚未经生产回放校准。置信度继续使用低<45、中45–<72、高≥72的门控边界。
+
+新预测生成 `scaling_advice.confidence_breakdown`（版本、满分、总分、实际加减项）；K8S 同时保存 `container_advice` 及有效预测 `sample_count`，供容器级评分和解释使用。缺预测数据不作为零负载缩容；质量、基线扣分在合并后应用；混合方向最高71分。既有执行门控仍保留。
+
+紧急度在列表和详情 API 中即时按 v2 计算；旧置信度产物不会自动改写，重新运行预测后获得新版结果和分解。前端遇到旧分解只显示已保存分数，不能据此推断新版公式。完整公式见 [architecture.md](architecture.md#置信度评分v2)，字段说明见 [api-reference.md](api-reference.md#评分字段v2)。
+
 ## 配置文件概览
+
+调配成效独立保存于各类型输出目录的 `scaling_effects.sqlite3`，不受任务JSON最近1000条限制。默认前24小时、稳定1小时、后24小时、80%有效覆盖率，事件冻结政策版本；来源契约、补齐期限与存储边界见 [scaling-effects.md](scaling-effects.md)。
 
 | 文件 | 用途 | 是否提交 Git |
 | --- | --- | --- |
@@ -117,6 +127,10 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | --- | --- |
 | `enabled_methods` | 参与竞选的候选模型，取值 `arima` / `sarima` / `prophet` / `seasonal_naive` / `rolling_mean`，至少一个。 |
 | `enable_ensemble` | `true` 表示在至少两个模型完成验证时生成集成候选。独立测试和未来预测的权重只来自训练段内验证分数；首个验证折等权，后续验证折使用此前折的分数。 |
+| `parallel_backend` | 默认 `auto`，可选 `process`/`thread`/`serial`；auto对重模型选择多进程，轻量模型选择线程。 |
+| `max_workers` | 默认 `0` 自动按可用CPU规划；1–256为显式上限，实际受CPU配额和任务数约束。 |
+
+并行配置在“系统配置 → 预测配置”保存，下一批生效；虚拟机可用CPU每轮重新识别，容器和聚合指标共用有界任务池。CLI覆盖、内存边界和吞吐基准见 [parallel-prediction.md](parallel-prediction.md)。
 
 以下开关是 `resource_predict/internal_settings.py` 中 `ForecastConfig` 的代码级默认值，
 不通过页面或配置文件暴露，需要调整时直接改代码：
@@ -336,6 +350,8 @@ outputs/
 留档发生在旧预测恢复、增量合并和跨轮次 action-gate 确认之前，因此仅记录本轮实际生成的预测，建议不是最终执行凭证。失败的批次不会发布半个文件；留档失败不阻止预测产物更新，日志与 `generation_stats.json.forecast_archive` 记录状态。真实值评分见下节；尚未实现概率区间校准。
 
 ### `forecast_realized.sqlite3` / `forecast_realized_report.json`
+
+预测准确性页面直接只读查询SQLite，不依赖可能滞后的JSON汇总。新版本增加独立测试逐点表 `holdout_curves/holdout_points`，与批次保留期级联清理；新未来留档含 `holdout_forecasts`。写入使用WAL。用户主动保存的长期快照位于输出根目录 `accuracy_snapshots/`，不会跟随7天账本清理；应定期备份和规划容量。详见 [forecast-accuracy.md](forecast-accuracy.md)。
 
 各 scope 的 raw 提交后、预测留档后自动回填历史预测误差。SQLite 的 `batches`、`curves`、`points` 分别保存导入批次、入选曲线及逐点评分，唯一键避免重复导入和计分。首次真实评分保留不变，迟到数据可以补评未评分点。只读取未导入的压缩批次，按资源和指标索引匹配，不把全部历史加载到内存。
 

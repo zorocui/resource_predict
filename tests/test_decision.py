@@ -416,6 +416,7 @@ class TestDecision(unittest.TestCase):
             "confidence",
             "confidence_score",
             "confidence_metric_scores",
+            "confidence_breakdown",
             "policy_tier",
             "risk_profile",
             "action_gate",

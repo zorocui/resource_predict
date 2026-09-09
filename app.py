@@ -8,6 +8,8 @@ from resource_predict.api.cluster_configs import register_cluster_config_routes
 from resource_predict.api.pages import register_page_routes
 from resource_predict.api.resources import register_resource_routes
 from resource_predict.api.scaling import register_scaling_routes
+from resource_predict.api.scaling_effects import register_scaling_effect_routes
+from resource_predict.api.forecast_accuracy import register_forecast_accuracy_routes
 from resource_predict.api.system_config import register_system_config_routes
 from resource_predict.api.updates import register_update_routes
 from resource_predict.logging_setup import setup_application_logging
@@ -47,6 +49,8 @@ def create_app() -> Flask:
     register_page_routes(app, route_helpers)
     register_resource_routes(app, route_helpers)
     register_scaling_routes(app, route_helpers)
+    register_scaling_effect_routes(app)
+    register_forecast_accuracy_routes(app)
     register_update_routes(app)
     register_cluster_config_routes(app)
     register_system_config_routes(app)

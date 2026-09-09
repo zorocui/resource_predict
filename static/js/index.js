@@ -17,6 +17,8 @@
       panel.classList.toggle("active", panel.id === `${app.state.activeView}-view`);
     });
     if (app.state.activeView === "tasks") renderTaskPanel();
+    if (app.state.activeView === "effects") window.ScalingEffects.load();
+    if (app.state.activeView === "accuracy") window.ForecastAccuracy.load();
     if (app.state.activeView === "updates") {
       refreshUpdateStatus();
       refreshUpdateHistory();
@@ -424,6 +426,11 @@
         ${configInput("K8S 预测窗口", "workload_future_duration", prediction.workload_future_duration || "24h")}
         ${supported.map((method) => configInput(method.label || method.key, `method:${method.key}`, enabled.has(method.key), { type: "checkbox" })).join("")}
         ${configInput("启用 Ensemble", "enable_ensemble", Boolean(prediction.enable_ensemble), { type: "checkbox" })}
+        ${configSelect("预测并行后端", "parallel_backend", prediction.parallel_backend || "auto", [
+          { value: "auto", label: "自动" }, { value: "process", label: "多进程" },
+          { value: "thread", label: "多线程" }, { value: "serial", label: "串行" },
+        ])}
+        ${configInput("最大并行数（0 自动，最多 256）", "max_workers", prediction.max_workers ?? 0, { type: "number" })}
       </div></div>`;
     if (app.els.decisionConfigList) app.els.decisionConfigList.innerHTML = `
       <div class="config-row" data-config-kind="decision"><div class="config-grid">
@@ -664,6 +671,7 @@
         vm_test_duration: rowValue(prediction, "vm_test_duration"), vm_future_duration: rowValue(prediction, "vm_future_duration"),
         workload_test_duration: rowValue(prediction, "workload_test_duration"), workload_future_duration: rowValue(prediction, "workload_future_duration"),
         enabled_methods: methods, enable_ensemble: rowValue(prediction, "enable_ensemble"),
+        parallel_backend: rowValue(prediction, "parallel_backend"), max_workers: rowValue(prediction, "max_workers"),
       },
       decision: {
         default_policy_tier: rowValue(decision, "default_policy_tier"),
@@ -896,6 +904,8 @@
   }
 
   async function bootstrap() {
+    window.ScalingEffects.init();
+    window.ForecastAccuracy.init();
     if (typeof echarts === "undefined") {
       app.els.rowsRoot.innerHTML = `<div class="empty-list">ECharts 未加载，请确认 static/vendor/echarts/echarts.min.js 存在。</div>`;
       return;

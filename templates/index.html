@@ -19,6 +19,8 @@
           <button class="nav-tab active" type="button" data-view="risk">风险队列</button>
           <button class="nav-tab" type="button" data-view="overview">概览</button>
           <button class="nav-tab" type="button" data-view="tasks">调配任务</button>
+          <button class="nav-tab" type="button" data-view="effects">调配成效</button>
+          <button class="nav-tab" type="button" data-view="accuracy">预测准确性</button>
           <button class="nav-tab" type="button" data-view="updates">数据更新</button>
           <button class="nav-tab" type="button" data-view="system-config">系统配置</button>
           <button class="nav-tab" type="button" data-view="cluster-config">集群配置</button>
@@ -73,9 +75,9 @@
             <div class="field-label">置信度</div>
             <div class="segmented" data-filter-group="confidence">
               <button class="active" type="button" data-value="">全部</button>
-              <button type="button" data-value="high">High</button>
-              <button type="button" data-value="medium">Medium</button>
-              <button type="button" data-value="low">Low</button>
+              <button type="button" data-value="high" title="72–100 分">高</button>
+              <button type="button" data-value="medium" title="45–小于72 分">中</button>
+              <button type="button" data-value="low" title="0–小于45 分">低</button>
             </div>
           </div>
 
@@ -147,6 +149,9 @@
             </section>
           </div>
 
+          <div id="effects-view" class="view-panel" aria-label="调配成效"></div>
+          <div id="accuracy-view" class="view-panel" aria-label="预测准确性"></div>
+
           <div id="updates-view" class="view-panel">
             <section class="empty-state">
               <h2>数据更新</h2>
@@ -195,7 +200,7 @@
               <div class="config-head">
                 <div>
                   <h2>系统配置</h2>
-                  <p>管理数据采集、预测和扩缩容策略，保存后立即生效。</p>
+                  <p>管理数据采集、预测和扩缩容策略。</p>
                 </div>
                 <button id="system-config-save" class="primary-btn" type="button">保存系统配置</button>
               </div>
@@ -206,7 +211,7 @@
               </div>
 
               <div class="config-section config-section-runtime">
-                <div class="config-section-head"><div><h3>预测配置</h3><p>分别设置 VM 与 K8S 的验证/未来窗口和候选模型。</p></div></div>
+                <div class="config-section-head"><div><h3>预测配置</h3><p>设置预测窗口、候选模型和并行方式。保存后从下一批预测生效，当前批次配置保持一致。</p></div></div>
                 <div id="prediction-config-list" class="config-list"></div>
               </div>
 
@@ -364,6 +369,8 @@
     <script src="{{ url_for('static', filename='js/feedback.js') }}"></script>
     <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
     <script src="{{ url_for('static', filename='js/scaling.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/scaling-effects.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/forecast-accuracy.js') }}"></script>
     <script src="{{ url_for('static', filename='js/index.js') }}"></script>
   </body>
 </html>

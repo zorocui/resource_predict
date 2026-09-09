@@ -190,9 +190,11 @@ flowchart TB
 Provider（mock / real / Prometheus）
   -> build_prepared_data()          [pipeline/prepare.py]
   -> write_raw_resource_dataset()   [data/raw_store.py -> raw_index.json + raw/]
-  -> resolve_parallel_plan()        [pipeline/plan.py - ThreadPoolExecutor 调度]
-  -> worker() per resource          [pipeline/worker.py]
+  -> resolve_execution_plan()       [pipeline/plan.py - CPU配额/后端选择]
+  -> iter_metric_inputs()           [pipeline/worker.py - 聚合/容器指标统一拆分]
+  -> execute_metric_jobs()          [pipeline/parallel.py - 有界spawn进程/线程池]
       -> fit_one_metric()           [pipeline/fit.py - 全部活跃模型]
+  -> worker(precomputed=...)        [pipeline/worker.py - 父进程按资源组装]
       -> model_selection            [pipeline/model_selection.py - 最优选择]
       -> build_scaling_advice()     [core/decision.py]
       -> build_k8s_workload_advice()[core/k8s_workload_decision.py]
@@ -221,7 +223,7 @@ Prometheus range window
 
 前端仍执行防御性边界检查：只绘制严格晚于 `test_end_ms` 的未来点，黄色预测区域从最后测试点开始，到最后一个有效未来点结束，与当前时间无关。历史线和测试线在大缺口处插入空点并保持 `connectNulls=false`，避免跨越采集中断直接连线。
 
-`WorkerContext`（`pipeline/_types.py`）是传递给每个 worker 的只读上下文。`FitResult` 是每个指标的返回结构。管线使用 `concurrent.futures.ThreadPoolExecutor` 进行资源级并行，可选的指标级内部并行由 `resolve_parallel_plan()` 控制。
+`WorkerContext`（`pipeline/_types.py`）与冻结Settings每个进程初始化一次，单任务只发送当前指标序列。auto对ARIMA/SARIMA/Prophet使用spawn进程池，轻量模型使用线程；最多2×workers个任务在途。容器也进入统一队列，父进程保持原有输出顺序与建议。配置和基准见 [parallel-prediction.md](parallel-prediction.md)。
 
 ## 产物隔离
 
@@ -306,6 +308,8 @@ sequenceDiagram
 
 ### 预测引擎（`core/forecasting.py`）
 
+预测准确性页面由 `services/forecast_accuracy.py` 提供只读SQL统计与流式证据，`accuracy_exports.py` 冻结完整报告ZIP，`api/forecast_accuracy.py` 暴露查询和导出。独立测试在现有worker结果上留档，不重复训练；兑现评估复用真实观测账本，两个来源不混合。详见 [forecast-accuracy.md](forecast-accuracy.md)。
+
 | 方法 | 说明 |
 | --- | --- |
 | ARIMA | 自动阶数选择（AIC 最小），线性趋势，收敛重试 |
@@ -371,6 +375,8 @@ sequenceDiagram
 
 ### 调配执行（`services/scaling/`）
 
+真实执行在首条远程命令前通过 `effects.py` 冻结成效事件；命令成功后由raw提交的新鲜 `scaling_evidence` 确认实际生效并评估窗口。`effect_metrics.py` 负责时间加权统计，`effect_reports.py` 负责SQL聚合和分页，`api/scaling_effects.py` 提供只读页面数据及导出。该链路不修改执行门控，也不以成功快照或预测值冒充实测。详见 [scaling-effects.md](scaling-effects.md)。
+
 - **OpenStack VM**：自动发现可用 flavor -> 选择/生成目标 flavor -> `openstack server resize` -> 可选自动/手动 confirm
 - **K8S Workload**：`kubectl set resources` 按容器粒度 -> `kubectl scale` 调整副本数
 - **执行前置校验**：`execute` 模式在任务入队前调用 `_execution_gate_failures()`。默认建议执行必须满足 `action_gate=ready`、`confidence=high` 且分数达标、数据质量良好、未处于冷却期、策略层级有效；人工复核建议（`target_source=confirmed`）只跳过 `action_gate`，仍保留其他门控；手动 `target_spec` 不要求建议 `action_gate` / `confidence`，但仍需通过策略层级、数据质量、冷却期和 K8S 目标策略校验
@@ -379,225 +385,58 @@ sequenceDiagram
 
 `build_scaling_plan()`（`executor.py`）生成包含 shell 命令的 `ScalingPlan` dataclass。`command_runner.py` 通过 SSH 执行命令。`openstack_flavors.py` 从控制节点查询可用 flavor 以选择调整目标；如无合适 flavor，`allow_create_flavor=True` 启用自动创建。
 
-### 紧急度评分（`services/urgency.py`）
+### 紧急度评分（`services/urgency.py`，v2）
 
-`compute_urgency_score()` 为每个资源计算一个综合紧急度分数，用于资源列表的默认排序。`compute_urgency_breakdown()` 返回同一套计算的分项，API 会把它作为 `urgency_breakdown` 返回给前端，风险列表的“紧急度 i”使用中文公式串展示，例如：
+紧急度是固定范围 `0..100` 的规则排序分，不是故障概率或预计耗尽时间。扩容的 `kind=capacity_risk` 表示容量风险；缩容的 `kind=savings` 表示节省机会。两类分数不具有相同的业务损失含义，查看资源时应同时关注动作类型。
 
-```text
-紧急度150 = 基础动作分35 + 置信度加成6 + 风险分贡献12.4 + 最强指标贡献72.1 + 其他指标贡献8.5 + 多指标加成4 + 目标变化分12
-```
+`compute_urgency_breakdown()` 返回 `version=2`、`score_max=100`、`score`、`level`、`kind`、`components` 和 `metric_scores`。列表、单资源详情和批量详情 API 使用相同计算；后端分解直接用于前端说明。
 
-总分公式：
+定义 `clip(x)=max(0,min(1,x))`，阈值取当前策略层级的 `policy_thresholds`（VM 磁盘使用专用扩容/峰值阈值）。仅计算与资源主动作同方向、具有有效统计的指标。
 
 ```text
-紧急度 = 基础动作分
-       + 置信度加成
-       + 风险分贡献
-       + 最强指标贡献
-       + 其他指标贡献
-       + 多指标加成
-       + 混合信号加成
-       + 目标变化分
-       + 仅分析折扣/封顶
+P = clip((P95 - 扩容阈值) / max(1 - 扩容阈值, 0.001))
+K = clip((峰值 - 峰值保护阈值) / max(1 - 峰值保护阈值, 0.001))
+容量风险 = 40 × I(P95或峰值触及对应阈值) + 60 × max(P, 0.75 × K)
+
+H = min(clip((缩容均值阈值 - 均值) / 缩容均值阈值),
+        clip((缩容P95阈值 - P95) / 缩容P95阈值))
+节省机会 = 60 × H + 25 × clip(持续低负载比例) + 15 × 回收比例
 ```
 
-分项含义：
+分母最小值统一保护为 `0.001`。P95 与峰值取最大，峰值折减；不再叠加均值、风险画像、置信度、多指标数量或执行就绪等重复贡献。仅分析、冷却、不能执行都不降低容量风险分。饱和及超饱和最多 100 分，不再区分超过上限的幅度。
 
-- **基础动作分**：扩容类动作（`scale_out` / `scale_out_candidate`）为 35，缩容类动作（`scale_in` / `scale_in_candidate`）为 18，`hold` 为 0，`insufficient_data` 固定为 1。
-- **置信度加成**：high +6、medium +3、low +1。
-- **风险分贡献**：读取 `risk_profile.risk_score`，按 `risk_score * 0.2` 计分，最高 +20。
-- **最强指标贡献**：逐指标计算压力/空闲信号分，取最大值。扩容指标综合 P95 超阈值、峰值超阈值、均值超阈值、上升趋势和峰谷差；缩容指标综合均值低于阈值、P95 低于缩容保护阈值、下降趋势和稳定性。
-- **其他指标贡献**：除最强指标外，其余指标贡献之和乘以 0.25，避免多个弱信号把排序过度抬高。
-- **多指标加成**：触发扩缩容信号的指标数超过 1 个时，每多一个指标 +4。
-- **混合信号加成**：`has_mixed_signals=true` 时 +4，用于提示同一资源存在扩缩方向冲突。
-- **目标变化分**：当前规格与 `target_spec` 的变化幅度，最高 +18；K8S 的 `replicas` 变化也纳入该项。
-- **仅分析折扣/封顶**：K8S 建议若是 `analysis_only` 且目标策略未 ready，会先乘以 0.35，再按动作封顶；扩容类最高 35，缩容类最高 25。
+VM 使用 CPU、内存、磁盘；K8S 仅 CPU、内存。新 K8S 建议优先使用 `container_advice` 中各容器的统计，避免低 Workload 平均值掩盖单容器热点；旧产物没有容器建议时用原有 Workload 统计。资源分数取相关指标/容器的最大值，`components` 是该最强项的真实加减项，`metric_scores` 保留各项及容器名。
 
-`urgency_breakdown.metric_scores` 会保留每个指标的原始贡献值。前端 tooltip 中的“指标贡献”展示的是这些原始单项分；总分只直接使用其中最高的一项，其他项进入“其他指标贡献（0.25 倍）”。
+回收比例按规格同一维度的 `clip(1 - 目标总量/当前总量)` 计算，再取各维度最大值，不把 CPU 与内存相加，也不代表金额收益。K8S 当前规格仅从 `spec.containers` 读取，将每个容器目标与副本变化共同计算；未调整容器沿用当前规格，缺失或无效维度不贡献回收分，不额外保存 Workload 当前汇总规格。扩大副本抵消容器缩小时，回收比例随之下降。
 
-#### 紧急度指标贡献
+默认等级：低 `<40`，中 `40–<70`，高 `70–<90`，`>=90` 的容量风险为“紧急”、节省机会为“极高”。`hold` 为“无需调整”；数据不足、缺失/非有限统计为“待评估”，排序值为 0，不能理解为低风险。这些是尚未经生产历史回放校准的工程默认值，不是 SLA。页面显示类别、中文等级及 `/100`，旧版排序分不会冒充百分制。
 
-紧急度里的“指标贡献”用于排序优先级，和置信度章节中的“指标得分”不是同一套权重。它只对触发扩缩容动作的指标计算；`hold` 指标不会进入 `urgency_breakdown.metric_scores`。
+### 置信度评分（v2）
 
-参与紧急度计算的指标按资源类型过滤：OpenStack VM 使用 CPU、内存和磁盘；K8S Workload 仅使用 CPU 和内存。K8S 旧产物或异常输入中即使残留 `disk` 统计、动作或目标规格，磁盘也不会进入指标贡献、多指标加成或目标变化分。
+置信度保留 `0..100` 范围与门控阈值：低 `<45`，中 `45–<72`，高 `>=72`。这是扩缩容证据的规则评分，仍未引入历史实测误差或区间覆盖率的概率校准；82 分不表示预测正确率 82%。
 
-扩容类指标贡献：
+每项指标首先计算有界信号分。VM 与 K8S 均使用当前策略层级阈值，VM 磁盘使用对应专用阈值；K8S 扩容基于 limit，缩容基于 request。
 
 ```text
-指标贡献 = 32 * P95超阈值强度
-        + 22 * 峰值超阈值强度
-        + 12 * 均值超阈值强度
-        + 6  * 上升趋势压力
-        + 4  * 峰谷差压力
+VM扩容 = 42×P95强度 + 20×峰值强度 + 14×均值强度
+       + 16×持续高负载比例 + 8×上升趋势 + 超100%强度奖励 - 尖峰惩罚
+K8S扩容 = 42×P95强度 + 20×峰值强度 + 14×均值强度
+        + 16×持续高负载比例 + 8×上升趋势 - 尖峰惩罚
+VM缩容 = 28×均值空闲 + 26×P95空闲 + 24×持续低负载比例
+       + 10×下降趋势 + 12×稳定性 + 连续低负载奖励 - 上升趋势惩罚
+K8S缩容 = 34×均值空闲 + 30×P95空闲 + 18×持续低负载比例
+        + 10×下降趋势 + 8×稳定性 - 上升趋势惩罚
 ```
 
-- `P95超阈值强度 = above(p95, scale_out_threshold)`。
-- `峰值超阈值强度 = above(peak, peak_guard_threshold)`。
-- `均值超阈值强度 = above(avg, scale_out_threshold)`。
-- `上升趋势压力` 最多 2 分量：`slope` 大于 0 时按 `uptrend_slope_threshold` 归一化，`window_mean_delta` 大于 0 时按 `window_mean_delta_threshold` 归一化，两项相加后最高为 2。
-- `峰谷差压力 = min(1, gap / peak_valley_gap_threshold)`。
+强度按超阈值距离归一化并裁剪；空闲按低于阈值的比例归一化。趋势是斜率和窗口均值变化的归一化平均，稳定性按峰谷差折减。VM 超100%强度奖励最多8分，连续低负载奖励最多8分；尖峰惩罚最多18分，上升趋势惩罚最多12分。持续高负载分直接取 `high_ratio`，不再以 P95 强度替代持续性。
 
-缩容类指标贡献：
+资源级汇总：
 
-```text
-指标贡献 = 20 * 均值空闲强度
-        + 16 * P95空闲强度
-        + 5  * 下降趋势压力
-        + 4  * 稳定性
-```
+- 扩容仅取同方向最强指标证据；缩容取同方向最弱指标证据。多容器同一指标也按此规则汇总，不能用缩容高分支持扩容，不再给予多指标数量奖励。
+- K8S 在完成容器合并后统一应用质量调整，同时检查 Workload 与相关容器：存在 poor 扣18，存在 fair 扣8；存在无有效证据的 blocker 扣12；资源或容器缺基线扣6。各类扣分各应用一次，不因执行就绪增加分数。
+- 容器之间同指标反向也属于混合信号。混合信号扣8并封顶71，防止相互矛盾的建议达到高置信度执行门槛。
+- 非 hold 建议历史不足5天，继续封顶71。最终裁剪至 `0..100`；无有效动作证据基础分为0，空 K8S 预测不能成为高置信度缩容。
 
-- `均值空闲强度 = below(avg, scale_in_threshold)`。
-- `P95空闲强度 = below(p95, scale_in_p95_guard)`。
-- `下降趋势压力` 最多 2 分量：`slope` 小于 0 时按 `downtrend_slope_threshold` 归一化，`window_mean_delta` 小于 0 时按 `window_mean_delta_threshold` 归一化，两项相加后最高为 2。
-- `稳定性 = 1 - min(1, gap / 0.5)`，峰谷差越小，缩容信号越稳定。
+`confidence_metric_scores` 是合并后的未应用资源级扣分的指标分。新增 `confidence_breakdown` 保存 `version=2`、`score_max=100`、`score` 和实际 `components`（包括扣分与封顶修正）。前端直接展示该分解，不再反推最高分/均分公式，也不会用“其他调整”掩盖不一致。
 
-总分中指标贡献的使用方式：
-
-```text
-最强指标贡献 = max(所有指标贡献)
-其他指标贡献 = 0.25 * sum(除最强指标外的指标贡献)
-多指标加成 = 4 * max(0, 触发动作指标数 - 1)
-```
-
-因此 tooltip 中的原始指标贡献可能不会原样相加到紧急度总分。例如 CPU 扩容贡献 28.1、内存扩容贡献 10.4，则总分里会计入 `最强指标贡献28.1 + 其他指标贡献2.6`。
-
-### 置信度评分
-
-置信度用于判断建议可靠程度，也参与执行门控。详情抽屉的“置信度 i”使用中文公式串展示当前资源的资源级置信度，例如：
-
-```text
-置信度76.4 = 最高指标贡献48.1 + 平均指标贡献24.3 + 多指标加成4
-```
-
-#### VM 置信度
-
-VM 先为每个触发动作的指标计算单项置信度：
-
-- 扩容指标：综合 P95 超阈值、峰值超阈值、均值超阈值、持续高负载、上升趋势，并对“只有尖峰但 P95 不强”的情况扣分。
-- 缩容指标：综合均值低于缩容阈值、P95 低于缩容保护阈值、持续低负载、下降趋势、稳定性，并对上升趋势扣分。
-
-VM 单项指标得分会先把各类信号归一化：
-
-```text
-above(x, threshold) = 0                              , x <= threshold
-                    = (x - threshold) / (1-threshold), threshold < x <= 1
-                    = 1 + log1p(x - 1) capped        , x > 1
-
-below(x, threshold) = clamp((threshold - x) / threshold, 0, 1)
-
-trend_up   = 0.5 * slope_up_ratio   + 0.5 * window_delta_up_ratio
-trend_down = 0.5 * slope_down_ratio + 0.5 * window_delta_down_ratio
-```
-
-VM 扩容指标得分：
-
-```text
-指标得分 = 42 * min(1, P95超阈值强度)
-        + 20 * min(1, 峰值超阈值强度)
-        + 14 * min(1, 均值超阈值强度)
-        + 16 * 持续高负载强度
-        + 8  * 上升趋势强度
-        + 8  * max(0, P95超阈值强度 - 1)
-        - 尖峰惩罚
-```
-
-- `P95超阈值强度 = above(p95, scale_out_threshold)`。
-- `峰值超阈值强度 = above(peak, peak_guard_threshold)`。
-- `均值超阈值强度 = above(avg, scale_out_threshold)`。
-- `持续高负载强度 = max(high_ratio, min(1, P95超阈值强度))`。
-- `尖峰惩罚` 仅在峰值超阈值但 P95 强度很弱时触发，最高扣 18 分，用于降低瞬时尖峰导致的误判。
-
-VM 缩容指标得分：
-
-```text
-指标得分 = 28 * 均值空闲强度
-        + 26 * P95空闲强度
-        + 24 * 持续低负载比例
-        + 10 * 下降趋势强度
-        + 12 * 稳定性
-        + 持续低负载奖励
-        - 上升趋势惩罚
-```
-
-- `均值空闲强度 = below(avg, scale_in_threshold)`。
-- `P95空闲强度 = below(p95, scale_in_p95_guard)`。
-- `稳定性 = 1 - min(1, gap / scale_in_p95_guard)`。
-- `持续低负载奖励 = min(8, 8 * low_streak / 12)`，仅在连续低负载点存在时生效。
-- `上升趋势惩罚 = 12 * trend_up`。
-
-单项指标得分最后会被限制在 `0..100`。
-
-资源级公式：
-
-```text
-置信度 = 最高指标得分 * 0.65
-       + 平均指标得分 * 0.35
-       + 多指标加成
-       - 混合信号扣分
-       + 历史覆盖封顶/其他调整
-```
-
-- **多指标加成**：至少 2 个指标触发动作时 +4。
-- **混合信号扣分**：`has_mixed_signals=true` 时 -8。
-- **历史覆盖封顶**：非 `hold` 建议若历史覆盖不足 5 天，置信度会被封顶到执行阈值以下。
-- 分级：`score >= 72` 为 high，`45 <= score < 72` 为 medium，否则为 low。
-
-#### K8S Workload 置信度
-
-K8S 的单项置信度与 VM 类似，但仅对有 request/limit baseline 且数据质量不是 poor 的指标触发；缺 baseline 的指标会降级为 trend-only 分析，不直接产生可执行扩缩容目标。
-
-K8S 单项指标得分使用 K8S 当前策略阈值（`policy_thresholds(policy_tier)`）计算。扩容基于 limit 使用率，缩容基于 request 使用率。
-
-K8S 扩容指标得分：
-
-```text
-指标得分 = 42 * min(1, P95超阈值强度)
-        + 20 * min(1, 峰值超阈值强度)
-        + 14 * min(1, 均值超阈值强度)
-        + 16 * 持续高负载强度
-        + 8  * 上升趋势强度
-        - 尖峰惩罚
-```
-
-- `P95超阈值强度 = above(p95, scale_out_threshold)`。
-- `峰值超阈值强度 = above(peak, peak_guard_threshold)`。
-- `均值超阈值强度 = above(avg, scale_out_threshold)`。
-- `持续高负载强度 = max(high_ratio, min(1, P95超阈值强度))`。
-- `尖峰惩罚` 最高扣 18 分；K8S 当前实现用固定 `gap / 0.3` 判定尖峰幅度。
-
-K8S 缩容指标得分：
-
-```text
-指标得分 = 34 * 均值空闲强度
-        + 30 * P95空闲强度
-        + 18 * 持续低负载比例
-        + 10 * 下降趋势强度
-        + 8  * 稳定性
-        - 上升趋势惩罚
-```
-
-- `均值空闲强度 = below(avg, scale_in_threshold)`。
-- `P95空闲强度 = below(p95, scale_in_p95_guard)`。
-- `稳定性 = 1 - min(1, gap / scale_in_p95_guard)`。
-- `上升趋势惩罚 = 12 * trend_up`。
-
-K8S 单项指标得分同样限制在 `0..100`。多容器 Workload 会先按 container 计算单项得分，再把相关 container 的最大得分合并到 Workload 级 `confidence_metric_scores`。
-
-资源级公式：
-
-```text
-置信度 = 最高指标得分 * 0.65
-       + 平均指标得分 * 0.35
-       + 多指标加成
-       - 数据质量扣分
-       - 缺 baseline/阻断项扣分
-       + 执行就绪加成
-       + 历史覆盖封顶/其他调整
-```
-
-- **数据质量扣分**：任一相关指标 `poor` 时 -18，任一相关指标 `fair` 时 -8。
-- **阻断项扣分**：存在无法执行的 blocker 时 -12；缺 baseline 且策略未 ready 时还会降低置信度。
-- **container 级合并**：多容器 Workload 会先按 container 生成建议；同一指标有多个 container 信号时，资源级动作优先保留扩容信号，置信度取相关 container 单项分的最大值。
-- **执行就绪加成**：`target_k8s_policy.ready_for_execution=true` 时 +4。
-- **历史覆盖封顶**：非 `hold` 建议若历史覆盖不足 5 天，置信度会被封顶到执行阈值以下。
-- 分级同 VM：`score >= 72` 为 high，`45 <= score < 72` 为 medium，否则为 low。
+这些修复不取代执行门控：action_gate、confidence、data_quality、cooldown、policy_tier 与 K8S 目标策略检查继续生效。旧预测产物保留旧置信度，不自动重写预测或执行目标；重新预测后生成新版分数与分解。紧急度在 API 读取时按新版规则计算。

@@ -12,21 +12,22 @@
   };
 
   const CONFIDENCE_LABELS = {
-    high: "High",
-    medium: "Medium",
-    low: "Low",
+    high: "高",
+    medium: "中",
+    low: "低",
+    unknown: "待评估",
   };
 
   const URGENCY_HELP = [
-    "紧急度用于风险队列排序，分数越高越优先处理。",
-    "计算口径：基础动作分 + 置信度加成 + 风险分贡献 + 指标压力/空闲信号 + 多指标加成 + 混合信号加成 + 目标规格变化分。",
-    "风险分最多贡献 20 分；混合信号会额外加 4 分；目标规格变化越大，排序越靠前。",
+    "紧急度是规则评分，不是故障概率，也不预测耗尽时间。容量风险与节省机会分别解释。",
+    "默认等级：低 <40，中 40–<70，高 70–<90；容量风险 ≥90 为紧急，节省机会 ≥90 为极高节省机会。",
+    "等级阈值未经生产回放校准。相关指标取最高分，不累加。",
   ].join("\n");
 
   const CONFIDENCE_HELP = [
-    "置信度表示当前扩缩容信号的可靠程度。",
-    "VM：综合 P95、峰值、平均值、持续高/低负载比例、趋势和尖峰惩罚；多指标一致会加分，混合信号会扣 8 分。",
-    "K8S：还会考虑数据质量、是否缺少 request/limit 基线，以及是否能生成目标策略。",
+    "置信度是信号可靠程度的规则评分，不是预测正确的概率。",
+    "等级：低 <45，中 45–<72，高 ≥72。",
+    "具体加减项以本次后端分解为准；执行权限不加分。",
   ].join("\n");
 
   function escapeHtml(value) {
@@ -42,33 +43,64 @@
     return `<span class="info-tooltip" role="img" aria-label="${escapeHtml(label)}">i<span class="tooltip-bubble" aria-hidden="true">${escapeHtml(text)}</span></span>`;
   }
 
-  function urgencyTooltip(item) {
+  function scoreValue(value) {
+    if (value == null || typeof value === "boolean" || String(value).trim() === "") return null;
+    const score = Number(value);
+    return Number.isFinite(score) ? score : null;
+  }
+
+  function urgencyText(item) {
     const breakdown = item?.urgency_breakdown;
-    if (!breakdown || typeof breakdown !== "object") return URGENCY_HELP;
+    const score = scoreValue(breakdown?.version === 2 ? breakdown.score : (breakdown?.score ?? item?.urgency_score));
+    if (breakdown?.version !== 2) return `旧版排序分 · ${score === null ? "待评估" : formatNumber(score, 1)}`;
+    if (score === null || breakdown.kind === "unknown" || breakdown.level === "unknown") return "待评估";
+    const value = `${formatNumber(score, 1)}/100`;
+    if (breakdown.kind === "none" || breakdown.level === "none") return `无需调整 · ${value}`;
+    const savings = breakdown.kind === "savings";
+    const level = score >= 90 ? (savings ? "极高" : "紧急") : score >= 70 ? "高" : score >= 40 ? "中" : "低";
+    return `${savings ? "节省机会" : "容量风险"} ${level} · ${value}`;
+  }
+
+  function confidenceText(item) {
+    const score = scoreValue(item?.scaling_advice?.confidence_score);
+    const level = confidenceOf(item);
+    return `${CONFIDENCE_LABELS[level]}${level === "unknown" ? "" : ` · ${formatNumber(score, 1)}/100`}`;
+  }
+
+  function breakdownFormula(breakdown) {
     const components = Array.isArray(breakdown.components) ? breakdown.components : [];
     const parts = components
-      .filter((part) => part && typeof part === "object" && Number.isFinite(Number(part.value)))
+      .filter((part) => part && typeof part === "object" && scoreValue(part.value) !== null)
       .map((part) => ({ label: String(part.label || ""), value: Number(part.value) }));
-    const score = Number(breakdown.score ?? item?.urgency_score ?? 0);
     const formulaTerms = parts.map((part, index) => {
       const value = Math.abs(part.value);
       const signedText = `${part.label}${formatNumber(value, 1)}`;
       if (index === 0) return part.value < 0 ? `-${signedText}` : signedText;
       return `${part.value < 0 ? "-" : "+"} ${signedText}`;
     });
-    const formula = formulaTerms.length
-      ? `紧急度${formatNumber(score, 1)} = ${formulaTerms.join(" ")}`
-      : `紧急度${formatNumber(score, 1)}`;
-    const lines = [formula];
+    return formulaTerms.length ? `后端分解：${formulaTerms.join(" ")}` : "缺少评分分解。";
+  }
+
+  function confidenceTooltip(item) {
+    const breakdown = item?.scaling_advice?.confidence_breakdown;
+    return [confidenceText(item), CONFIDENCE_HELP,
+      breakdown?.version === 2 ? breakdownFormula(breakdown) : "缺少新版评分分解，无法解释本次实际加减项。",
+    ].join("\n");
+  }
+
+  function urgencyTooltip(item) {
+    const breakdown = item?.urgency_breakdown;
+    if (breakdown?.version !== 2) return `${urgencyText(item)}\n旧版排序分不是百分制，不能套用新版等级。`;
+    const lines = [urgencyText(item), URGENCY_HELP, breakdownFormula(breakdown)];
     const metricScores = Array.isArray(breakdown.metric_scores) ? breakdown.metric_scores : [];
     if (metricScores.length) {
-      lines.push("指标贡献:");
+      lines.push("相关指标评分（取最高值）:");
       metricScores.forEach((part) => {
         if (!part || typeof part !== "object") return;
-        const value = Number(part.value);
-        if (!Number.isFinite(value)) return;
+        const value = scoreValue(part.value);
+        if (value === null) return;
         const metric = app.metricTitleMap[part.metric] || part.metric;
-        lines.push(`  ${metric} ${actionLabel(part.action)}: +${formatNumber(value, 1)}`);
+        lines.push(`  ${part.container ? `${part.container} · ` : ""}${metric} ${actionLabel(part.action)}: ${formatNumber(value, 1)}`);
       });
     }
     return lines.join("\n");
@@ -100,7 +132,8 @@
   }
 
   function confidenceOf(item) {
-    return String(item?.scaling_advice?.confidence || "medium").toLowerCase();
+    const score = scoreValue(item?.scaling_advice?.confidence_score);
+    return score === null || score < 0 || score > 100 ? "unknown" : score >= 72 ? "high" : score >= 45 ? "medium" : "low";
   }
 
   function metricKeysFor(item) {
@@ -941,9 +974,9 @@
         <span class="row-side">
           <span class="score-block">
             <span class="score-label">紧急度 ${infoTooltip(urgencyTooltip(item), "紧急度计算说明")}</span>
-            <span class="score">${formatNumber(item.urgency_score || 0, 1)}</span>
+            <span class="score">${escapeHtml(urgencyText(item))}</span>
           </span>
-          <span class="confidence-chip is-${escapeHtml(confidence)}">${escapeHtml(CONFIDENCE_LABELS[confidence] || confidence)}</span>
+          <span class="confidence-chip is-${escapeHtml(confidence)}">置信度 ${escapeHtml(confidenceText(item))} ${infoTooltip(confidenceTooltip(item), "置信度计算说明")}</span>
           <span class="target-text" title="${escapeHtml(targetSpecText(item))}">${escapeHtml(targetSpecListText(item))}</span>
         </span>`;
       root.appendChild(node);
@@ -1009,6 +1042,10 @@
     actionOf,
     applyClientFilters,
     confidenceOf,
+    confidenceText,
+    confidenceTooltip,
+    urgencyText,
+    urgencyTooltip,
     escapeHtml,
     formatNumber,
     formatStatValue,

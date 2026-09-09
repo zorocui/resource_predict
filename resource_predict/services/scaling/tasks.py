@@ -436,6 +436,8 @@ def _run_task(task_id: str, resource: Dict[str, Any]) -> None:
                 calibrated_failure = calibrated_execution_failure(resource)
                 if calibrated_failure:
                     raise RuntimeError(calibrated_failure)
+            if idx == 1:
+                _capture_effect(task_id, resource, plan)
             _patch_task(
                 task_id,
                 {
@@ -733,8 +735,50 @@ def _patch_task(task_id: str, patch: Dict[str, Any]) -> None:
     for task in tasks:
         if str(task.get("task_id")) == str(task_id):
             task.update(patch)
+            if patch.get("status") in {"success", "failed"} and task.get("mode") == "execute":
+                try:
+                    from resource_predict.pipeline.output_paths import scope_for_resource, scoped_out_dir
+                    from resource_predict.services.scaling.effects import complete_event
+
+                    plan = task.get("plan") or {}
+                    out_base = scoped_out_dir(scope_for_resource({**plan, "resource_id": task.get("resource_id")}), TASKS_PATH.parent)
+                    complete_event(out_base, task_id, success=patch["status"] == "success",
+                                   now_ms=int(patch.get("updated_at_ms") or _now_ms()))
+                except Exception as exc:
+                    task["outcome_capture_error"] = str(exc)
+                    logger.exception("[scaling_effects] task completion capture failed: %s", task_id)
             break
     _write_tasks(tasks)
+
+
+def _capture_effect(task_id: str, resource: Dict[str, Any], plan: Any) -> None:
+    """Freeze baseline before the first real remote command; never use forecasts as evidence."""
+    try:
+        from resource_predict.data.raw_store import RawResourceStore
+        from resource_predict.pipeline.output_paths import scope_for_resource, scoped_out_dir
+        from resource_predict.services.scaling.effects import ingest_evidence, start_event
+        from resource_predict.services.scaling.snapshot import _effective_spec
+
+        out_base = scoped_out_dir(scope_for_resource(resource), TASKS_PATH.parent)
+        start_event(out_base, {"task_id": task_id, "resource_id": plan.resource_id,
+                              "resource_type": plan.resource_type, "mode": "execute"},
+                    resource.get("spec", {}), _effective_spec(plan))
+        raw_store = RawResourceStore(out_base)
+        raw = raw_store.get(plan.resource_id) if raw_store.exists() else None
+        if isinstance(raw, dict):
+            ingest_evidence(out_base, [raw])
+    except Exception as exc:
+        _patch_task(task_id, {"outcome_capture_error": str(exc)})
+        logger.exception("[scaling_effects] baseline capture failed: %s", task_id)
+        try:
+            from resource_predict.services.scaling.effects import capture_failure, start_event
+
+            out_base = TASKS_PATH.parent / ("k8s" if plan.resource_type == "k8s_workload" else "vm")
+            start_event(out_base, {"task_id": task_id, "resource_id": plan.resource_id,
+                                  "resource_type": plan.resource_type, "mode": "execute"}, {}, {})
+            capture_failure(out_base, task_id, str(exc))
+        except Exception:
+            logger.exception("[scaling_effects] cannot persist failed evidence capture: %s", task_id)
 
 
 def _now_ms() -> int:

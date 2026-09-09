@@ -274,5 +274,12 @@ python -m pytest -q
 | [docs/architecture.md](docs/architecture.md) | 目录结构、总体架构、管线流程、数据更新机制、核心模块说明 |
 | [docs/configuration.md](docs/configuration.md) | 部署配置文件详解、全局参数默认值、输出产物结构 |
 | [docs/api-reference.md](docs/api-reference.md) | API 端点详细参数、请求体格式、curl 使用示例 |
+| [docs/scaling-effects.md](docs/scaling-effects.md) | 调配成效口径、前后实测证据、页面与报告导出 |
+| [docs/forecast-accuracy.md](docs/forecast-accuracy.md) | 预测准确性口径、容差达标率、真实兑现与报告快照 |
+| [docs/parallel-prediction.md](docs/parallel-prediction.md) | 万级资源多核配置、任务队列、阶段耗时与吞吐基准 |
 | [docs/development.md](docs/development.md) | 测试策略、代码约定、Provider 接口、安全规范、常见问题 |
 | [docs/innovation.md](docs/innovation.md) | 成果创新性与先进性说明、实测技术指标、与现有技术对比 |
+| [docs/routing-research.md](docs/routing-research.md) | 成本感知路由第一阶段：成对回放协议、运行命令与证据边界 |
+| [docs/routing-offline.md](docs/routing-offline.md) | 内网离线实验包、数据预检与脱敏汇总操作说明 |
+| [docs/routing-confirmation.md](docs/routing-confirmation.md) | 新时间段确认协议：冻结候选、数据范围、判断规则与单文件回传 |
+| [docs/routing-method-audit.md](docs/routing-method-audit.md) | 路由实验方法审计：逐批预算、成本口径、时间边界与修正优先级 |

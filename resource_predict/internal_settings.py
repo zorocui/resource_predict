@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
@@ -52,7 +54,9 @@ class GenerationConfig:
     base_seed: int = 1000
     # 时间序列频率，传给 pandas/预测流程；"h" 表示小时级数据。
     freq: str = "h"
-    # 预测并行工作线程数；None 表示由程序按机器资源自动决定。
+    # 并行后端：auto、process、thread 或 serial。
+    parallel_backend: str = "auto"
+    # 预测并行工作数；None 或 0 表示按机器资源自动决定。
     max_workers: Optional[int] = None
     # details/ 详情分片大小；资源很多时避免单个详情 JSON 过大。
     detail_chunk_size: int = 25
@@ -247,6 +251,7 @@ class Settings:
 
 
 _internal_settings = Settings()
+_settings_snapshot: ContextVar[Optional[Settings]] = ContextVar("settings_snapshot", default=None)
 
 
 class SettingsProxy:
@@ -255,13 +260,48 @@ class SettingsProxy:
     app = _internal_settings.app
     update = _internal_settings.update
 
-    @property
-    def generation(self) -> GenerationConfig:
+    def freeze(self) -> Settings:
+        """Resolve all sections from one atomic runtime snapshot for this batch."""
+        frozen = _settings_snapshot.get()
+        if frozen is not None:
+            return frozen
         from resource_predict.services.runtime_config import runtime_config_store
 
-        cfg = runtime_config_store.snapshot().prediction
+        runtime = runtime_config_store.snapshot()
+        return Settings(
+            app=self.app, update=self.update,
+            generation=self._generation(runtime.prediction),
+            forecast=self._forecast(runtime.prediction),
+            decision=replace(_internal_settings.decision, **runtime.decision.__dict__),
+            k8s_prometheus=self._k8s_prometheus(runtime.collection),
+        )
+
+    @contextmanager
+    def use(self, snapshot: Settings):
+        """Bind an immutable batch snapshot only in the current execution context."""
+        if not isinstance(snapshot, Settings):
+            raise TypeError("snapshot must be Settings")
+        token = _settings_snapshot.set(snapshot)
+        try:
+            yield snapshot
+        finally:
+            _settings_snapshot.reset(token)
+
+    @property
+    def generation(self) -> GenerationConfig:
+        frozen = _settings_snapshot.get()
+        if frozen is not None:
+            return frozen.generation
+        from resource_predict.services.runtime_config import runtime_config_store
+
+        return self._generation(runtime_config_store.snapshot().prediction)
+
+    @staticmethod
+    def _generation(cfg) -> GenerationConfig:
         return replace(
             _internal_settings.generation,
+            parallel_backend=cfg.parallel_backend,
+            max_workers=cfg.max_workers or None,
             vm_test_duration=cfg.vm_test_duration,
             vm_future_duration=cfg.vm_future_duration,
             workload_test_duration=cfg.workload_test_duration,
@@ -270,9 +310,15 @@ class SettingsProxy:
 
     @property
     def forecast(self) -> ForecastConfig:
+        frozen = _settings_snapshot.get()
+        if frozen is not None:
+            return frozen.forecast
         from resource_predict.services.runtime_config import runtime_config_store
 
-        cfg = runtime_config_store.snapshot().prediction
+        return self._forecast(runtime_config_store.snapshot().prediction)
+
+    @staticmethod
+    def _forecast(cfg) -> ForecastConfig:
         return replace(
             _internal_settings.forecast,
             enabled_methods=cfg.enabled_methods,
@@ -281,6 +327,9 @@ class SettingsProxy:
 
     @property
     def decision(self) -> DecisionConfig:
+        frozen = _settings_snapshot.get()
+        if frozen is not None:
+            return frozen.decision
         from resource_predict.services.runtime_config import runtime_config_store
 
         cfg = runtime_config_store.snapshot().decision
@@ -288,9 +337,15 @@ class SettingsProxy:
 
     @property
     def k8s_prometheus(self) -> K8SPrometheusConfig:
+        frozen = _settings_snapshot.get()
+        if frozen is not None:
+            return frozen.k8s_prometheus
         from resource_predict.services.runtime_config import runtime_config_store
 
-        cfg = runtime_config_store.snapshot().collection
+        return self._k8s_prometheus(runtime_config_store.snapshot().collection)
+
+    @staticmethod
+    def _k8s_prometheus(cfg) -> K8SPrometheusConfig:
         return replace(
             _internal_settings.k8s_prometheus,
             scheduled_update_enabled=cfg.scheduled_update_enabled,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Callable, Dict, List
 
 from flask import Flask, jsonify, request
@@ -8,6 +9,7 @@ from resource_predict.resource_types import resource_type_of
 from resource_predict.settings import settings
 from resource_predict.services.urgency import compute_urgency_breakdown
 from resource_predict.services.forecast_feedback import resource_feedback
+from resource_predict.utils import parse_float_or_none
 
 
 def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) -> None:
@@ -57,14 +59,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                 ]
         enriched_rows = []
         for x in rows:
-            urgency = compute_urgency_breakdown(x, settings.decision)
-            enriched_rows.append(
-                {
-                    **x,
-                    "urgency_score": urgency.get("score", 0.0),
-                    "urgency_breakdown": urgency,
-                }
-            )
+            enriched_rows.append(_with_urgency(x))
         rows = enriched_rows
 
         if sort_by == "resource_id":
@@ -132,7 +127,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             "scale_in_candidate": 0,
             "insufficient_data": 0,
         }
-        confidence_counts = {"high": 0, "medium": 0, "low": 0}
+        confidence_counts = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
         resource_type_counts: Dict[str, int] = {}
         best_method_counts: Dict[str, int] = {}
         for item in rows:
@@ -191,7 +186,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             return jsonify({"error": str(exc)}), 400
         if detail is None:
             return jsonify({"error": "resource not found"}), 404
-        return jsonify({"resource": detail})
+        return jsonify({"resource": _with_urgency(detail)})
 
     @app.get("/api/resources/<resource_id>/feedback")
     def api_resource_feedback(resource_id: str):
@@ -249,8 +244,13 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                 history_points=history_points,
             )
             if detail is not None:
-                items.append(detail)
+                items.append(_with_urgency(detail))
         return jsonify({"resources": items})
+
+
+def _with_urgency(item: Dict[str, Any]) -> Dict[str, Any]:
+    urgency = compute_urgency_breakdown(item, settings.decision)
+    return {**item, "urgency_score": urgency["score"], "urgency_breakdown": urgency}
 
 
 def _normalize_resource_type_filter(value: Any) -> str:
@@ -294,13 +294,16 @@ def _optional_int(value: Any, name: str) -> int | None:
 
 def _normalize_confidence_filter(value: Any) -> str:
     raw = str(value or "").strip().lower()
-    return raw if raw in {"high", "medium", "low"} else ""
+    return raw if raw in {"high", "medium", "low", "unknown"} else ""
 
 
 def _confidence_of(item: Dict[str, Any]) -> str:
     advice = item.get("scaling_advice", {}) if isinstance(item, dict) else {}
-    confidence = str((advice or {}).get("confidence", "medium")).lower()
-    return confidence if confidence in {"high", "medium", "low"} else "medium"
+    raw = advice.get("confidence_score") if isinstance(advice, dict) else None
+    score = parse_float_or_none(raw) if not isinstance(raw, bool) else None
+    if score is None or not math.isfinite(score) or not 0 <= score <= 100:
+        return "unknown"
+    return "high" if score >= 72 else "medium" if score >= 45 else "low"
 
 
 def _matches_action_filter(action: str, action_filter: str) -> bool:

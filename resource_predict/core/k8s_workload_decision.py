@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from resource_predict.core.decision import policy_thresholds
+from resource_predict.core.decision import aggregate_confidence, policy_thresholds
 from resource_predict.resource_types import resource_type_of
 from resource_predict.settings import settings
 from resource_predict.utils import (
@@ -434,7 +434,7 @@ def _metric_confidence_k8s(metric_action: str, st: Dict[str, float], th: Dict[st
         p95_strength = _bounded_above(p95, th["scale_out_threshold"])
         peak_strength = _bounded_above(peak, th["peak_guard_threshold"])
         avg_strength = _bounded_above(avg, th["scale_out_threshold"])
-        persistence = max(high_ratio, min(1.0, p95_strength))
+        persistence = max(0.0, min(1.0, high_ratio))
         trend = _trend_support_score(st, direction="up")
         spike_penalty = 0.0
         if peak_strength > 0.0 and p95_strength < 0.15:
@@ -532,6 +532,7 @@ def build_k8s_workload_advice(
     for m in signal_keys:
         vals = np.asarray(metric_future_values.get(m, np.array([])), dtype=float)
         st = compute_metric_stats(vals, extended=True)
+        st["sample_count"] = int(np.count_nonzero(np.isfinite(vals)))
         tr = _trend_features(vals, cfg.trend_window_points)
         st.update(tr)
         high_streak = _max_consecutive(vals, lambda x: x >= float(cfg.consecutive_high_threshold))
@@ -562,9 +563,11 @@ def build_k8s_workload_advice(
         request_quality = _quality_level(resource, request_key)
         has_limit = _metric_limit_base(spec, metric) is not None
         has_request = _metric_request_base(spec, metric) is not None
-        if limit_quality == "poor" and request_quality == "poor":
+        limit_available = st_limit["sample_count"] > 0 and limit_quality != "poor"
+        request_available = st_request["sample_count"] > 0 and request_quality != "poor"
+        if not limit_available and not request_available:
             metric_actions[metric] = "insufficient_data"
-            metric_reasons[metric] = f"{label} data quality is poor; skip execution recommendation"
+            metric_reasons[metric] = f"{label} data quality is poor or forecast is empty; skip execution recommendation"
             blockers.append(metric)
             decision_stats[metric] = st_limit
             continue
@@ -586,7 +589,7 @@ def build_k8s_workload_advice(
             decision_stats[metric] = st_limit
             continue
         # Tier-aware utilization thresholds (shared with VM decision module)
-        if has_limit and limit_quality != "poor" and (
+        if has_limit and limit_available and (
             st_limit["p95"] >= th["scale_out_threshold"] or st_limit["peak"] >= th["peak_guard_threshold"]
         ):
             metric_actions[metric] = "scale_out_candidate"
@@ -595,7 +598,7 @@ def build_k8s_workload_advice(
                 f"peak={st_limit['peak'] * 100:.1f}%)"
             )
             decision_stats[metric] = st_limit
-        elif has_request and request_quality != "poor" and (
+        elif has_request and request_available and (
             st_request["avg"] < th["scale_in_threshold"] and st_request["p95"] < th["scale_in_p95_guard"]
         ):
             # 趋势保护：当前偏低但趋势回升时，暂缓缩容
@@ -650,23 +653,6 @@ def build_k8s_workload_advice(
             score_key = f"{m}_limit" if m_action == "scale_out_candidate" else f"{m}_request"
             metric_confidence_scores[m] = _metric_confidence_k8s(m_action, by_metric[score_key], th)
 
-    if metric_confidence_scores:
-        scores = list(metric_confidence_scores.values())
-        confidence_score = 0.65 * max(scores) + 0.35 * float(np.mean(scores))
-        if len(scores) >= 2:
-            confidence_score += 4.0
-    else:
-        confidence_score = 50.0
-
-    # Quality adjustments
-    quality_levels = [_quality_level(resource, m) for m in signal_keys]
-    if any(x == "poor" for x in quality_levels):
-        confidence_score -= 18.0
-    if any(x == "fair" for x in quality_levels):
-        confidence_score -= 8.0
-    if blockers:
-        confidence_score -= 12.0
-
     target_policy = _recommend_k8s_policy(
         spec=spec,
         by_metric=decision_stats,
@@ -688,7 +674,11 @@ def build_k8s_workload_advice(
             container_advice,
         )
         actions = set(metric_actions.values())
-        has_mixed_signals = "scale_out_candidate" in actions and "scale_in_candidate" in actions
+        container_actions = {
+            a for summary in container_advice.values() for a in summary["metric_actions"].values()
+        }
+        all_actions = actions | container_actions
+        has_mixed_signals = "scale_out_candidate" in all_actions and "scale_in_candidate" in all_actions
         if "scale_out_candidate" in actions:
             action = "scale_out_candidate"
         elif "scale_in_candidate" in actions:
@@ -697,11 +687,6 @@ def build_k8s_workload_advice(
             action = "insufficient_data"
         else:
             action = "hold"
-        if metric_confidence_scores:
-            scores = list(metric_confidence_scores.values())
-            confidence_score = 0.65 * max(scores) + 0.35 * float(np.mean(scores))
-            if len(scores) >= 2:
-                confidence_score += 4.0
     elif _has_multiple_containers(spec) and _has_resource_target_fields(target_spec):
         target_policy.setdefault("notes", []).append(
             "multiple-container workload lacks container-level forecasts; request/limit target is analysis-only"
@@ -711,17 +696,31 @@ def build_k8s_workload_advice(
     # Total capacity coordination: 校验 per_replica * replicas 的总量合理性
     _coordinate_total_capacity(target_policy, target_spec, spec, decision_stats, metric_actions)
 
-    if target_policy.get("ready_for_execution"):
-        confidence_score += 4.0
-    if baseline_missing and not target_policy.get("ready_for_execution"):
-        confidence_score -= 6.0
+    # Apply quality once, after merging raw container evidence. Never reward executability.
+    quality_levels = [_quality_level(resource, m) for m in signal_keys]
+    container_quality = resource.get("container_data_quality", {})
+    if isinstance(container_quality, dict):
+        for name in container_advice:
+            quality_levels.extend(_quality_level({"data_quality": container_quality.get(name)}, m) for m in signal_keys)
+    adjustments: List[Dict[str, Any]] = []
+    if "poor" in quality_levels:
+        adjustments.append({"label": "差数据质量", "value": -18.0})
+    if "fair" in quality_levels:
+        adjustments.append({"label": "一般数据质量", "value": -8.0})
+    if blockers or any(summary.get("blockers") for summary in container_advice.values()):
+        adjustments.append({"label": "指标缺少有效证据", "value": -12.0})
+    if baseline_missing or any(summary.get("baseline_missing") for summary in container_advice.values()):
+        adjustments.append({"label": "缺少规格基线", "value": -6.0})
     history_coverage = resource.get("history_coverage", {})
     history_note = _short_history_note(history_coverage, action)
     if history_note:
-        confidence_score = min(confidence_score, _SHORT_HISTORY_CONFIDENCE_CAP)
         target_policy.setdefault("notes", []).append(history_note)
-    confidence_score = max(0.0, min(100.0, confidence_score))
-    confidence = "high" if confidence_score >= 72 else "medium" if confidence_score >= 45 else "low"
+    confidence_info = aggregate_confidence(
+        metric_actions, metric_confidence_scores, has_mixed_signals=has_mixed_signals,
+        adjustments=adjustments, cap=_SHORT_HISTORY_CONFIDENCE_CAP if history_note else 100.0,
+    )
+    confidence_score = confidence_info["score"]
+    confidence = confidence_info["label"]
 
     if action == "scale_out_candidate":
         required = max(1, int(settings.decision.scale_out_confirmations) - (1 if tier == "conservative" else 0))
@@ -745,6 +744,9 @@ def build_k8s_workload_advice(
         "confidence": confidence,
         "confidence_score": round(confidence_score, 2),
         "confidence_metric_scores": {m: round(s, 2) for m, s in metric_confidence_scores.items()},
+        "confidence_breakdown": confidence_info["breakdown"],
+        "container_advice": container_advice,
+        "baseline_missing": baseline_missing,
         "policy_tier": tier,
         "risk_profile": _risk_profile(
             action=action,
@@ -915,6 +917,9 @@ def _container_targets_from_future_values(
             "metric_actions": advice.get("metric_actions", {}),
             "metric_reasons": advice.get("metric_reasons", {}),
             "confidence_metric_scores": advice.get("confidence_metric_scores", {}),
+            "stats": advice.get("stats", {}),
+            "blockers": [m for m, a in advice.get("metric_actions", {}).items() if a == "insufficient_data"],
+            "baseline_missing": advice.get("baseline_missing", []),
         }
     return targets, policies, summaries
 
@@ -928,7 +933,7 @@ def _merge_container_advice(
     for metric in ("cpu", "memory"):
         actions_by_container: Dict[str, str] = {}
         reasons_by_container: Dict[str, str] = {}
-        scores: List[float] = []
+        scores_by_action: Dict[str, List[float]] = {}
         for name, advice in container_advice.items():
             actions = advice.get("metric_actions", {})
             action = str(actions.get(metric) if isinstance(actions, dict) else "hold")
@@ -944,8 +949,7 @@ def _merge_container_advice(
                 score_value = float(score)
             except (TypeError, ValueError):
                 score_value = float("nan")
-            if np.isfinite(score_value):
-                scores.append(score_value)
+            scores_by_action.setdefault(action, []).append(score_value if np.isfinite(score_value) else 0.0)
         if not actions_by_container:
             continue
         action_values = set(actions_by_container.values())
@@ -961,5 +965,8 @@ def _merge_container_advice(
             metric_reasons[metric] = "; ".join(labels)
         elif action_values:
             metric_reasons[metric] = "container-level forecast recommends adjustment"
-        if scores:
-            metric_confidence_scores[metric] = max(scores)
+        scores = scores_by_action.get(metric_actions[metric], [])
+        metric_confidence_scores[metric] = (
+            (max(scores) if metric_actions[metric] == "scale_out_candidate" else min(scores))
+            if scores else 0.0
+        )

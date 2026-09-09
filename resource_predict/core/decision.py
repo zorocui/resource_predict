@@ -34,8 +34,8 @@ _METRIC_TO_DIM = {
 }
 
 
-def policy_thresholds(tier: str) -> Dict[str, float]:
-    cfg = settings.decision
+def policy_thresholds(tier: str, cfg: Any = None) -> Dict[str, float]:
+    cfg = settings.decision if cfg is None else cfg
     out = float(cfg.scale_out_threshold)
     in_avg = float(cfg.scale_in_threshold)
     in_p95 = float(cfg.scale_in_p95_guard)
@@ -445,9 +445,10 @@ def _trend_support_score(st: Dict[str, float], *, direction: str) -> float:
     return 0.5 * slope_part + 0.5 * delta_part
 
 
-def _metric_confidence_score(metric_action: str, st: Dict[str, float]) -> float:
+def _metric_confidence_score(metric_action: str, st: Dict[str, float], thresholds: Optional[Dict[str, float]] = None) -> float:
     """Return a 0..100 reliability score for one metric's scaling signal."""
     cfg = settings.decision
+    th = thresholds if thresholds is not None else policy_thresholds("balanced")
     avg = float(st.get("avg", 0.0))
     p95 = float(st.get("p95", 0.0))
     peak = float(st.get("peak", 0.0))
@@ -456,10 +457,10 @@ def _metric_confidence_score(metric_action: str, st: Dict[str, float]) -> float:
     low_ratio = float(st.get("low_ratio", 0.0))
 
     if metric_action == "scale_out":
-        p95_strength = _bounded_above(p95, float(cfg.scale_out_threshold))
-        peak_strength = _bounded_above(peak, float(cfg.peak_guard_threshold))
-        avg_strength = _bounded_above(avg, float(cfg.scale_out_threshold))
-        persistence = max(high_ratio, min(1.0, p95_strength))
+        p95_strength = _bounded_above(p95, th["scale_out_threshold"])
+        peak_strength = _bounded_above(peak, th["peak_guard_threshold"])
+        avg_strength = _bounded_above(avg, th["scale_out_threshold"])
+        persistence = max(0.0, min(1.0, high_ratio))
         trend = _trend_support_score(st, direction="up")
         spike_penalty = 0.0
         if peak_strength > 0.0 and p95_strength < 0.15:
@@ -476,10 +477,10 @@ def _metric_confidence_score(metric_action: str, st: Dict[str, float]) -> float:
         return max(0.0, min(100.0, score))
 
     if metric_action == "scale_in":
-        avg_headroom = _bounded_below(avg, float(cfg.scale_in_threshold))
-        p95_headroom = _bounded_below(p95, float(cfg.scale_in_p95_guard))
+        avg_headroom = _bounded_below(avg, th["scale_in_threshold"])
+        p95_headroom = _bounded_below(p95, th["scale_in_p95_guard"])
         trend = _trend_support_score(st, direction="down")
-        stability = 1.0 - min(1.0, gap / max(float(cfg.scale_in_p95_guard), 0.001))
+        stability = 1.0 - min(1.0, gap / max(th["scale_in_p95_guard"], 0.001))
         uptrend_penalty = 12.0 * _trend_support_score(st, direction="up")
         # 持续性奖励：如果全部预测点都低于 scale_in_p95_guard，额外加分
         low_streak = float(st.get("low_streak", 0))
@@ -503,36 +504,58 @@ def _overall_confidence(
     by_metric: Dict[str, Dict[str, float]],
     *,
     has_mixed_signals: bool,
+    thresholds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, object]:
-    scores = [
-        _metric_confidence_score(metric_actions[m], by_metric[m])
-        for m in ("cpu", "memory", "disk")
-        if metric_actions.get(m) in {"scale_out", "scale_in"}
-    ]
-    if not scores:
-        return {"label": "medium", "score": 50.0, "metric_scores": {}}
-
-    primary = max(scores)
-    avg = float(np.mean(scores))
-    score = 0.65 * primary + 0.35 * avg
-    if len(scores) >= 2:
-        score += 4.0
-    if has_mixed_signals:
-        score -= 8.0
-    score = max(0.0, min(100.0, score))
-
-    if score >= 72.0:
-        label = "high"
-    elif score >= 45.0:
-        label = "medium"
-    else:
-        label = "low"
+    thresholds = thresholds if thresholds is not None else policy_thresholds("balanced")
     metric_scores = {
-        m: round(_metric_confidence_score(metric_actions[m], by_metric[m]), 2)
+        m: round(_metric_confidence_score(metric_actions[m], by_metric[m], {
+            **thresholds,
+            "scale_out_threshold": thresholds["disk_scale_out_threshold"] if m == "disk" else thresholds["scale_out_threshold"],
+            "peak_guard_threshold": thresholds["disk_peak_guard_threshold"] if m == "disk" else thresholds["peak_guard_threshold"],
+        }), 2)
         for m in ("cpu", "memory", "disk")
         if metric_actions.get(m) in {"scale_out", "scale_in"}
     }
-    return {"label": label, "score": round(score, 2), "metric_scores": metric_scores}
+    result = aggregate_confidence(metric_actions, metric_scores, has_mixed_signals=has_mixed_signals)
+    return {**result, "metric_scores": metric_scores}
+
+
+def aggregate_confidence(
+    metric_actions: Dict[str, str],
+    metric_scores: Dict[str, float],
+    *,
+    has_mixed_signals: bool,
+    adjustments: Optional[List[Dict[str, Any]]] = None,
+    cap: float = 100.0,
+) -> Dict[str, Any]:
+    """Rule evidence score, never a calibrated probability or execution permission."""
+    expanding = any(a in {"scale_out", "scale_out_candidate"} for a in metric_actions.values())
+    direction = {"scale_out", "scale_out_candidate"} if expanding else {"scale_in", "scale_in_candidate"}
+    scores = [
+        max(0.0, min(100.0, float(value)))
+        for metric, value in metric_scores.items()
+        if metric_actions.get(metric) in direction and math.isfinite(float(value))
+    ]
+    score = (max(scores) if expanding else min(scores)) if scores else 0.0
+    label = "同方向最强扩容证据" if expanding else "最弱缩容证据"
+    components = [{"label": label if scores else "无有效动作证据", "value": round(score, 2)}]
+    for adjustment in adjustments or []:
+        value = float(adjustment["value"])
+        score += value
+        components.append({"label": adjustment["label"], "value": value})
+    if has_mixed_signals:
+        score -= 8.0
+        components.append({"label": "混合信号扣分", "value": -8.0})
+        cap = min(cap, 71.0)
+    bounded = round(max(0.0, min(cap, score)), 2)
+    correction = round(bounded - sum(float(c["value"]) for c in components), 2)
+    if correction:
+        components.append({"label": "混合信号/短历史封顶及范围限制", "value": correction})
+    return {
+        "label": "high" if bounded >= 72 else "medium" if bounded >= 45 else "low",
+        "score": bounded,
+        "breakdown": {"version": 2, "score_max": 100, "score": bounded, "components": components},
+    }
 
 
 def _short_history_note(history_coverage: Optional[Dict[str, Any]], action: str) -> str:
@@ -658,13 +681,19 @@ def build_scaling_advice(
         metric_actions,
         by_metric,
         has_mixed_signals=has_mixed,
+        thresholds=tier_thresholds,
     )
     confidence = str(confidence_info["label"])
     confidence_score = float(confidence_info["score"])
     history_note = _short_history_note(history_coverage, action)
     if history_note:
+        previous_score = confidence_score
         confidence_score = min(confidence_score, _SHORT_HISTORY_CONFIDENCE_CAP)
         confidence = "medium" if confidence_score >= 45 else "low"
+        confidence_info["breakdown"]["components"].append(
+            {"label": "短历史封顶", "value": round(confidence_score - previous_score, 2)}
+        )
+        confidence_info["breakdown"]["score"] = confidence_score
         reason = f"{reason}；{history_note}"
     risk_profile = _risk_profile(
         action,
@@ -681,6 +710,7 @@ def build_scaling_advice(
         "confidence": confidence,
         "confidence_score": confidence_score,
         "confidence_metric_scores": confidence_info["metric_scores"],
+        "confidence_breakdown": confidence_info["breakdown"],
         "policy_tier": policy_tier,
         "risk_profile": risk_profile,
         "action_gate": action_gate,

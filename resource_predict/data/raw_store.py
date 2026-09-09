@@ -226,6 +226,11 @@ def write_raw_resource_dataset(
     try_score_realized_forecasts(base, (
         item for rid, item in prepared_by_id.items() if changed is None or rid in changed
     ), publish_report=False)
+    from resource_predict.services.scaling.effects import try_ingest_evidence
+
+    try_ingest_evidence(base, (
+        item for rid, item in prepared_by_id.items() if changed is None or rid in changed
+    ))
     return {
         "resources": len(new_resources),
         "files_total": len(new_files),

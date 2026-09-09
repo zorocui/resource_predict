@@ -10,6 +10,8 @@
 
 ## 资源查询
 
+预测准确性使用独立接口：`GET /api/forecast-accuracy`、`GET /api/forecast-accuracy/export.csv?kind=summary|points`、`POST /api/forecast-accuracy/snapshots`、`GET /api/forecast-accuracy/snapshots/<id>/download`。支持来源、资源/容器层、指标、模型、提前量和目标时刻筛选；容差达标率与完整率返回0..1，百分点误差已经乘100。快照保存全部筛选证据，默认7天账本清理不影响已保存ZIP。字段、统计和佐证边界见 [forecast-accuracy.md](forecast-accuracy.md)。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/resources` | 资源列表（支持分页、筛选、搜索） |
@@ -22,15 +24,28 @@
 
 ### 列表参数
 
+调配成效使用独立只读接口：`GET /api/scaling-effects`（列表及汇总）、`GET /api/scaling-effects/<task_id>`（单事件）、`GET /api/scaling-effects/export.csv`（筛选范围完整CSV）、`GET /api/scaling-effects/<task_id>/evidence.json`（原始证据包及SHA256）。列表/CSV支持 `resource_type`、`action=scale_in|scale_out|mixed|unknown`、`status`、`q`（资源或任务ID子串）、`from_ms`（调配开始时间含边界）、`to_ms`（不含边界）；列表另支持 `page`、`page_size=1..200`。详情返回 `{schema_version,event,sha256}`；列表返回 `{version,policy,summary,items,total,page,page_size,generated_at_ms}`。未知任务404，非法参数400，账本读取失败503。没有账本时返回真实空列表，不创建示例数据。完整字段、算法和证据契约见 [scaling-effects.md](scaling-effects.md)。
+
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `q` | string | 搜索 resource_id / IP / namespace / workload / node |
 | `action` | string | 筛选动作：`scale_out` / `scale_in` / `hold` / `mixed` / `scale_out_candidate` / `scale_in_candidate` / `insufficient_data` |
 | `resource_type` | string | 筛选类型：`openstack_vm` / `k8s_workload` |
+| `confidence` | string | 按实际分数筛选 `high` / `medium` / `low`；缺失或非法分数为 `unknown` |
 | `sort_by` | string | 排序：`urgency_score`（默认）/ `resource_id` / `anomaly_score` |
 | `page` | int | 页码（从 1 开始） |
 | `page_size` | int | 每页数量（默认 20，最大 200） |
 | `top_n` | int | 返回前 N 条（优先于分页） |
+
+### 评分字段（v2）
+
+列表、单资源及批量详情中的 `urgency_score` 统一为 `0..100`。`urgency_breakdown` 包含 `version=2`、`score_max=100`、`score`、`level`、`kind`、`components[{label,value}]`、`metric_scores[{metric,container,action,value}]`。`kind` 为 `capacity_risk`（容量风险）、`savings`（节省机会）、`none` 或 `unknown`；`level` 为 `low`、`medium`、`high`、`critical`、`none` 或 `unknown`。默认分级边界为40、70、90；无有效证据的排序值0必须结合 `unknown` 显示为待评估，不能当作低风险。等级未经生产回放校准。
+
+新预测产物的 `scaling_advice.confidence_breakdown` 包含 `version=2`、`score_max=100`、`score`、实际 `components[{label,value}]`。现有 `confidence_score` 仍为百分制，低<45、中45–<72、高≥72；`confidence_metric_scores` 保存资源级扣分前的单项分。K8S 增加 `container_advice`，保存容器的动作、单项分、统计、缺失基线和阻断指标；统计中的 `sample_count` 是有效预测点数。详情和摘要预测产物均保留这些字段。
+
+置信度是规则证据分，不是正确概率；混合方向扣8并封顶71，不能达到高置信度建议执行门槛。缺旧版分解时不要前端反推公式，也不要把缺失分数当0。历史产物不自动重写，重新预测后获得新版置信度；紧急度在读取 API 时按新规则计算。完整公式与限制见 [architecture.md](architecture.md#置信度评分v2)。
+
+建议汇总 `confidence_counts` 同时包含 `unknown` 计数。筛选、统计和页面等级均以实际分数为准，不用旧标签覆盖分数。
 
 ### 详情接口特殊状态
 

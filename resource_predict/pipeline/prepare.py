@@ -101,6 +101,8 @@ def build_prepared_data(
                     prepared_item["resource_type"] = resource_type
                 if isinstance(item.get("observation_evidence"), dict):
                     prepared_item["observation_evidence"] = item["observation_evidence"]
+                if isinstance(item.get("scaling_evidence"), dict):
+                    prepared_item["scaling_evidence"] = item["scaling_evidence"]
                 if isinstance(item.get("data_quality"), dict):
                     prepared_item["data_quality"] = item["data_quality"]
                 for metric_name in metric_names_for_resource(prepared_item):

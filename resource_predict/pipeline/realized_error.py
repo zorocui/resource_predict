@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS points (
 CREATE INDEX IF NOT EXISTS curves_lookup ON curves(resource_id, container, metric);
 CREATE INDEX IF NOT EXISTS points_pending ON points(curve_id, target_ms) WHERE actual IS NULL;
 CREATE INDEX IF NOT EXISTS curves_batch ON curves(batch);
+CREATE INDEX IF NOT EXISTS points_target ON points(target_ms,curve_id);
 CREATE TABLE IF NOT EXISTS calibrations (
  curve_id INTEGER PRIMARY KEY REFERENCES curves(id) ON DELETE CASCADE,
  metadata TEXT NOT NULL
@@ -54,6 +55,21 @@ CREATE TABLE IF NOT EXISTS upper_bounds (
  PRIMARY KEY(curve_id, target_ms),
  FOREIGN KEY(curve_id,target_ms) REFERENCES points(curve_id,target_ms) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS holdout_curves (
+ id INTEGER PRIMARY KEY, batch TEXT NOT NULL REFERENCES batches(name) ON DELETE CASCADE,
+ resource_id TEXT NOT NULL, container TEXT NOT NULL, metric TEXT NOT NULL,
+ model TEXT NOT NULL, unit TEXT NOT NULL, data_end_ms INTEGER, issued_ms INTEGER NOT NULL,
+ basis TEXT NOT NULL, provenance TEXT NOT NULL, evaluation TEXT NOT NULL, eligible INTEGER NOT NULL,
+ UNIQUE(batch, resource_id, container, metric, model)
+);
+CREATE TABLE IF NOT EXISTS holdout_points (
+ curve_id INTEGER NOT NULL REFERENCES holdout_curves(id) ON DELETE CASCADE,
+ target_ms INTEGER NOT NULL, predicted REAL, actual REAL, skip_reason TEXT,
+ PRIMARY KEY(curve_id, target_ms)
+);
+CREATE INDEX IF NOT EXISTS holdout_curves_batch ON holdout_curves(batch);
+CREATE INDEX IF NOT EXISTS holdout_curves_lookup ON holdout_curves(resource_id,container,metric);
+CREATE INDEX IF NOT EXISTS holdout_points_target ON holdout_points(target_ms,curve_id);
 """
 
 
@@ -93,6 +109,66 @@ def _unit(item: dict, container: str, metric: str) -> str:
                 else item.get("spec", {}).get(f"{metric}_metric_mode"))
         return f"{kind}:{mode or 'unknown'}"
     return f"{kind}:ratio"
+
+
+def _holdout_reason(evaluation: dict, provenance: dict, timestamps: list) -> str | None:
+    if not provenance or provenance.get("actual_source") != "prepared_history":
+        return "missing_provenance"
+    if evaluation.get("role") != "independent_test":
+        return "not_independent_test"
+    train_end = evaluation.get("test_train_end_ms")
+    if type(train_end) is not int or not isinstance(provenance.get("generated_at_epoch_ms"), int):
+        return "missing_provenance"
+    if (timestamps != sorted(set(timestamps)) or train_end >= timestamps[0]
+            or evaluation.get("test_start_ms") != timestamps[0]
+            or evaluation.get("test_end_ms") != timestamps[-1]):
+        return "invalid_test_boundary"
+    windows = evaluation.get("validation_windows")
+    if (evaluation.get("selection_status") != "validated" or not isinstance(windows, list) or not windows
+            or not evaluation.get("validation_metrics")
+            or evaluation.get("selected_method") not in evaluation["validation_metrics"]):
+        return "unvalidated_selection"
+    routing_end = evaluation.get("routing_train_end_ms")
+    if type(routing_end) is not int or routing_end > train_end:
+        return "invalid_selection_boundary"
+    for window in windows:
+        if not isinstance(window, dict):
+            return "invalid_selection_boundary"
+        bounds = [window.get(key) for key in ("train_end_ms", "validation_start_ms", "validation_end_ms")]
+        if (any(type(value) is not int for value in bounds)
+                or not bounds[0] < bounds[1] <= bounds[2] <= train_end or routing_end > bounds[0]):
+            return "invalid_selection_boundary"
+    return None
+
+
+def _import_holdout(db: sqlite3.Connection, batch: str, issued: int, record: dict) -> None:
+    for curve in record.get("holdout_forecasts", []):
+        timestamps, predictions, actuals = curve["x_test_ms"], curve["yhat"], curve["actual"]
+        if not timestamps or len(timestamps) != len(predictions) or len(timestamps) != len(actuals):
+            raise ValueError("unaligned holdout curve")
+        if any(type(target) is not int for target in timestamps):
+            raise ValueError("invalid holdout timestamp")
+        evaluation, provenance = curve.get("evaluation", {}), curve.get("provenance", {})
+        evaluation = evaluation if isinstance(evaluation, dict) else {}
+        provenance = provenance if isinstance(provenance, dict) else {}
+        reason = _holdout_reason(evaluation, provenance, timestamps)
+        container, metric = curve.get("container", ""), curve["metric"]
+        train_end = evaluation.get("test_train_end_ms")
+        cursor = db.execute(
+            "INSERT INTO holdout_curves(batch,resource_id,container,metric,model,unit,data_end_ms,"
+            "issued_ms,basis,provenance,evaluation,eligible) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (batch, record["resource_id"], container, metric, curve["model"], _unit(record, container, metric),
+             train_end if type(train_end) is int else None, issued, _basis(record, container, metric),
+             _json(provenance), _json(evaluation), reason is None),
+        )
+        for target, predicted, actual in zip(timestamps, predictions, actuals):
+            valid_prediction = type(predicted) in (float, int) and math.isfinite(predicted)
+            valid_actual = type(actual) in (float, int) and math.isfinite(actual)
+            skip = reason or ("invalid_prediction" if not valid_prediction else
+                              "invalid_observation" if not valid_actual else None)
+            db.execute("INSERT INTO holdout_points VALUES (?,?,?,?,?)",
+                       (cursor.lastrowid, target, float(predicted) if valid_prediction else None,
+                        float(actual) if valid_actual else None, skip))
 
 
 def _import_archives(db: sqlite3.Connection, base: Path, cutoff_ms: int) -> int:
@@ -155,6 +231,7 @@ def _import_archives(db: sqlite3.Connection, base: Path, cutoff_ms: int) -> int:
                                     raise ValueError("invalid calibration upper bound")
                                 db.execute("INSERT INTO upper_bounds VALUES (?,?,?)",
                                            (cursor.lastrowid, target, float(upper)))
+                    _import_holdout(db, path.name, issued, record)
                     import_shadow(db, path.name, record)
         imported += 1
     return imported
@@ -266,6 +343,8 @@ def score_realized_forecasts(out_base: Path, items: Iterable[dict] = (), *, rete
     cutoff = now_ms - retention_days * 86400_000
     timings = {}
     with closing(sqlite3.connect(base / DB_NAME, timeout=30)) as db:
+        # Long read-only evidence exports must not block ongoing observation scoring.
+        db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA temp_store=FILE")
         db.executescript(_SCHEMA)

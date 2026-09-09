@@ -146,6 +146,8 @@ def prepared_dict_to_raw_record(p: Dict[str, Any]) -> Dict[str, Any]:
         rec["data_quality"] = p["data_quality"]
     if isinstance(p.get("observation_evidence"), dict):
         rec["observation_evidence"] = p["observation_evidence"]
+    if isinstance(p.get("scaling_evidence"), dict):
+        rec["scaling_evidence"] = p["scaling_evidence"]
     container_metrics = _serialize_container_metric_series(p.get("container_metrics"))
     if container_metrics:
         rec["container_metrics"] = container_metrics
@@ -196,6 +198,8 @@ def raw_record_to_prepared(rec: Dict[str, Any]) -> Dict[str, Any]:
         item["resource_type"] = resource_type
     if isinstance(rec.get("observation_evidence"), dict):
         item["observation_evidence"] = rec["observation_evidence"]
+    if isinstance(rec.get("scaling_evidence"), dict):
+        item["scaling_evidence"] = rec["scaling_evidence"]
     if isinstance(rec.get("data_quality"), dict):
         item["data_quality"] = rec["data_quality"]
     for metric in metric_names_for_resource(item):

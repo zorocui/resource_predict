@@ -4,9 +4,10 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 import numpy as np
+import pandas as pd
 
 from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resource, resource_type_of
 from resource_predict.core.decision import build_scaling_advice
@@ -20,6 +21,39 @@ from resource_predict.utils import compute_metric_stats
 logger = logging.getLogger(__name__)
 
 
+def _selected_metrics(source: dict, ctx: WorkerContext) -> list[str]:
+    metric_names = metric_names_for_resource(source)
+    resource_id = str(source["resource_id"])
+    if ctx.metric_partial_enabled and resource_id in ctx.existing_partial_ids:
+        selected = [metric for metric in metric_names
+                    if metric in ctx.metric_filter_by_id.get(resource_id, set(metric_names))]
+        return selected or list(metric_names)
+    return list(metric_names)
+
+
+def _iter_container_inputs(
+    source: dict, metric_names: tuple[str, ...], ctx: WorkerContext,
+) -> Iterator[tuple[str, str, pd.Series]]:
+    raw = source.get("container_metrics")
+    if not isinstance(raw, dict):
+        return
+    for container, metrics in raw.items():
+        name = str(container or "").strip()
+        if not name or not isinstance(metrics, dict):
+            continue
+        for metric in metric_names:
+            series = metrics.get(metric)
+            if series is not None and len(series) > ctx.test_size:
+                yield name, metric, series
+
+
+def iter_metric_inputs(source: dict, ctx: WorkerContext) -> Iterator[tuple[str, str, pd.Series]]:
+    """Yield aggregate and eligible container series in the worker's fitting order."""
+    for metric in _selected_metrics(source, ctx):
+        yield "", metric, source[metric]
+    yield from _iter_container_inputs(source, metric_names_for_resource(source), ctx)
+
+
 def worker(
     i: int,
     prepared_data: List[Dict[str, Any]],
@@ -27,6 +61,7 @@ def worker(
     ctx: WorkerContext,
     parallel_metrics_enabled: bool,
     inner_metric_workers: int,
+    precomputed: dict[tuple[str, str], tuple] | None = None,
 ) -> Dict[str, Any]:
     """处理单个资源的全部指标预测。"""
     worker_started = time.perf_counter()
@@ -43,18 +78,11 @@ def worker(
         name: (source[name].iloc[:-ctx.test_size], source[name].iloc[-ctx.test_size:], source[name])
         for name in metric_names
     }
-    if ctx.metric_partial_enabled and str(resource_tag) in ctx.existing_partial_ids:
-        metrics_to_fit = [
-            metric
-            for metric in metric_names
-            if metric in ctx.metric_filter_by_id.get(str(resource_tag), set(metric_names))
-        ]
-    else:
-        metrics_to_fit = list(metric_names)
-    if not metrics_to_fit:
-        metrics_to_fit = list(metric_names)
+    metrics_to_fit = _selected_metrics(source, ctx)
 
-    if parallel_metrics_enabled and len(metrics_to_fit) > 1:
+    if precomputed is not None:
+        results = [(name, precomputed[("", name)]) for name in metrics_to_fit]
+    elif parallel_metrics_enabled and len(metrics_to_fit) > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=inner_metric_workers) as imx:
             results = list(
                 imx.map(
@@ -80,6 +108,7 @@ def worker(
     observed_stats: Dict[str, Dict[str, float]] = {}
     futures_for_advice: Dict[str, np.ndarray] = {}
     forecast_diagnostics: Dict[str, Any] = {}
+    accuracy_holdout: List[Dict[str, Any]] = []
     history_coverage = _history_coverage(source, metric_names)
     for metric_name in metrics_to_fit:
         pred, metric_scores, best, future_pred, _timing, diagnostics = computed[metric_name]
@@ -87,6 +116,8 @@ def worker(
         best_methods[metric_name] = best
         metrics_out[metric_name] = metric_scores
         forecast_diagnostics[metric_name] = diagnostics
+        accuracy_holdout.extend(_holdout_curves(source, "", metric_name,
+                                               metric_sources[metric_name][1], pred, diagnostics))
         charts_forecast[metric_name] = {
             "preds": {m: series_to_lists(pred[m]) for m in pred.keys()},
             "x_pred_ms": to_ms(next(iter(future_pred.values())).index),
@@ -104,6 +135,8 @@ def worker(
         metric_names=metric_names,
         ctx=ctx,
         timing_by_model=timing_by_model,
+        accuracy_holdout=accuracy_holdout,
+        precomputed=precomputed,
     )
     timing_total = float(sum(timing_by_model.values()))
 
@@ -138,6 +171,7 @@ def worker(
         "history_coverage": history_coverage,
         "charts_forecast": charts_forecast,
         "forecast_diagnostics": forecast_diagnostics,
+        "_accuracy_holdout": accuracy_holdout,
         "resource_profile": resource_profile,
         "_timings": {"by_model": timing_by_model, "total": timing_total, "wall": wall_seconds},
         "_slot": i,
@@ -183,41 +217,55 @@ def _history_coverage(source: Dict[str, Any], metric_names: tuple[str, ...]) -> 
     }
 
 
+def _holdout_curves(source, container, metric, y_test, predictions, diagnostics):
+    """Freeze prepared outer-test labels; never infer unfilled production telemetry."""
+    provenance = {**diagnostics.get("provenance", {}), "actual_source": "prepared_history"}
+    evidence = source.get("observation_evidence", {})
+    if isinstance(evidence, dict) and evidence.get("source"):
+        provenance["input_observation_source"] = evidence["source"]
+    failures = diagnostics.get("phase_failures", {})
+    methods = dict.fromkeys([*predictions, *failures.get("test", {}), *failures.get("test_fallback", {})])
+    actual = [float(value) if np.isfinite(value) else None for value in y_test.to_numpy(dtype=float)]
+    curves = []
+    for model in methods:
+        prediction = predictions.get(model)
+        values = prediction.reindex(y_test.index).to_numpy(dtype=float) if prediction is not None else np.full(len(y_test), np.nan)
+        curves.append(dict(container=container, metric=metric, model=model, x_test_ms=to_ms(y_test.index),
+                           yhat=[float(value) if np.isfinite(value) else None for value in values],
+                           actual=actual, evaluation=diagnostics.get("evaluation", {}), provenance=provenance))
+    return curves
+
+
 def _fit_container_metrics(
     source: Dict[str, Any],
     *,
     metric_names: tuple[str, ...],
     ctx: WorkerContext,
     timing_by_model: Dict[str, float],
+    accuracy_holdout: List[Dict[str, Any]],
+    precomputed: dict[tuple[str, str], tuple] | None = None,
 ) -> tuple[Dict[str, Dict[str, Dict[str, Any]]], Dict[str, Dict[str, np.ndarray]]]:
-    raw = source.get("container_metrics")
-    if not isinstance(raw, dict):
-        return {}, {}
     charts: Dict[str, Dict[str, Dict[str, Any]]] = {}
     futures: Dict[str, Dict[str, np.ndarray]] = {}
-    for container, metrics in raw.items():
-        name = str(container or "").strip()
-        if not name or not isinstance(metrics, dict):
-            continue
-        for metric_name in metric_names:
-            series = metrics.get(metric_name)
-            if series is None or len(series) <= ctx.test_size:
-                continue
-            y_train = series.iloc[:-ctx.test_size]
-            y_test = series.iloc[-ctx.test_size:]
-            pred, metric_scores, best, future_pred, timing_part, diagnostics = fit_one_metric(y_train, y_test, series, ctx=ctx)
-            for method, seconds in timing_part.items():
-                timing_by_model[method] = timing_by_model.get(method, 0.0) + float(seconds)
-            charts.setdefault(name, {})[metric_name] = {
-                "preds": {m: series_to_lists(pred[m]) for m in pred.keys()},
-                "x_pred_ms": to_ms(next(iter(future_pred.values())).index),
-                "preds_future": {m: series_to_lists(future_pred[m]) for m in future_pred.keys()},
-                "metrics": metric_scores,
-                "best_method": best,
-                "forecast_diagnostics": diagnostics,
-                "test_end_ms": int(y_test.index.max().value // 1_000_000),
-                "sample_interval_seconds": float(ctx.sample_interval_seconds),
-                "max_interpolation_gap_steps": int(ctx.max_interpolation_gap_steps),
-            }
-            futures.setdefault(name, {})[metric_name] = future_pred[best].to_numpy(dtype=float)
+    for name, metric_name, series in _iter_container_inputs(source, metric_names, ctx):
+        y_train = series.iloc[:-ctx.test_size]
+        y_test = series.iloc[-ctx.test_size:]
+        result = (precomputed[(name, metric_name)] if precomputed is not None
+                  else fit_one_metric(y_train, y_test, series, ctx=ctx))
+        pred, metric_scores, best, future_pred, timing_part, diagnostics = result
+        accuracy_holdout.extend(_holdout_curves(source, name, metric_name, y_test, pred, diagnostics))
+        for method, seconds in timing_part.items():
+            timing_by_model[method] = timing_by_model.get(method, 0.0) + float(seconds)
+        charts.setdefault(name, {})[metric_name] = {
+            "preds": {m: series_to_lists(pred[m]) for m in pred.keys()},
+            "x_pred_ms": to_ms(next(iter(future_pred.values())).index),
+            "preds_future": {m: series_to_lists(future_pred[m]) for m in future_pred.keys()},
+            "metrics": metric_scores,
+            "best_method": best,
+            "forecast_diagnostics": diagnostics,
+            "test_end_ms": int(y_test.index.max().value // 1_000_000),
+            "sample_interval_seconds": float(ctx.sample_interval_seconds),
+            "max_interpolation_gap_steps": int(ctx.max_interpolation_gap_steps),
+        }
+        futures.setdefault(name, {})[metric_name] = future_pred[best].to_numpy(dtype=float)
     return charts, futures

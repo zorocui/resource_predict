@@ -711,6 +711,9 @@ def _fetch_target(
         cpu_usage,
         mem_usage,
     )
+    capacity_history, evidence_errors = _scaling_capacity_history(client, selector, start, end, step)
+    scaling_series = _scaling_series_by_workload(cpu_usage, mem_usage, capacity_history, pod_owners)
+    evidence_collected_at_ms = int(time.time() * 1000)
 
     out: List[Dict[str, Any]] = []
     for key in workload_keys:
@@ -925,6 +928,25 @@ def _fetch_target(
             "metrics": observed_metrics,
             "container_metrics": observed_containers,
         }
+        item["scaling_evidence"] = {
+            "schema_version": 1,
+            "source": "k8s_prometheus_scaling_unfilled",
+            "collected_at_ms": evidence_collected_at_ms,
+            "spec": spec,
+            "sample_interval_ms": step * 1000,
+            "series": scaling_series.get(key, []),
+            "query_errors": evidence_errors,
+            "provenance": {
+                "owner_mapping": "current_instant_snapshot",
+                "aggregation": "same_observed_members_at_exact_timestamp",
+                "cpu_rate_window": target.rate_window,
+                "orphan_container_series": len(orphan_keys),
+            },
+            "limitations": [
+                "Historical membership cannot be proven for departed or reassigned containers using current owner mappings.",
+                "Containers absent from all queried metrics at a timestamp cannot be detected; this is observed mapped capacity, not physical cluster utilization.",
+            ],
+        }
         out.append(item)
         if limit > 0 and len(out) >= limit:
             break
@@ -933,6 +955,87 @@ def _fetch_target(
             f"集群 {target.cluster} 解析出 {len(workload_keys)} 个 Workload，"
             "但没有一个同时具备 CPU 与内存使用率序列，无法聚合"
         )
+    return out
+
+
+def _scaling_capacity_history(
+    client: PrometheusClient, selector: str, start: float, end: float, step: int,
+) -> Tuple[Dict[Tuple[str, str], Dict[ContainerKey, pd.Series]], List[str]]:
+    history: Dict[Tuple[str, str], Dict[ContainerKey, pd.Series]] = {}
+    errors: List[str] = []
+    for metric, resource, suffix, unit in (
+        ("cpu", "cpu", "cpu_cores", "core"),
+        ("memory", "memory", "memory_bytes", "byte"),
+    ):
+        for basis in ("request", "limit"):
+            prefix = f"kube_pod_container_resource_{basis}s"
+            # Prefer the legacy metric where present, and deduplicate exporter labels.
+            query = (
+                f"max by (namespace,pod,container) ({prefix}_{suffix}{{{selector}}})"
+                " or on (namespace,pod,container) "
+                f'max by (namespace,pod,container) ({prefix}{{{selector},resource="{resource}",unit="{unit}"}})'
+            )
+            try:
+                history[(metric, basis)] = _range_by_key(
+                    client.query_range(query, start=start, end=end, step=step)
+                )
+                if not history[(metric, basis)]:
+                    errors.append(f"{metric}/{basis}: historical capacity unavailable")
+            except Exception as exc:
+                history[(metric, basis)] = {}
+                detail = f"{metric}/{basis}: {type(exc).__name__}: {exc}"
+                errors.append(detail)
+                logger.warning("[k8s_prometheus] scaling evidence unavailable: %s", detail)
+    return history, errors
+
+
+def _scaling_series_by_workload(
+    cpu_usage: Dict[ContainerKey, pd.Series],
+    mem_usage: Dict[ContainerKey, pd.Series],
+    capacity_history: Dict[Tuple[str, str], Dict[ContainerKey, pd.Series]],
+    pod_owners: Dict[Tuple[str, str], Tuple[str, str]],
+) -> Dict[WorkloadKey, List[Dict[str, Any]]]:
+    sources = [cpu_usage, mem_usage, *capacity_history.values()]
+    grouped: Dict[Tuple[WorkloadKey, str], Set[ContainerKey]] = {}
+    for source in sources:
+        for member in source:
+            workload = _workload_key(member, pod_owners)
+            if workload is not None:
+                grouped.setdefault((workload, member[2]), set()).add(member)
+    out: Dict[WorkloadKey, List[Dict[str, Any]]] = {}
+    for (workload, container), members in sorted(grouped.items()):
+        # A sample in any metric establishes membership, even when its value is NaN.
+        presence = {}
+        for member in sorted(members):
+            indices = [source[member].index for source in sources if member in source]
+            index = indices[0]
+            for other in indices[1:]:
+                index = index.union(other)
+            presence[member] = pd.Series(True, index=index)
+        active = pd.DataFrame(presence).notna().sort_index()
+        expected = active.sum(axis=1)
+        for metric, usage, divisor, unit in (
+            ("cpu", cpu_usage, 1, "cores"),
+            ("memory", mem_usage, BYTES_PER_GIB, "GiB"),
+        ):
+            for basis in ("request", "limit"):
+                capacity = capacity_history.get((metric, basis), {})
+                frames = [pd.DataFrame({member: source[member] for member in members if member in source})
+                          .reindex(index=active.index, columns=active.columns)
+                          for source in (usage, capacity)]
+                valid = expected.gt(0)
+                totals = []
+                for frame in frames:
+                    usable = np.isfinite(frame) & frame.ge(0)
+                    valid &= (usable & active).sum(axis=1).eq(expected)
+                    totals.append(frame.where(active & usable).sum(axis=1, min_count=1) / divisor)
+                    valid &= np.isfinite(totals[-1])
+                values = [[float(value) if ok else None for value, ok in zip(total, valid)] for total in totals]
+                out.setdefault(workload, []).append({
+                    "container": container, "metric": metric, "basis": basis, "unit": unit,
+                    "timestamps": (active.index.as_unit("ns").view("int64") // 1_000_000).astype(int).tolist(),
+                    "usage": values[0], "capacity": values[1],
+                })
     return out
 
 

@@ -19,7 +19,7 @@ def _resource(
     return {
         "resource_id": resource_id,
         "resource_type": resource_type,
-        "scaling_advice": {"action": action, "confidence": confidence},
+        "scaling_advice": {"action": action, "confidence": confidence, "confidence_score": {"high": 90, "medium": 60, "low": 20}[confidence]},
         "best_methods": best_methods or {},
         "anomaly_score": 0.0,
     }
@@ -123,6 +123,32 @@ def test_resource_detail_can_skip_charts():
     response = app.test_client().get("/api/resources/vm-1?include_charts=false")
 
     assert response.status_code == 200
+
+
+def test_list_detail_and_batch_share_urgency_without_mutating_cached_item():
+    item = _resource("vm-1", "scale_out", resource_type="openstack_vm")
+    item["scaling_advice"].update(
+        metric_actions={"cpu": "scale_out"}, stats={"cpu": {"avg": 1, "p95": 1, "peak": 1}}
+    )
+    client = _app([item], {"vm-1": item}).test_client()
+    listing = client.get("/api/resources").get_json()["items"][0]
+    detail = client.get("/api/resources/vm-1?include_charts=false").get_json()["resource"]
+    batch = client.get("/api/resources/details?ids=vm-1&include_charts=false").get_json()["resources"][0]
+    assert listing["urgency_breakdown"] == detail["urgency_breakdown"] == batch["urgency_breakdown"]
+    assert detail["urgency_breakdown"]["version"] == 2
+    assert "urgency_breakdown" not in item
+
+
+def test_confidence_filter_uses_score_and_missing_is_unknown():
+    mismatched = _resource("mismatch", "scale_out", confidence="high")
+    mismatched["scaling_advice"]["confidence_score"] = 0
+    missing = _resource("missing", "hold")
+    missing["scaling_advice"].pop("confidence_score")
+    client = _app([mismatched, missing]).test_client()
+    assert client.get("/api/resources?confidence=high").get_json()["total"] == 0
+    assert client.get("/api/resources?confidence=low").get_json()["items"][0]["resource_id"] == "mismatch"
+    assert client.get("/api/resources?confidence=unknown").get_json()["items"][0]["resource_id"] == "missing"
+    assert client.get("/api/resources/advice-summary").get_json()["confidence_counts"]["unknown"] == 1
 
 
 def test_resource_detail_rejects_invalid_include_charts_value():
