@@ -2,6 +2,8 @@
 
 本文档详细说明系统所有 API 端点及完整使用方法。
 
+当前预测准确率页面使用 `GET /api/forecast-accuracy/summary` 读取轻量JSON。返回实际选用模型的独立历史测试准确率（±5个百分点达标点/有效点）、资源数、样本数、测试区间和各scope更新时间。无有效样本为null，读取损坏文件为503。旧逐点只读接口不再用于默认页面，逐点留档与SQLite导入已删除。
+
 ## 页面路由
 
 | 方法 | 路径 | 说明 |
@@ -87,6 +89,8 @@ K8S 指标的 `data_quality` 会附带 `recent_contiguous_points`、`recent_cont
 | POST | `/api/upsert-data` | 推送数据，更新或新增资源（异步） |
 
 更新任务成功、部分成功或失败后都会写入 `outputs/update_history.json`，应用重启后仍可查询。系统按完成时间从新到旧保留最近 100 条；历史文件读取或写入异常只记录日志，不影响数据更新主流程。历史记录包含任务来源、拉取窗口、开始/结束时间、耗时、资源和数据点统计以及错误信息。整体 `status` 可为 `success`、`partial_success` 或 `failed`；K8S Prometheus 更新还通过 `cluster_results` 记录每个集群的 `success` / `failed`、Workload 数、耗时和错误。
+
+历史总耗时优先按有效的 `finished_at-started_at` 计算，包含采集、合并和预测；旧记录即使误存了仅处理阶段的 `elapsed_seconds`，读取时也会校正，无需重新拉取或重写历史文件。缺少时间边界时才回退到原耗时。K8S更新结果的 `elapsed_seconds` 为整轮采集和处理耗时，另保留 `fetch_elapsed_seconds` 与 `upsert_elapsed_seconds`；逐集群耗时仍仅表示对应集群拉取耗时。
 
 K8S 多集群拉取中，只要至少一个集群成功且后续 upsert/预测完成，同时另有集群失败，整体即为 `partial_success`。失败集群的具体异常写入对应 `cluster_results[].error`；成功集群的数据继续提交。失败集群所属或本轮未返回的 Workload 会保留已有 raw 历史和预测产物，不会因为一次稀疏结果被删除。一个 range 查询的任一分片在重试耗尽后失败时，该集群查询按整体失败处理，不会合并部分时间范围。
 

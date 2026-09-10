@@ -1,6 +1,7 @@
 """Reports page payloads in SQLite and summarize cached aggregate observations."""
 
 import json
+import re
 from pathlib import Path
 import sqlite3
 
@@ -27,6 +28,19 @@ CREATE TABLE metric_summaries (
 @pytest.fixture(autouse=True)
 def fixed_clock(monkeypatch):
     monkeypatch.setattr(effect_reports.time, "time", lambda: NOW / 1000)
+
+
+@pytest.fixture(autouse=True)
+def legacy_sql(monkeypatch):
+    connect = effect_reports.sqlite3.connect
+
+    class LegacyConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            assert not re.search(r"\bWITH\b|\bOVER\s*\(|\bON\s+CONFLICT\b", sql, re.I), sql
+            return super().execute(sql, parameters)
+
+    monkeypatch.setattr(effect_reports.sqlite3, "connect",
+                        lambda *args, **kwargs: connect(*args, factory=LegacyConnection, **kwargs))
 
 
 def metric(before_capacity=2, after_capacity=1, before_usage=1, after_usage=1, **labels):

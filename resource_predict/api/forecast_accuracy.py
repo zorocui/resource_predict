@@ -1,6 +1,7 @@
 """Prediction accuracy report endpoints; snapshots are explicit local writes."""
 import re
-import sqlite3
+import logging
+from resource_predict.sqlite_runtime import sqlite3
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_file
@@ -10,6 +11,14 @@ from resource_predict.services.accuracy_exports import (
     LEGACY_FIELDS, POINT_FIELDS, SUMMARY_FIELDS, csv_chunks, freeze_report, report_session,
 )
 from resource_predict.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _database_failure(exc, message):
+    logger.exception("[forecast_accuracy] SQLite %s source=%s: %s", sqlite3.sqlite_version,
+                     request.args.get("source", "realized"), type(exc).__name__)
+    return jsonify(error=f"{message}（SQLite {sqlite3.sqlite_version}）"), 503
 
 
 def _filters(values):
@@ -43,6 +52,15 @@ def register_forecast_accuracy_routes(app: Flask, out_dirs_provider=None, snapsh
     def snapshots():
         return Path(snapshot_dir) if snapshot_dir is not None else Path(settings.app.out_dir) / "accuracy_snapshots"
 
+    @app.get("/api/forecast-accuracy/summary")
+    def api_accuracy_summary():
+        from resource_predict.services.accuracy_summary import read_accuracy_summary
+        try:
+            return jsonify(read_accuracy_summary(directories()))
+        except (OSError, ValueError, KeyError, TypeError):
+            logger.exception("[forecast_accuracy] summary read failed")
+            return jsonify(error="准确率汇总读取失败，请检查服务器日志"), 503
+
     @app.get("/api/forecast-accuracy")
     def api_forecast_accuracy():
         try:
@@ -56,8 +74,8 @@ def register_forecast_accuracy_routes(app: Flask, out_dirs_provider=None, snapsh
                 return jsonify(report)
         except (ValueError, TypeError) as exc:
             return jsonify(error=str(exc)), 400
-        except (sqlite3.Error, OSError):
-            return jsonify(error="准确性证据读取失败，不能作为无数据处理"), 503
+        except (sqlite3.Error, OSError) as exc:
+            return _database_failure(exc, "准确性证据读取失败，不能作为无数据处理；具体原因已记录服务器日志")
 
     @app.get("/api/forecast-accuracy/export.csv")
     def api_forecast_accuracy_csv():
@@ -73,8 +91,8 @@ def register_forecast_accuracy_routes(app: Flask, out_dirs_provider=None, snapsh
                 pass
         except (ValueError, TypeError) as exc:
             return jsonify(error=str(exc)), 400
-        except (sqlite3.Error, OSError):
-            return jsonify(error="准确性证据读取失败"), 503
+        except (sqlite3.Error, OSError) as exc:
+            return _database_failure(exc, "准确性证据读取失败；具体原因已记录服务器日志")
 
         paths = directories()
         def stream():
@@ -95,8 +113,8 @@ def register_forecast_accuracy_routes(app: Flask, out_dirs_provider=None, snapsh
             return jsonify(freeze_report(directories(), snapshots(), **_filters(body))), 201
         except (ValueError, TypeError) as exc:
             return jsonify(error=str(exc)), 400
-        except (OSError, sqlite3.Error):
-            return jsonify(error="快照保存失败，未发布不完整的报告包"), 503
+        except (OSError, sqlite3.Error) as exc:
+            return _database_failure(exc, "快照保存失败，未发布不完整的报告包；具体原因已记录服务器日志")
 
     @app.get("/api/forecast-accuracy/snapshots/<snapshot_id>/download")
     def api_accuracy_snapshot_download(snapshot_id):

@@ -259,9 +259,9 @@ Push:       POST /api/update-data -> run_scoped_update_with_data -> _do_update
 K8S Fetch:  POST /api/cluster-configs/k8s-fetch -> run_k8s_prometheus_upsert（异步）
 ```
 
-K8S Prometheus 拉取窗口由 `run_k8s_prometheus_upsert()` 决定：如果 `outputs/k8s/raw_index.json` 缺失、指定集群没有本地基线，或请求传入 `full_refresh=true`，则按 `history_days` 拉取全量历史窗口（默认 7 天）；否则按 `scheduled_update_interval_minutes + incremental_overlap_minutes` 拉取增量窗口（默认 6 小时周期 + 1 小时 overlap = 最近 7 小时）。通过 `python app.py` 启动且 `scheduled_update_enabled=true` 时，应用会在 `scheduled_update_startup_delay_seconds` 后启动首次 K8S 拉取，此后按配置间隔执行；也可通过页面按钮、API 或 CLI 手动触发。
+K8S Prometheus 拉取窗口由 `run_k8s_prometheus_upsert()` 决定：如果 `outputs/k8s/raw_index.json` 缺失、指定集群没有本地基线，或请求传入 `full_refresh=true`，则按 `history_days` 拉取全量历史窗口（默认 7 天）；否则按 `scheduled_update_interval_minutes + incremental_overlap_minutes` 拉取增量窗口（默认 6 小时周期 + 1 小时 overlap = 最近 7 小时）。通过 `python app.py` 启动时保留 K8S 定时调度线程，启用后按配置周期（默认每 6 小时）拉取；仅取消启动时额外执行的那一轮。也可通过页面按钮、API 或 CLI 手动触发。
 
-调度线程的等待挂在 `_k8s_reload_event` 上，因此保存系统配置（`PUT /api/system-config`）会立刻唤醒它重读开关和周期，无需重启应用。唤醒本身不触发拉取：循环每轮按 `last_start + max(60 秒, scheduled_update_interval_minutes)` 重新推导到期时刻并继续等待剩余部分，所以周期既不会被重置也不会被提前。其中 `last_start` 是上一次拉取**开始**时的 monotonic 时刻，拉取异常同样占用本轮，因此失败后不会快速重试而是等满一个周期；`last_start` 为 `None`（从未拉取过）时视为已到期。只有重算后已逾期的配置变更才会立即取数：把周期改短到已过期、关闭超过一个周期后重新打开，或线程启动后还没拉取过。首次成功拉取之前 `trigger_source` 都是 `scheduled_startup`，之后为 `scheduled`。VM 侧的 `_scheduler_loop` 没有接入该事件，且 `start_background_updater()` 当前无调用方，因此 VM 数据不会被自动拉取。
+调度线程的等待挂在 `_k8s_reload_event` 上，因此保存系统配置（`PUT /api/system-config`）会立刻唤醒它重读开关和周期，无需重启应用。唤醒本身不触发拉取：循环每轮按 `last_start + max(60 秒, scheduled_update_interval_minutes)` 重新推导到期时刻并继续等待剩余部分，所以周期既不会被重置也不会被提前。其中 `last_start` 是上一次拉取**开始**时的 monotonic 时刻，拉取异常同样占用本轮，因此失败后不会快速重试而是等满一个周期；首轮以线程启动时刻为计时基准。只有重算后已逾期的配置变更才会立即取数：把周期改短到已过期、关闭超过一个周期后重新打开。定时拉取的 `trigger_source` 统一为 `scheduled`。VM 侧的 `_scheduler_loop` 没有接入该事件，且 `start_background_updater()` 当前无调用方，因此 VM 数据不会被自动拉取。
 
 锚定开始时刻而非完成时刻是数据完整性的要求。增量回看窗口固定为 `scheduled_update_interval_minutes + incremental_overlap_minutes`，而窗口末端取的是 `_fetch_target()` 里构建查询时的 `time.time()`，也就是本轮拉取的起点。若按完成时刻计时，两轮起点的实际间隔会变成 `周期 + 拉取耗时`，一旦耗时超过 `incremental_overlap_minutes`（默认 60 分钟），窗口就盖不住上一轮的末端，中间那段数据永远不会被任何一轮取到，漏掉的时长等于 `拉取耗时 - incremental_overlap_minutes`。按开始时刻计时后实际间隔是 `max(周期, 拉取耗时)`，默认配置下拉取耗时不超过 420 分钟都不会漏；耗时超过周期时循环会记录 warning 并立即开始下一轮。漏掉的时间段若超过 `step_seconds × (max_interpolation_gap_steps + 1)`（默认 40 分钟），`recent_contiguous_segment()` 会判定断档并把可用历史截断到最近一段，该段点数不足 `test_size` 时 `prepare_recent_contiguous_forecast_data()` 记入 `prediction_skips` 并沿用旧预测。
 
@@ -323,9 +323,9 @@ sequenceDiagram
 
 **集成与在线更新**：首个验证折等权，后续折只用之前验证折学习权重；误差来自真实集成预测残差。独立测试和未来预测使用全部内部验证确定的固定权重，缺失成员时不静默重分配权重。所有候选未来曲线使用最新完整观测重新拟合，以保留模型对照图。入选模型未来失败时以 Rolling Mean 的真实名称降级。相比原先一次延伸预测，单验证折通常需要验证、测试和未来三次拟合，应在生产规模下度量耗时。
 
-**预测留档**：`pipeline/forecast_archive.py` 在增量合并前流式写入本轮新预测的入选曲线，按 scope 保存 gzip JSONL，临时文件成功完成后原子发布；默认保留 7 天。来源记录数据和训练截止时间、配置摘要、模型版本与实际模型。不会将复用的旧预测重新标记为新预测。原始建议快照位于跨轮次门控之前，不是执行授权。
+**预测准确率**：`services/accuracy_summary.py` 在增量合并前汇总本轮新预测实际选用模型的独立历史测试，保存 `forecast_accuracy_summary.json`。只保存计数、MAE和测试边界，不保存逐点数组；页面自动展示±5个百分点达标率，支持汇总CSV和打印。
 
-**真实误差回填**：`pipeline/realized_error.py` 在 raw 提交后及新预测留档后导入尚未登记的批次，用显式未填补采样证据精确匹配目标时间。SQLite 按 scope、批次、资源、容器、指标保存原始曲线与首次真实评分，迟到数据补评；按规格、口径及观测成员检查可比性。报告按入选模型和提前量聚合，和独立测试误差分开。默认保留 7 天；不改变选型或执行门控。详细契约与重试命令见 [configuration.md](configuration.md)。
+**移除逐点写入**：逐点预测留档生成、SQLite导入和手动补导入入口已删除。`pipeline/realized_error.py` 仅保留旧证据的口径及只读报告辅助函数。已有旧证据不自动删除；扩缩容执行门控继续保留，缺少新证据不会自动通过评审。
 
 ### VM 决策引擎（`core/decision.py`）
 

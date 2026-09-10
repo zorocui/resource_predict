@@ -103,8 +103,7 @@ class ForecastConfig:
     enable_ensemble: bool = False
     # 旧字段仅用于兼容配置读取；在线预测始终使用最新完整历史重新拟合。
     reuse_backtest_model_for_future: bool = False
-    # 按 scope 保存本轮新预测（gzip JSONL），用于后续真实误差核验。
-    archive_enabled: bool = True
+    # 仅用于读取旧校准证据时的有效期，不再生成或导入逐点留档。
     archive_retention_days: int = 7
     # 是否仅在值得承担训练成本的序列上运行 Prophet。
     prophet_routing_enabled: bool = True
@@ -175,8 +174,6 @@ class UpdateConfig:
     enabled: bool = False
     # 显式后台拉取更新间隔，单位分钟。
     interval_minutes: int = 60
-    # 显式启动后台调度器后的首次更新延迟秒数；手动更新不受影响。
-    startup_delay_seconds: int = 60
     # 每次调用增量数据提供器期望追加的时间点数量。
     points_per_update: int = 1
     # 是否在增量更新后保持滑动窗口长度，避免历史序列无限增长。
@@ -226,12 +223,10 @@ class K8SPrometheusConfig:
     max_interpolation_gap_steps: int = 3
     # 多集群拉取时是否遇到任一集群失败就立即中断；False 表示尽量保留成功集群。
     fail_fast: bool = False
-    # 是否在 python app.py 启动时启用 K8S Prometheus 后台拉取。
+    # 是否启用 K8S 后台定时拉取；app.py 启动调度线程，但不额外触发启动拉取。
     scheduled_update_enabled: bool = True
     # K8S Prometheus 显式后台拉取间隔，单位分钟。
     scheduled_update_interval_minutes: int = 360
-    # 显式启动 K8S 后台调度器后的首次拉取延迟秒数；手动拉取不受影响。
-    scheduled_update_startup_delay_seconds: int = 60
 
 
 @dataclass(frozen=True)

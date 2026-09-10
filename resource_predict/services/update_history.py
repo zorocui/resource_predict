@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from pathlib import Path
@@ -74,11 +75,14 @@ def _read_records(path: Path) -> List[Dict[str, Any]]:
 
 
 def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    finished_at = float(record.get("finished_at") or time.time())
+    recorded_finish = _optional_float(record.get("finished_at"))
+    finished_at = recorded_finish if recorded_finish is not None else time.time()
     started_at = _optional_float(record.get("started_at"))
     elapsed = _optional_float(record.get("elapsed_seconds"))
-    if elapsed is None and started_at is not None:
-        elapsed = max(0.0, finished_at - started_at)
+    # Stored elapsed may cover only upsert/prediction after a long external fetch.
+    # Use the displayed task boundaries for both new records and legacy reads.
+    if started_at is not None and recorded_finish is not None and recorded_finish >= started_at:
+        elapsed = recorded_finish - started_at
     suffix = time.time_ns() % 1_000_000
     status = str(record.get("status") or "failed")
     if status not in _TERMINAL_STATUSES:
@@ -127,7 +131,8 @@ def _optional_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except (TypeError, ValueError):
         return None
 

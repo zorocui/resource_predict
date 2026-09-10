@@ -1,25 +1,13 @@
-"""Score immutable forecasts against explicitly identified, unfilled observations.
-
-Run with ``python -m resource_predict.pipeline.realized_error --out-dir outputs/k8s``.
-SQLite holds point-level evidence; JSON is a compact, selected-model report.
-"""
+"""Legacy evidence helpers and reports; archive/import entry points were removed."""
 from __future__ import annotations
 
-import argparse
-import gzip
 import json
 import logging
 import math
-import sqlite3
-import time
-from contextlib import closing
-from pathlib import Path
-from typing import Iterable
+from resource_predict.sqlite_runtime import sqlite3
 
-from resource_predict.data.io import atomic_write_json
-from resource_predict.pipeline.forecast_archive import _ARCHIVE_NAME
 from resource_predict.resource_types import resource_type_of
-from resource_predict.pipeline.shadow_evaluation import SCHEMA as SHADOW_SCHEMA, import_shadow, shadow_report
+from resource_predict.pipeline.shadow_evaluation import shadow_report
 from resource_predict.pipeline.activation_assessment import activation_assessment
 
 logger = logging.getLogger(__name__)
@@ -43,7 +31,7 @@ CREATE TABLE IF NOT EXISTS points (
  PRIMARY KEY(curve_id, target_ms)
 );
 CREATE INDEX IF NOT EXISTS curves_lookup ON curves(resource_id, container, metric);
-CREATE INDEX IF NOT EXISTS points_pending ON points(curve_id, target_ms) WHERE actual IS NULL;
+CREATE INDEX IF NOT EXISTS points_pending ON points(curve_id, actual, target_ms);
 CREATE INDEX IF NOT EXISTS curves_batch ON curves(batch);
 CREATE INDEX IF NOT EXISTS points_target ON points(target_ms,curve_id);
 CREATE TABLE IF NOT EXISTS calibrations (
@@ -94,12 +82,6 @@ def _basis(item: dict, container: str, metric: str) -> str:
     return _json([kind, {key: spec.get(key) for key in ("cpu_cores", "memory_gb", "disk_gb")}])
 
 
-def _metric_blocks(item: dict, main_key: str, container_key: str):
-    for metric, block in item.get(main_key, {}).items():
-        yield "", metric, block
-    for container, metrics in item.get(container_key, {}).items():
-        for metric, block in metrics.items():
-            yield container, metric, block
 
 
 def _unit(item: dict, container: str, metric: str) -> str:
@@ -111,177 +93,12 @@ def _unit(item: dict, container: str, metric: str) -> str:
     return f"{kind}:ratio"
 
 
-def _holdout_reason(evaluation: dict, provenance: dict, timestamps: list) -> str | None:
-    if not provenance or provenance.get("actual_source") != "prepared_history":
-        return "missing_provenance"
-    if evaluation.get("role") != "independent_test":
-        return "not_independent_test"
-    train_end = evaluation.get("test_train_end_ms")
-    if type(train_end) is not int or not isinstance(provenance.get("generated_at_epoch_ms"), int):
-        return "missing_provenance"
-    if (timestamps != sorted(set(timestamps)) or train_end >= timestamps[0]
-            or evaluation.get("test_start_ms") != timestamps[0]
-            or evaluation.get("test_end_ms") != timestamps[-1]):
-        return "invalid_test_boundary"
-    windows = evaluation.get("validation_windows")
-    if (evaluation.get("selection_status") != "validated" or not isinstance(windows, list) or not windows
-            or not evaluation.get("validation_metrics")
-            or evaluation.get("selected_method") not in evaluation["validation_metrics"]):
-        return "unvalidated_selection"
-    routing_end = evaluation.get("routing_train_end_ms")
-    if type(routing_end) is not int or routing_end > train_end:
-        return "invalid_selection_boundary"
-    for window in windows:
-        if not isinstance(window, dict):
-            return "invalid_selection_boundary"
-        bounds = [window.get(key) for key in ("train_end_ms", "validation_start_ms", "validation_end_ms")]
-        if (any(type(value) is not int for value in bounds)
-                or not bounds[0] < bounds[1] <= bounds[2] <= train_end or routing_end > bounds[0]):
-            return "invalid_selection_boundary"
-    return None
 
 
-def _import_holdout(db: sqlite3.Connection, batch: str, issued: int, record: dict) -> None:
-    for curve in record.get("holdout_forecasts", []):
-        timestamps, predictions, actuals = curve["x_test_ms"], curve["yhat"], curve["actual"]
-        if not timestamps or len(timestamps) != len(predictions) or len(timestamps) != len(actuals):
-            raise ValueError("unaligned holdout curve")
-        if any(type(target) is not int for target in timestamps):
-            raise ValueError("invalid holdout timestamp")
-        evaluation, provenance = curve.get("evaluation", {}), curve.get("provenance", {})
-        evaluation = evaluation if isinstance(evaluation, dict) else {}
-        provenance = provenance if isinstance(provenance, dict) else {}
-        reason = _holdout_reason(evaluation, provenance, timestamps)
-        container, metric = curve.get("container", ""), curve["metric"]
-        train_end = evaluation.get("test_train_end_ms")
-        cursor = db.execute(
-            "INSERT INTO holdout_curves(batch,resource_id,container,metric,model,unit,data_end_ms,"
-            "issued_ms,basis,provenance,evaluation,eligible) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (batch, record["resource_id"], container, metric, curve["model"], _unit(record, container, metric),
-             train_end if type(train_end) is int else None, issued, _basis(record, container, metric),
-             _json(provenance), _json(evaluation), reason is None),
-        )
-        for target, predicted, actual in zip(timestamps, predictions, actuals):
-            valid_prediction = type(predicted) in (float, int) and math.isfinite(predicted)
-            valid_actual = type(actual) in (float, int) and math.isfinite(actual)
-            skip = reason or ("invalid_prediction" if not valid_prediction else
-                              "invalid_observation" if not valid_actual else None)
-            db.execute("INSERT INTO holdout_points VALUES (?,?,?,?,?)",
-                       (cursor.lastrowid, target, float(predicted) if valid_prediction else None,
-                        float(actual) if valid_actual else None, skip))
 
 
-def _import_archives(db: sqlite3.Connection, base: Path, cutoff_ms: int) -> int:
-    imported = 0
-    for path in sorted((base / "forecast_history").glob("forecast_*.jsonl.gz")):
-        match = _ARCHIVE_NAME.fullmatch(path.name)
-        if not match or path.is_symlink() or int(match.group(1)) < cutoff_ms:
-            continue
-        issued = int(match.group(1))
-        # One transaction per batch: corrupt/truncated input never marks it imported.
-        with db:
-            db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT 1 FROM batches WHERE name=?", (path.name,)).fetchone():
-                continue
-            db.execute("INSERT INTO batches VALUES (?, ?)", (path.name, issued))
-            with gzip.open(path, "rt", encoding="utf-8") as stream:
-                for line in stream:
-                    record = json.loads(line)
-                    if record.get("schema_version") != 1:
-                        raise ValueError(f"unsupported forecast archive schema: {path.name}")
-                    if f"forecast_{record['run_id']}.jsonl.gz" != path.name:
-                        raise ValueError("archive run_id does not match filename")
-                    for container, metric, curve in _metric_blocks(record, "forecasts", "container_forecasts"):
-                        provenance = curve.get("provenance", {})
-                        data_end = provenance.get("data_end_ms")
-                        generated = provenance.get("generated_at_epoch_ms")
-                        eligible = isinstance(data_end, int) and isinstance(generated, int)
-                        publication = max(issued, generated) if isinstance(generated, int) else issued
-                        cursor = db.execute(
-                            "INSERT INTO curves(batch,resource_id,container,metric,model,unit,data_end_ms,"
-                            "issued_ms,basis,provenance,eligible) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                            (path.name, record["resource_id"], container, metric, curve["selected_model"],
-                             _unit(record, container, metric), data_end, publication,
-                             _basis(record, container, metric), _json(provenance), eligible),
-                        )
-                        timestamps, values = curve["x_pred_ms"], curve["yhat"]
-                        if not timestamps or len(timestamps) != len(values):
-                            raise ValueError("unaligned archive curve")
-                        for target, value in zip(timestamps, values):
-                            if not isinstance(target, int) or not math.isfinite(float(value)):
-                                raise ValueError("invalid archive point")
-                            reason = None
-                            if not eligible:
-                                reason = "missing_provenance"
-                            elif target <= max(publication, data_end):
-                                reason = "not_future_at_publication"
-                            db.execute("INSERT INTO points(curve_id,target_ms,predicted,skip_reason) VALUES (?,?,?,?)",
-                                       (cursor.lastrowid, target, float(value), reason))
-                        calibration = curve.get("calibration")
-                        if isinstance(calibration, dict):
-                            db.execute("INSERT INTO calibrations VALUES (?,?)",
-                                       (cursor.lastrowid, _json(calibration)))
-                            bounds = calibration.get("upper", [])
-                            if bounds and len(bounds) != len(timestamps):
-                                raise ValueError("unaligned calibration bounds")
-                            for target, predicted, upper in zip(timestamps, values, bounds):
-                                if upper is None:
-                                    continue
-                                if not math.isfinite(float(upper)) or float(upper) < float(predicted):
-                                    raise ValueError("invalid calibration upper bound")
-                                db.execute("INSERT INTO upper_bounds VALUES (?,?,?)",
-                                           (cursor.lastrowid, target, float(upper)))
-                    _import_holdout(db, path.name, issued, record)
-                    import_shadow(db, path.name, record)
-        imported += 1
-    return imported
 
 
-def _score_evidence(db: sqlite3.Connection, items: Iterable[dict], now_ms: int) -> dict:
-    scored = without_evidence = 0
-    for item in items:
-        evidence = item.get("observation_evidence")
-        if not isinstance(evidence, dict) or evidence.get("schema_version") != 1 or not evidence.get("source"):
-            without_evidence += 1
-            continue
-        rid = str(item["resource_id"])
-        # Evidence carries its own spec, independent of subsequent raw/spec updates.
-        for container, metric, block in _metric_blocks(evidence, "metrics", "container_metrics"):
-            timestamps, values = block["timestamps"], block["values"]
-            if len(timestamps) != len(values):
-                raise ValueError("unaligned observation evidence")
-            basis = _basis(evidence, container, metric)
-            observations = {}
-            for target, value in zip(timestamps, values):
-                if not isinstance(target, int):
-                    raise ValueError("observation timestamps must be integer epoch milliseconds")
-                if target <= now_ms:
-                    observations[target] = float(value)
-            # One indexed lookup per metric, not one DB query per historical sample.
-            rows = db.execute(
-                "SELECT p.curve_id,p.target_ms,c.basis FROM curves c JOIN points p ON p.curve_id=c.id "
-                "WHERE c.resource_id=? AND c.container=? AND c.metric=? "
-                "AND p.actual IS NULL AND c.eligible=1 AND p.target_ms>c.issued_ms "
-                "AND p.target_ms>c.data_end_ms AND p.target_ms<=?",
-                (rid, container, metric, now_ms),
-            ).fetchall()
-            for curve_id, target, expected_basis in rows:
-                if target in observations:
-                    actual = observations[target]
-                    reason = "nonfinite_observation" if not math.isfinite(actual) else (
-                        "basis_mismatch" if basis != expected_basis else None
-                    )
-                    if reason:
-                        db.execute("UPDATE points SET skip_reason=? WHERE curve_id=? AND target_ms=?",
-                                   (reason, curve_id, target))
-                    else:
-                        db.execute(
-                            "UPDATE points SET actual=?,scored_at_ms=?,observation_source=?,skip_reason=NULL "
-                            "WHERE curve_id=? AND target_ms=? AND actual IS NULL",
-                            (actual, now_ms, str(evidence["source"]), curve_id, target),
-                        )
-                        scored += 1
-    return {"newly_scored": scored, "resources_without_evidence": without_evidence}
 
 
 def _report(db: sqlite3.Connection, now_ms: int, retention_days: int) -> dict:
@@ -293,7 +110,10 @@ def _report(db: sqlite3.Connection, now_ms: int, retention_days: int) -> dict:
     rows = []
     # Reduce to curve/horizon totals before sorting by wide model/unit strings.
     for model, metric, level, horizon, unit, count, mae, mse, under, magnitude in db.execute(
-        "WITH totals AS (SELECT p.curve_id,CASE WHEN p.target_ms-c.data_end_ms<=3600000 THEN '0-1h' "
+        "SELECT c.model,c.metric,CASE WHEN c.container='' THEN 'resource' ELSE 'container' END, "
+        "t.horizon,c.unit,SUM(t.n),SUM(t.ae)/SUM(t.n),SUM(t.se)/SUM(t.n),"
+        "SUM(t.under)/SUM(t.n),SUM(t.magnitude)/SUM(t.n) "
+        "FROM (SELECT p.curve_id,CASE WHEN p.target_ms-c.data_end_ms<=3600000 THEN '0-1h' "
         "WHEN p.target_ms-c.data_end_ms<=21600000 THEN '1-6h' "
         "WHEN p.target_ms-c.data_end_ms<=86400000 THEN '6-24h' ELSE '>24h' END AS horizon, "
         "COUNT(*) AS n,SUM(ABS(p.actual-p.predicted)) AS ae,"
@@ -301,10 +121,7 @@ def _report(db: sqlite3.Connection, now_ms: int, retention_days: int) -> dict:
         "SUM(CASE WHEN p.actual>p.predicted THEN 1.0 ELSE 0.0 END) AS under,"
         "SUM(MAX(p.actual-p.predicted,0)) AS magnitude "
         "FROM points p JOIN curves c ON c.id=p.curve_id WHERE p.actual IS NOT NULL GROUP BY 1,2) "
-        "SELECT c.model,c.metric,CASE WHEN c.container='' THEN 'resource' ELSE 'container' END, "
-        "t.horizon,c.unit,SUM(t.n),SUM(t.ae)/SUM(t.n),SUM(t.se)/SUM(t.n),"
-        "SUM(t.under)/SUM(t.n),SUM(t.magnitude)/SUM(t.n) "
-        "FROM totals t JOIN curves c ON c.id=t.curve_id GROUP BY 1,2,3,4,5 "
+        "t JOIN curves c ON c.id=t.curve_id GROUP BY 1,2,3,4,5 "
         "ORDER BY 1,2,3,4,5"
     ):
         rows.append(dict(model=model, metric=metric, level=level, horizon=horizon, unit=unit, count=count,
@@ -329,74 +146,3 @@ def _report(db: sqlite3.Connection, now_ms: int, retention_days: int) -> dict:
                 coverage=coverage, rows=rows, calibration_rows=calibrated_rows,
                 shadow_comparison=shadow_report(db),
                 activation_assessment=activation_assessment(db, now_ms, retention_days), ledger=DB_NAME)
-
-
-def score_realized_forecasts(out_base: Path, items: Iterable[dict] = (), *, retention_days: int = 7,
-                            publish_report: bool = True) -> dict:
-    """Import new archives, backfill pending points, and atomically publish a report."""
-    if retention_days <= 0:
-        raise ValueError("retention_days must be positive")
-    base = Path(out_base)
-    if not (base / "forecast_history").exists() and not (base / DB_NAME).exists():
-        return {"status": "no_archives", "newly_scored": 0}
-    now_ms = int(time.time() * 1000)
-    cutoff = now_ms - retention_days * 86400_000
-    timings = {}
-    with closing(sqlite3.connect(base / DB_NAME, timeout=30)) as db:
-        # Long read-only evidence exports must not block ongoing observation scoring.
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA temp_store=FILE")
-        db.executescript(_SCHEMA)
-        db.executescript(SHADOW_SCHEMA)
-        started = time.perf_counter()
-        imported = _import_archives(db, base, cutoff)
-        timings["import_seconds"] = time.perf_counter()-started
-        started = time.perf_counter()
-        with db:
-            db.execute("BEGIN IMMEDIATE")
-            result = _score_evidence(db, items, now_ms)
-        timings["score_seconds"] = time.perf_counter()-started
-        started = time.perf_counter()
-        with db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute("DELETE FROM batches WHERE issued_ms<?", (cutoff,))
-            report = _report(db, now_ms, retention_days) if publish_report else None
-            if report is not None:
-                atomic_write_json(base / REPORT_NAME, report, indent=2)
-        timings["retention_report_seconds"] = time.perf_counter()-started
-    return dict(status="completed", imported_batches=imported, **result,
-                report_published=publish_report, timings=timings,
-                coverage=report["coverage"] if report is not None else None)
-
-
-def try_score_realized_forecasts(out_base: Path, items: Iterable[dict] = (), *, publish_report: bool = True) -> dict:
-    """Scoring failure must not undo an already committed observation/forecast."""
-    from resource_predict.settings import settings
-
-    try:
-        result = score_realized_forecasts(out_base, items, retention_days=settings.forecast.archive_retention_days,
-                                         publish_report=publish_report)
-    except Exception as exc:
-        logger.warning("[forecast_realized] scoring failed: %s", exc)
-        result = {"status": "failed", "error": str(exc)}
-    logger.info("[forecast_realized] %s", result)
-    return result
-
-
-def main() -> None:
-    from resource_predict.data.raw_store import RawResourceStore
-    from resource_predict.settings import settings
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out-dir", required=True, type=Path)
-    args = parser.parse_args()
-    store = RawResourceStore(args.out_dir, max_cache_items=1)
-    items = (store.get(rid) for rid in store.resource_ids()) if store.exists() else ()
-    print(json.dumps(score_realized_forecasts(
-        args.out_dir, items, retention_days=settings.forecast.archive_retention_days,
-    ), ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()

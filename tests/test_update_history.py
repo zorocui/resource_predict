@@ -10,6 +10,7 @@ from flask import Flask
 
 from resource_predict.api.updates import register_update_routes
 from resource_predict.data import updater
+from resource_predict.services import k8s_ingest
 from resource_predict.services.update_history import (
     UPDATE_HISTORY_RETENTION,
     append_update_history,
@@ -19,6 +20,28 @@ from resource_predict.services.update_history import (
 
 
 class UpdateHistoryStoreTest(unittest.TestCase):
+    def test_full_task_duration_overrides_phase_duration_on_write_and_legacy_read(self):
+        for status in ("success", "partial_success", "failed"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                record = {"id": "legacy", "status": status, "started_at": 1000,
+                          "finished_at": 5474, "elapsed_seconds": 1901,
+                          "cluster_results": [{"cluster": "a", "status": "success", "elapsed_seconds": 475}]}
+                path = update_history_path(tmp)
+                path.write_text(json.dumps({"records": [record]}), encoding="utf-8")
+                original = path.read_bytes()
+                restored = get_update_history(out_dir=tmp)[0]
+                self.assertEqual(restored["elapsed_seconds"], 4474)
+                self.assertEqual(restored["cluster_results"][0]["elapsed_seconds"], 475)
+                self.assertEqual(path.read_bytes(), original)
+                append_update_history(record, out_dir=tmp)
+                saved = json.loads(path.read_text(encoding="utf-8"))["records"][0]
+                self.assertEqual(saved["elapsed_seconds"], 4474)
+
+    def test_missing_time_boundary_keeps_legacy_elapsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            append_update_history({"status": "success", "finished_at": 5000, "elapsed_seconds": 12.5}, out_dir=tmp)
+            self.assertEqual(get_update_history(out_dir=tmp)[0]["elapsed_seconds"], 12.5)
+
     def test_partial_success_and_cluster_results_are_normalized(self):
         with tempfile.TemporaryDirectory() as tmp:
             append_update_history(
@@ -109,6 +132,24 @@ class UpdateHistoryStoreTest(unittest.TestCase):
 class UpdateHistoryIntegrationTest(unittest.TestCase):
     def setUp(self):
         updater._last_history_started_at = None
+
+    def test_k8s_result_counts_fetch_and_upsert_including_failure(self):
+        for success in (True, False):
+            with self.subTest(success=success):
+                with patch.object(k8s_ingest, "_history_hours_for_fetch", return_value=None), \
+                     patch.object(k8s_ingest, "mark_external_update_started"), \
+                     patch.object(k8s_ingest, "mark_external_update_finished") as finished, \
+                     patch.object(k8s_ingest, "mark_external_update_failed"), \
+                     patch.object(k8s_ingest.time, "perf_counter", side_effect=[0, 2571, 4474]), \
+                     patch.object(k8s_ingest, "fetch_k8s_prometheus_result", return_value={
+                         "items": [{"resource_id": "workload"}], "cluster_results": [{"cluster": "a", "status": "success"}]}), \
+                     patch.object(k8s_ingest, "run_upsert_with_data", return_value={"success": success, "elapsed_seconds": 1901}):
+                    result = k8s_ingest.run_k8s_prometheus_upsert()
+                self.assertEqual(result["elapsed_seconds"], 4474)
+                self.assertEqual(result["fetch_elapsed_seconds"], 2571)
+                self.assertEqual(result["upsert_elapsed_seconds"], 1901)
+                if success:
+                    self.assertEqual(finished.call_args.args[0]["elapsed_seconds"], 4474)
 
     def test_external_success_writes_one_terminal_record(self):
         with patch.object(updater, "append_update_history", return_value=True) as append:

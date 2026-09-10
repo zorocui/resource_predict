@@ -34,8 +34,6 @@ def write_prediction_outputs(
     total_elapsed: float,
     raw_stats: Dict[str, int],
     prediction_skips: Optional[List[Dict[str, str]]] = None,
-    forecast_archive: Optional[Dict[str, Any]] = None,
-    forecast_realized: Optional[Dict[str, Any]] = None,
     execution_stats: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     output_started = time.perf_counter()
@@ -176,8 +174,6 @@ def write_prediction_outputs(
         "total_elapsed_seconds": total_elapsed,
         "total_output_bytes": total_bytes,
         "forecast_error_report_file": FORECAST_ERROR_REPORT_FILENAME,
-        "forecast_archive": dict(forecast_archive or {}),
-        "forecast_realized": dict(forecast_realized or {}),
         "raw": dict(raw_stats),
         "prediction_skips": prediction_skips,
         "execution": {**(execution_stats or {}), "output_write_seconds": time.perf_counter()-output_started},

@@ -108,11 +108,24 @@ def run_loop(
             with patch.object(k8s_ingest, "_k8s_stop_event", stop_event):
                 with patch.object(k8s_ingest, "_k8s_reload_event", reload_event):
                     with patch.object(k8s_ingest, "run_k8s_prometheus_upsert", fake_upsert):
-                        k8s_ingest._k8s_scheduler_loop(interval_minutes * 60.0, 0.0)
+                        k8s_ingest._k8s_scheduler_loop(interval_minutes * 60.0)
     return clock, cfg, fetches, reload_event
 
 
 class K8SSchedulerReloadTest(unittest.TestCase):
+    def test_six_hour_schedule_has_no_extra_startup_pull(self):
+        _, _, fetches, event = run_loop(
+            interval_minutes=360,
+            script=[
+                (60.0, True, None),
+                (21540.0, False, None),
+                (21600.0, False, None),
+                (100000.0, False, None),
+            ],
+        )
+        self.assertEqual(fetches, [(22600.0, "scheduled"), (44200.0, "scheduled")])
+        self.assertEqual(event.timeouts, [21600.0, 21540.0, 21600.0, 21600.0])
+
     def test_config_save_wakes_loop_without_extra_fetch(self):
         """保存配置把线程从 60 分钟等待中唤醒，但不应该立刻拉取。"""
         script = [
@@ -122,9 +135,9 @@ class K8SSchedulerReloadTest(unittest.TestCase):
         ]
         _clock, _cfg, fetches, reload_event = run_loop(script=script, interval_minutes=60)
 
-        self.assertEqual([item[1] for item in fetches], ["scheduled_startup", "scheduled"])
-        # 关键断言：第二轮发生在原定到期时刻 4601，而不是配置保存的 1005。
-        self.assertEqual([item[0] for item in fetches], [1000.0, 4601.0])
+        self.assertEqual([item[1] for item in fetches], ["scheduled"])
+        # 关键断言：首轮发生在原定到期时刻 4601，而不是配置保存的 1005。
+        self.assertEqual([item[0] for item in fetches], [4601.0])
         # 被提前唤醒后等待的是剩余 3595 秒，说明周期没有被重置也没有被提前。
         self.assertEqual(reload_event.timeouts, [3600.0, 3595.0, 3600.0])
 
@@ -136,14 +149,13 @@ class K8SSchedulerReloadTest(unittest.TestCase):
         ]
         _clock, cfg, fetches, reload_event = run_loop(script=script, interval_minutes=60)
 
-        self.assertEqual(len(fetches), 1)
-        self.assertEqual(fetches[0][1], "scheduled_startup")
+        self.assertEqual(fetches, [])
         # 第二次等待按新周期从上一轮时刻重算：1000 + 7200 - 1005 = 7195。
         self.assertEqual(reload_event.timeouts, [3600.0, 7195.0])
         self.assertEqual(cfg.scheduled_update_interval_minutes, 120)
 
-    def test_enabling_from_disabled_still_wakes_and_pulls(self):
-        """热更新能力必须保留：从关闭改为开启后要能被唤醒并跑首轮。"""
+    def test_enabling_from_disabled_waits_for_first_deadline(self):
+        """热更新能力必须保留：从关闭改为开启后被唤醒，但不额外执行启动拉取。"""
         script = [
             (0.0, True, {"scheduled_update_enabled": True}),
             (100000.0, False, None),
@@ -153,21 +165,21 @@ class K8SSchedulerReloadTest(unittest.TestCase):
         )
 
         self.assertTrue(cfg.scheduled_update_enabled)
-        self.assertEqual([item[1] for item in fetches], ["scheduled_startup"])
+        self.assertEqual(fetches, [])
         # 第一次是无超时等待（关闭状态），被唤醒后才进入正常周期。
         self.assertEqual(reload_event.timeouts, [None, 3600.0])
 
     def test_shortening_interval_pulls_when_new_deadline_already_overdue(self):
         """把周期改短到已逾期是唯一会因保存配置而立即拉取的情况之一。"""
         script = [
-            # t=1000 首轮完成后，t=3000 保存配置把周期从 60 分钟改成 1 分钟。
+            # t=1000 启动后，t=3000 保存配置把周期从 60 分钟改成 1 分钟。
             (2000.0, True, {"scheduled_update_interval_minutes": 1}),
             (100000.0, False, None),
         ]
         _clock, _cfg, fetches, reload_event = run_loop(script=script, interval_minutes=60)
 
         # 新到期时刻 1000 + 60 = 1060 已在 t=3000 之前，因此立即拉取。
-        self.assertEqual(fetches, [(1000.0, "scheduled_startup"), (3000.0, "scheduled")])
+        self.assertEqual(fetches, [(3000.0, "scheduled")])
         self.assertEqual(reload_event.timeouts, [3600.0, 60.0])
 
     def test_shortening_interval_waits_when_new_deadline_still_future(self):
@@ -178,7 +190,7 @@ class K8SSchedulerReloadTest(unittest.TestCase):
         ]
         _clock, _cfg, fetches, reload_event = run_loop(script=script, interval_minutes=60)
 
-        self.assertEqual(fetches, [(1000.0, "scheduled_startup")])
+        self.assertEqual(fetches, [])
         # 新到期时刻 1000 + 1800 = 2800，t=1005 时还剩 1795 秒。
         self.assertEqual(reload_event.timeouts, [3600.0, 1795.0])
 
@@ -191,7 +203,7 @@ class K8SSchedulerReloadTest(unittest.TestCase):
         ]
         _clock, _cfg, fetches, reload_event = run_loop(script=script, interval_minutes=60)
 
-        self.assertEqual(fetches, [(1000.0, "scheduled_startup")])
+        self.assertEqual(fetches, [])
         # 原到期时刻 4600 保持不变，t=1500 时还剩 3100 秒。
         self.assertEqual(reload_event.timeouts, [3600.0, None, 3100.0])
 
@@ -204,42 +216,41 @@ class K8SSchedulerReloadTest(unittest.TestCase):
         ]
         _clock, _cfg, fetches, reload_event = run_loop(script=script, interval_minutes=60)
 
-        self.assertEqual(fetches, [(1000.0, "scheduled_startup"), (10999.0, "scheduled")])
+        self.assertEqual(fetches, [(10999.0, "scheduled")])
         self.assertEqual(reload_event.timeouts, [3600.0, None, 3600.0])
 
-    def test_failed_fetch_consumes_slot_and_keeps_startup_label(self):
-        """拉取失败同样占用本轮：不快速重试，且下一轮仍标记 scheduled_startup。"""
-        script = [(100000.0, False, None)]
+    def test_failed_fetch_consumes_slot(self):
+        """拉取失败同样占用本轮：不快速重试，且下一轮仍标记 scheduled。"""
+        script = [(3600.0, False, None), (100000.0, False, None)]
         _clock, _cfg, fetches, reload_event = run_loop(
             script=script, interval_minutes=60, upsert_raises=True
         )
 
-        self.assertEqual(fetches, [(1000.0, "scheduled_startup")])
+        self.assertEqual(fetches, [(4600.0, "scheduled")])
         # 失败后仍然等满一个完整周期，没有立即重试。
-        self.assertEqual(reload_event.timeouts, [3600.0])
+        self.assertEqual(reload_event.timeouts, [3600.0, 3600.0])
 
     def test_next_pull_is_anchored_to_fetch_start_not_completion(self):
         """拉取耗时不能把下一轮往后推，否则固定回看窗口盖不住实际间隔。"""
-        script = [(3000.0, False, None), (100000.0, False, None)]
+        script = [(3600.0, False, None), (3000.0, False, None), (100000.0, False, None)]
         _clock, _cfg, fetches, reload_event = run_loop(
             script=script, interval_minutes=60, upsert_seconds=600.0
         )
 
-        # 首轮 t=1000 开始、t=1600 结束；第二轮仍在 t=4600（1000 + 3600）开始，
-        # 而不是按完成时刻算出的 5200。
-        self.assertEqual(fetches, [(1000.0, "scheduled_startup"), (4600.0, "scheduled")])
-        self.assertEqual(reload_event.timeouts, [3000.0, 3000.0])
+        # 首轮 t=4600 开始、t=5200 结束；第二轮仍在 t=8200 开始。
+        self.assertEqual(fetches, [(4600.0, "scheduled"), (8200.0, "scheduled")])
+        self.assertEqual(reload_event.timeouts, [3600.0, 3000.0, 3000.0])
 
     def test_fetch_longer_than_interval_starts_next_round_immediately(self):
         """耗时超过周期时立刻开始下一轮，尽量让窗口贴合真实间隔。"""
         _clock, _cfg, fetches, reload_event = run_loop(
-            script=[], interval_minutes=60, upsert_seconds=7200.0
+            script=[(3600.0, False, None)], interval_minutes=60, upsert_seconds=7200.0
         )
 
-        # 首轮 t=1000 开始、t=8200 结束，已越过 next_due=4600，因此第二轮立即开始。
-        self.assertEqual(fetches[:2], [(1000.0, "scheduled_startup"), (8200.0, "scheduled")])
-        # 全程没有进入等待，因此不会有任何 reload 超时记录。
-        self.assertEqual(reload_event.timeouts, [])
+        # 首轮 t=4600 开始、t=11800 结束，已越过到期时刻，因此第二轮立即开始。
+        self.assertEqual(fetches[:2], [(4600.0, "scheduled"), (11800.0, "scheduled")])
+        # 仅首轮定时拉取前等待一个周期。
+        self.assertEqual(reload_event.timeouts, [3600.0])
 
 
 if __name__ == "__main__":

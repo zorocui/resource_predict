@@ -134,7 +134,7 @@ def replay_policy(batches, enabled, *, early_cost=False, min_mean_loss=0., probe
 
 
 def analyze_gate(rows, *, start_origin=None, feedback_delay_hours=0, compare_feedback=False,
-                 compare_exhaustion=False):
+                 compare_exhaustion=False, diagnostic=None, history_diagnostic=None):
     if compare_exhaustion and not compare_feedback:
         raise ValueError('Exhaustion comparison requires a common feedback warm start')
     if feedback_delay_hours < 0:
@@ -184,6 +184,14 @@ def analyze_gate(rows, *, start_origin=None, feedback_delay_hours=0, compare_fee
                         'prediction': prediction, 'gain': gain, 'cost': models['conservative_q90'],
                         'actual': np.maximum([r['delta_wall_seconds'] for r in test], 0.),
                         'budget': .5*reference*len(test)})
+    if history_diagnostic is not None:
+        result.update(status='partial' if unscorable else 'ok', evaluation_batches=len(batches),
+                      unscorable_origin_numbers=unscorable, diagnostic=history_diagnostic(train, batches))
+        return result
+    if diagnostic is not None:
+        result.update(status='partial' if unscorable else 'ok', evaluation_batches=len(batches),
+                      unscorable_origin_numbers=unscorable, diagnostic=diagnostic(batches))
+        return result
     gated, ungated = replay_policy(batches, True), replay_policy(batches, False)
     result.update(status='partial' if unscorable else 'ok', evaluation_batches=len(batches),
                   unscorable_origin_numbers=unscorable, gated=gated, ungated=ungated,

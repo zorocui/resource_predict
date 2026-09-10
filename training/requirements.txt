@@ -1,0 +1,2 @@
+# 在项目 requirements.txt 的基础上安装；生产运行不依赖 torch。
+torch>=2.6,<3

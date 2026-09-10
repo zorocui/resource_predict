@@ -994,10 +994,6 @@
           <span class="decision-action">${list.escapeHtml(actionText)}</span>
         </div>
         <div class="decision-row">
-          <span class="decision-label">紧急度 ${list.infoTooltip(list.urgencyTooltip(resource), "紧急度计算说明")}</span>
-          <span>${list.escapeHtml(list.urgencyText(resource))}</span>
-        </div>
-        <div class="decision-row">
           <span class="decision-label">目标结果</span>
           <div class="target-result" title="${list.escapeHtml(list.targetSpecText(resource))}">
             ${list.targetSpecDetailMarkup(resource)}

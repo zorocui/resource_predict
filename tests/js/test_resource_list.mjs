@@ -114,13 +114,14 @@ test("tooltips use backend components without invented confidence bonuses or add
     scaling_advice: { confidence_score: 71, confidence_metric_scores: { cpu: 99 },
       target_k8s_policy: { ready_for_execution: true },
       confidence_breakdown: { version: 2, score: 71, components: [{ label: "同方向指标", value: 90 }, { label: "质量扣分", value: -19 }] } } };
-  assert.match(list.confidenceTooltip(item), /同方向指标90 - 质量扣分19/);
+  assert.match(list.confidenceTooltip(item), /同方向指标：90\n质量扣分：-19\n结果：90 − 19 ≈ 71 分/);
   assert.match(list.confidenceTooltip(item), /不是预测正确的概率/);
   assert.doesNotMatch(list.confidenceTooltip(item), /执行就绪加成|最高指标得分|其他调整/);
-  assert.match(list.urgencyTooltip(item), /容量压力82/);
-  assert.match(list.urgencyTooltip(item), /app · CPU 扩容: 82/);
+  assert.match(list.urgencyTooltip(item), /容量压力：82\n结果：82 ≈ 82 分/);
+  assert.match(list.urgencyTooltip(item), /公式：触阈分 \+ 60 × 压力/);
   assert.match(list.urgencyTooltip(item), /未经生产回放校准/);
   delete item.scaling_advice.confidence_breakdown;
-  assert.match(list.confidenceTooltip(item), /缺少新版评分分解/);
+  assert.match(list.confidenceTooltip(item), /本次结果未保存计算明细/);
+  assert.match(list.confidenceTooltip(item), /重新生成预测/);
   assert.doesNotMatch(list.confidenceTooltip(item), /同方向指标|99|默认中等置信度/);
 });

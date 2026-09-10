@@ -68,7 +68,7 @@ python -m benchmarks.forecast_feedback_benchmark --resources 10000 --containers 
 
 2026-09-06 本机单进程重复负载测量：旧实现报告 23.4–26.5 秒，优化后 12.3–13.2 秒；校准旧实现 39.3–44.7 秒，优化后 33.6 秒。补评约 6–7 秒基本不变。优化版峰值 RSS 67.0 MiB，旧版复测 63.9 MiB；复用库约 590 MiB，文件空闲页复用，不承诺每轮收缩。Windows 进程累计写入约 2.73 GiB 降至 1.28 GiB，包含合成重置、SQLite 日志及临时排序文件，不能等同于物理磁盘写入。该测量不是多次统计置信区间。
 
-校准通过单次有序游标选取相同样本，每组最多保留 500 个；报告先汇总曲线/提前量，再按模型与单位汇总，并保持按实际点数加权。浮点累加顺序变化可能产生末位差异。raw 提交延迟报告，预测结束统一发布，减少一次完整汇总。回归命令：`python -m pytest -q tests/test_feedback_performance.py tests/test_calibration.py tests/test_realized_error.py`。
+校准通过单次有序游标选取相同样本，每组最多保留 500 个；报告先汇总曲线/提前量，再按模型与单位汇总，并保持按实际点数加权。浮点累加顺序变化可能产生末位差异。raw 提交延迟报告，预测结束统一发布，减少一次完整汇总。回归命令：`python -m pytest -q tests/test_feedback_performance.py tests/test_calibration.py`。
 
 ## 详情加载性能基准
 
@@ -136,38 +136,22 @@ python -m benchmarks.resource_detail_benchmark --resources 1000 --points 2016 --
 定向回归覆盖测试标签不影响选型或权重、最新观测影响未来曲线、集成真实误差、短历史降级、失败模型身份、分钟级日周期和留档发布/保留：
 
 ```bash
-python -m pytest -q tests/test_forecast_evaluation.py tests/test_forecast_optimizations.py tests/test_forecasting.py tests/test_forecast_archive.py tests/test_forecast_error_report.py
+python -m pytest -q tests/test_forecast_evaluation.py tests/test_forecast_optimizations.py tests/test_forecasting.py tests/test_forecast_error_report.py
 ```
 
 留档只保存预测与当时规格，不代表已经完成生产收益评估。必须后续对齐真实观测并进行回放/受控执行，才能报告容量不足、预留量或服务质量收益。万级资源测试按容器与指标展开后的序列数衡量；图表历史点数上限不等于模型训练点数上限。
 
 独立测试的输入契约是按时间可获得的序列。K8S 新采集短缺口只向前填补；已有 raw 缓存可能来自旧版双向插值，不能逆向恢复为原始观测，严格实验应重新采集或使用未插值输入。自定义 Provider 必须保证清洗、规格归一化与特征构造不使用预测起点之后的信息。填补值仍属于加工数据，生产评分应以后续真实采样点为准。
 
-### 真实误差回填验证
+### 轻量准确率验证
 
-`tests/test_realized_error.py` 覆盖重复评分、迟到补评、原曲线保留、精确时间、未来观测排除、规格变化、容器/scope 隔离、非有限值、导入回滚、保留期和 raw/upsert 自动链路。provider 测试验证采集证据不包含填补点。
+逐点留档与SQLite导入已删除。运行 `python -m pytest -q tests/test_accuracy_summary.py tests/test_multicore_pipeline.py`，验证自动生成汇总、选用模型、±5个百分点边界、容器去重、无效值、无SQLite/留档副作用及多核输出。前端运行 `node --test tests/js/test_accuracy_summary.mjs`。
 
-```bash
-python -m pytest -q tests/test_realized_error.py tests/test_k8s_workload_provider.py tests/test_forecast_archive.py
-python -m resource_predict.pipeline.realized_error --out-dir outputs/k8s
-```
-
-逐点追溯可使用 SQLite 查询（`container=''` 表示资源聚合指标）：
-
-```sql
-SELECT c.batch, c.resource_id, c.container, c.metric, c.model, c.unit,
-       p.target_ms, p.predicted, p.actual, p.scored_at_ms, p.observation_source,
-       p.target_ms-c.data_end_ms AS data_horizon_ms,
-       p.target_ms-c.issued_ms AS publication_horizon_ms, p.skip_reason
-FROM points p JOIN curves c ON c.id=p.curve_id;
-```
-
-原始证据仅保存最新接收批次，首次真实评分固定；监控修订不覆盖既有评分。生产性能应测量实际容器数、预测频率、窗口点数下的数据库大小和评分耗时。不以 mock 精度证明生产收益；基于真实残差的经验上界见下节。
 
 ### 经验上界验证
 
 ```bash
-python -m pytest -q tests/test_calibration.py tests/test_realized_error.py tests/test_io.py
+python -m pytest -q tests/test_calibration.py tests/test_io.py
 ```
 
 校准测试验证历史已评分样本的时间隔离、同目标去重、配置/版本/模型/容器/规格隔离、分提前量缺样本降级、负残差余量下限、只读账本异常、留档覆盖评分、增量合并和 API 输出。新增表通过 CREATE TABLE IF NOT EXISTS 增量创建，不重写旧预测或评分。

@@ -1,11 +1,39 @@
 """Accuracy contract: publication selection, denominators, units and read-only export."""
 import json
+import re
 import sqlite3
 
 import pytest
 
 from resource_predict.pipeline.realized_error import _SCHEMA
 from resource_predict.services.forecast_accuracy import DB_NAME, accuracy_session
+from resource_predict.services import forecast_accuracy
+
+
+class LegacySQLConnection(sqlite3.Connection):
+    """Exercise the service without features absent from SQLite 3.7.17."""
+
+    def execute(self, sql, parameters=()):
+        assert not re.search(r"\bWITH\b|\bOVER\s*\(|\bROW_NUMBER\s*\(|\bjson_(?:extract|valid)\s*\(|\binstr\s*\(", sql, re.I), sql
+        if sql.upper().startswith("PRAGMA QUERY_ONLY"):
+            # Unknown pragmas are ignored by 3.7.17; URI mode=ro must suffice.
+            return super().execute("SELECT 1 WHERE 0")
+        return super().execute(sql, parameters)
+
+    def create_function(self, name, nargs, function, **kwargs):
+        assert "deterministic" not in kwargs
+        return super().create_function(name, nargs, function, **kwargs)
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["native", "sqlite37-guard"])
+def accuracy_sqlite_compatibility(request, monkeypatch):
+    if request.param:
+        connect = forecast_accuracy.sqlite3.connect
+
+        def guarded_connect(*args, **kwargs):
+            return connect(*args, factory=LegacySQLConnection, **kwargs)
+
+        monkeypatch.setattr(forecast_accuracy.sqlite3, "connect", guarded_connect)
 
 
 @pytest.fixture
@@ -136,10 +164,12 @@ def test_report_and_export_share_read_snapshot_and_cannot_write(ledger):
     db.execute("PRAGMA journal_mode=WAL")
     add(db, actual=None)
     with accuracy_session([path], now_ms=4000000) as session:
+        candidates = list(session.candidates())
         assert session.report()["coverage"]["matched_points"] == 0
         db.execute("UPDATE points SET actual=.5")
         db.commit()
         assert list(session.points())[0]["actual"] is None
+        assert list(session.candidates()) == candidates
         with pytest.raises(sqlite3.OperationalError):
             session.db.execute("DELETE FROM ledger_0.points")
     with accuracy_session([path], now_ms=4000000) as session:
@@ -178,3 +208,93 @@ def test_horizons_use_publication_not_training_cutoff(ledger):
         add(db, rid=str(index), issued=10000000, data_end=1, target=10000000+delta)
     with accuracy_session([path], now_ms=200000000) as session:
         assert [p["horizon"] for p in session.points()] == ["unknown", "0-1h", "0-1h", "1-6h", "1-6h", "6-24h", "6-24h", ">24h"]
+
+
+def test_multiple_ledgers_tie_breaking_and_candidate_native_values(ledger, tmp_path):
+    db, path = ledger
+    add(db, predicted=.7)
+    db.execute("UPDATE curves SET provenance=?", ('{"ledger":"first"}',))
+    db.commit()
+    second_path = tmp_path / "second"
+    second_path.mkdir()
+    second = sqlite3.connect(second_path / DB_NAME)
+    try:
+        second.executescript(_SCHEMA)
+        add(second, predicted=.8)
+        second.execute("UPDATE curves SET provenance=?", ('{"ledger":"second"}',))
+        second.commit()
+        with accuracy_session([path, second_path, path], q="VM", now_ms=4000000) as session:
+            candidates = list(session.candidates())
+            assert len(candidates) == 2
+            assert [row["predicted_native"] for row in candidates] == [.7, .8]
+            assert all(row["predicted_finite"] == 1 for row in candidates)
+            assert {row["provenance"] for row in candidates} == {'{"ledger":"first"}', '{"ledger":"second"}'}
+            report = session.report()
+            assert report["coverage"]["candidate_points"] == 2
+            assert report["coverage"]["duplicate_points"] == 1
+            assert report["items"][0]["predicted"] == 80
+            assert report["items"][0]["provenance"] == '{"ledger":"second"}'
+    finally:
+        second.close()
+
+
+def test_percentile_rank_and_dedup_batch_boundaries(ledger):
+    db, path = ledger
+    add(db, unit="cores", target=2000, predicted=0, actual=0)
+    db.executemany("INSERT INTO points(curve_id,target_ms,predicted,actual,observation_source) VALUES (1,?,?,0,'prometheus')",
+                   ((2000+i, i) for i in range(1, 1021)))
+    db.commit()
+    with accuracy_session([path], now_ms=4000000) as session:
+        report = session.report()
+        summary = report["summary"][0]
+        assert summary["count"] == 1021
+        assert summary["p95_error"] == 969
+        assert len(list(session.candidates())) == len(list(session.points())) == 1021
+
+
+def test_large_curve_metadata_is_stored_once_and_exported_intact(ledger):
+    db, path = ledger
+    add(db, unit="k8s_workload:cpu_usage_cores")
+    basis = json.dumps(["k8s_workload", {"spec": {"containers": [
+        {"name": str(i), "cpu_limit": 1, "memory_limit": 2} for i in range(1000)]}}])
+    provenance = json.dumps({"notes": "完整来源" * 1000}, ensure_ascii=False)
+    db.execute("UPDATE curves SET basis=?,provenance=?", (basis, provenance))
+    db.executemany("INSERT INTO points(curve_id,target_ms,predicted,actual,observation_source) VALUES (1,?,.5,.5,'prometheus')",
+                   ((4000000+i,) for i in range(200)))
+    db.commit()
+    with accuracy_session([path], now_ms=5000000) as session:
+        assert session.db.execute("SELECT count(*) FROM curve_metadata").fetchone()[0] == 1
+        for name in ("candidates", "chosen", "selected", "errors"):
+            columns = {row[1] for row in session.db.execute(f"PRAGMA table_info({name})")}
+            assert not columns & {"basis", "provenance", "evaluation"}
+        assert session.report()["total"] == 201
+        for point in session.points():
+            assert point["basis"] == basis and point["provenance"] == provenance
+        for point in session.candidates():
+            assert point["basis"] == basis and point["provenance"] == provenance
+        # Export ordering must scan the point index before looking up metadata;
+        # a sorter carrying repeated JSON would undo the storage improvement.
+        for table in ("selected", "candidates"):
+            plan = session.db.execute(f"EXPLAIN QUERY PLAN SELECT * FROM {table}_export ORDER BY target_ms,resource_type,resource_id,container,metric,basis_unit,model,"
+                                      + ("issued_ms,batch" if table == "candidates" else "batch")).fetchall()
+            assert not any("TEMP B-TREE" in row[3] for row in plan)
+
+
+def test_holdout_snapshot_is_pinned_before_first_consumer(ledger):
+    db, path = ledger
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("INSERT INTO holdout_curves VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        1, "batch", "vm", "", "cpu", "a", "openstack_vm:ratio", 1000, 5000,
+        '["openstack_vm",{}]', '{}', '{"role":"independent_test"}', 1))
+    db.execute("INSERT INTO holdout_points VALUES (1,3000,.5,NULL,'invalid_observation')")
+    db.commit()
+    with accuracy_session([path], source="holdout", now_ms=6000) as session:
+        db.execute("UPDATE holdout_points SET actual=.5,skip_reason=NULL")
+        db.commit()
+        assert session.report()["coverage"]["nonfinite_observation"] == 1
+        assert list(session.points())[0]["actual"] is None
+        assert list(session.candidates())[0]["actual_finite"] == 0
+        with pytest.raises(sqlite3.OperationalError):
+            session.db.execute("DELETE FROM ledger_0.holdout_points")
+    with accuracy_session([path], source="holdout", now_ms=6000) as session:
+        assert session.report()["coverage"]["matched_points"] == 1

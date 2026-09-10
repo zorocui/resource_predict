@@ -1,5 +1,4 @@
 import copy
-import json
 import sqlite3
 from contextlib import closing
 from unittest.mock import patch
@@ -8,13 +7,10 @@ import pytest
 import pandas as pd
 
 from resource_predict.pipeline.calibration import calibrate_forecasts, refresh_calibration_advice
-from resource_predict.pipeline.forecast_archive import archive_forecasts
 from resource_predict.data.io import merge_charts_into_detail
 from resource_predict.pipeline.run import generate_forecasts
 from resource_predict.pipeline.partial import load_existing_forecast_items
-from resource_predict.pipeline.realized_error import (
-    DB_NAME, REPORT_NAME, _SCHEMA, _basis, _json, _unit, score_realized_forecasts,
-)
+from resource_predict.pipeline.realized_error import DB_NAME, _SCHEMA, _basis, _json, _unit
 
 T = 1_788_600_000_000
 
@@ -122,24 +118,6 @@ def test_no_database_and_unreadable_database_fall_back(tmp_path):
     assert source["scaling_advice"]["target_spec"] == {"cpu_cores": 2}
 
 
-def test_calibrated_bound_is_archived_and_scored_without_recalibration(tmp_path):
-    seed(tmp_path)
-    source = item()
-    calibrate_forecasts(tmp_path, [source])
-    with patch("time.time", return_value=T/1000):
-        archive_forecasts(tmp_path, [source])
-    source["observation_evidence"] = {
-        "schema_version": 1, "source": "test", "resource_type": "openstack_vm", "spec": source["spec"],
-        "metrics": {"cpu": {"timestamps": [T+1800000], "values": [0.35]}},
-    }
-    with patch("time.time", return_value=(T+3600000)/1000):
-        score_realized_forecasts(tmp_path, [source])
-        score_realized_forecasts(tmp_path, [source])
-    row, = json.loads((tmp_path / REPORT_NAME).read_text())["calibration_rows"]
-    assert row["count"] == 1
-    assert row["empirical_coverage"] == 0
-    assert row["mean_exceedance"] == pytest.approx(0.05)
-    assert row["mean_margin"] == pytest.approx(0.1)
 
 
 def test_container_samples_are_isolated_and_advice_can_be_rebuilt(tmp_path):

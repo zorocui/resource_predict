@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 import json
 from pathlib import Path
-import sqlite3
+from resource_predict.sqlite_runtime import sqlite3
 import time
 from typing import Iterable
 
@@ -77,24 +77,24 @@ def _payloads(db, candidates):
 
 
 def _summary(db, aliases, params):
-    # Only indexed identifiers/status and cached aggregate numbers enter these CTEs.
+    # Derived tables keep aggregation in SQL on SQLite 3.7 (which has no CTEs).
     events = " UNION ALL ".join(
         f"SELECT '{alias}' AS scope_id,task_id,resource_id,resource_type,action,{_STATUS} AS report_status "
         f"FROM {alias}.events" + _where(params) for alias in aliases
     )
-    cte = f"WITH filtered_events AS ({events}) "
-    count, resources = db.execute(cte + """
-        SELECT (SELECT COUNT(*) FROM filtered_events),
-        (SELECT COUNT(*) FROM (SELECT DISTINCT resource_type,resource_id FROM filtered_events))
+    count, resources = db.execute(f"""
+        SELECT (SELECT COUNT(*) FROM ({events})),
+        (SELECT COUNT(*) FROM (SELECT DISTINCT resource_type,resource_id FROM ({events})))
         """, params).fetchone()
-    statuses = dict(db.execute(cte + "SELECT report_status,COUNT(*) FROM filtered_events GROUP BY report_status", params))
+    statuses = dict(db.execute(
+        f"SELECT report_status,COUNT(*) FROM ({events}) GROUP BY report_status", params))
     cached = " UNION ALL ".join(f"SELECT '{alias}' AS scope_id,* FROM {alias}.metric_summaries" for alias in aliases)
-    metric_rows = db.execute(cte.rstrip() + f", cached AS ({cached}) " + """
+    metric_rows = db.execute(f"""
         SELECT e.resource_type,e.action,m.metric,m.basis,MIN(m.unit),COUNT(*),COUNT(DISTINCT e.resource_id),
                COUNT(m.relative_change_pct),AVG(m.relative_change_pct),SUM(m.before_capacity),
                SUM(m.before_pct*m.before_capacity),SUM(m.after_pct*m.before_capacity),
                SUM(m.reclaimed_capacity),SUM(m.reclaimed_unit_hours)
-        FROM filtered_events e JOIN cached m ON e.scope_id=m.scope_id AND e.task_id=m.task_id
+        FROM ({events}) e JOIN ({cached}) m ON e.scope_id=m.scope_id AND e.task_id=m.task_id
         WHERE e.report_status='evaluated' AND m.before_capacity>0
           AND m.before_pct IS NOT NULL AND m.after_pct IS NOT NULL
         GROUP BY e.resource_type,e.action,m.metric,m.basis

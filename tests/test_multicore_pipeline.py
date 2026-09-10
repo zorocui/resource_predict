@@ -1,4 +1,3 @@
-import gzip
 import json
 import os
 from unittest.mock import patch
@@ -38,6 +37,7 @@ def test_single_workload_container_tasks_spawn_and_keep_artifacts(tmp_path, monk
     detail = json.loads((tmp_path / "details" / "part-00000.json").read_text(encoding="utf-8"))["resources"][0]
     assert set(detail["container_charts_forecast"]) == {"app", "sidecar"}
     assert "_accuracy_holdout" not in detail
-    with gzip.open(report["forecast_archive"]["path"], "rt", encoding="utf-8") as stream:
-        archive = json.loads(next(stream))
-    assert len(archive["holdout_forecasts"]) == 12
+    summary = json.loads((tmp_path / "forecast_accuracy_summary.json").read_text(encoding="utf-8"))
+    assert len(summary["rows"]) == 8
+    assert not (tmp_path / "forecast_history").exists()
+    assert not (tmp_path / "forecast_realized.sqlite3").exists()

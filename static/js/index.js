@@ -219,11 +219,15 @@
   }
 
   function formatDuration(value) {
+    if (value == null || value === "") return "-";
     const seconds = Number(value);
     if (!Number.isFinite(seconds) || seconds < 0) return "-";
-    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`;
-    const minutes = Math.floor(seconds / 60);
-    const remainder = Math.round(seconds % 60);
+    const rounded = Math.round(seconds);
+    if (rounded < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒`;
+    const hours = Math.floor(rounded / 3600);
+    const minutes = Math.floor((rounded % 3600) / 60);
+    const remainder = rounded % 60;
+    if (hours) return `${hours} 小时${minutes ? ` ${minutes} 分` : ""}${remainder ? ` ${remainder} 秒` : ""}`;
     return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
   }
 

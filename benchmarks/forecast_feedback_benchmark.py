@@ -17,7 +17,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from resource_predict.pipeline.realized_error import _SCHEMA, _report, _score_evidence, _basis, _unit, _json
+from resource_predict.pipeline.realized_error import _SCHEMA, _report, _basis, _unit, _json
 from resource_predict.pipeline.shadow_evaluation import SCHEMA as SHADOW_SCHEMA
 from resource_predict.pipeline.calibration import _calibrate_curve
 
@@ -96,18 +96,6 @@ def seed(db, resources, containers, batches, points):
     db.execute("ANALYZE")
 
 
-def observations(resources, containers, points):
-    for r in range(resources):
-        item = resource(r, containers)
-        item["observation_evidence"] = {
-            "schema_version": 1, "source": "benchmark", "resource_type": item["resource_type"],
-            "spec": item["spec"], "container_metric_modes": item["container_metric_modes"],
-            "container_metrics": {f"app-{c}": {m: {
-                "timestamps": [NOW-86400000+(p+1)*600000 for p in range(points)],
-                "values": [0.3]*points,
-            } for m in METRICS} for c in range(containers)},
-        }
-        yield item
 
 
 def measure(path, resources, containers, batches, points):
@@ -129,15 +117,6 @@ def measure(path, resources, containers, batches, points):
         seed(db, resources, containers, batches, points)
         results["seed_seconds"] = time.perf_counter()-started
         print(json.dumps({"stage": "seed", **results}), flush=True)
-        # Reset only benchmark's last day for a repeatable incremental scoring measurement.
-        with db:
-            db.execute("UPDATE points SET actual=NULL,scored_at_ms=NULL WHERE curve_id IN "
-                       "(SELECT id FROM curves WHERE batch=?)", (f"benchmark-{batches-1}",))
-        started = time.perf_counter()
-        with db:
-            results["scoring"] = _score_evidence(db, observations(resources,containers,points), NOW)
-        results["score_seconds"] = time.perf_counter()-started
-        print(json.dumps({"stage": "score", "seconds": results["score_seconds"]}), flush=True)
         started = time.perf_counter()
         report = _report(db, NOW, 7)
         results["report_seconds"] = time.perf_counter()-started

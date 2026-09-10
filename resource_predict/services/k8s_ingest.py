@@ -109,11 +109,12 @@ def run_k8s_prometheus_upsert(
             detail = "；".join(errors) or "Prometheus provider returned no K8S workload resources"
             raise RuntimeError(f"所有 K8S Prometheus 集群拉取失败: {detail}")
         fetch_finished_at = _utc_timestamp()
+        fetch_elapsed = time.perf_counter() - fetch_started_perf
         logger.info(
             "[k8s_ingest] K8S Prometheus fetch finished: resources=%d elapsed=%.2fs "
             "started_at=%s finished_at=%s",
             len(items),
-            time.perf_counter() - fetch_started_perf,
+            fetch_elapsed,
             fetch_started_at,
             fetch_finished_at,
         )
@@ -131,6 +132,9 @@ def run_k8s_prometheus_upsert(
             )
         )
         result["cluster_results"] = cluster_results
+        result["fetch_elapsed_seconds"] = round(fetch_elapsed, 2)
+        result["upsert_elapsed_seconds"] = result.get("elapsed_seconds")
+        result["elapsed_seconds"] = round(time.perf_counter() - fetch_started_perf, 2)
         if not result.get("success"):
             result["status"] = "failed"
             mark_external_update_failed(
@@ -206,13 +210,13 @@ def _has_existing_k8s_raw_data(out_dir: Path, clusters: Optional[Iterable[str]])
 # ---------------------------------------------------------------------------
 
 
-def _k8s_scheduler_loop(interval_seconds: float, startup_delay_seconds: float) -> None:
+def _k8s_scheduler_loop(interval_seconds: float) -> None:
     """后台线程主循环：按间隔定时触发 K8S Prometheus 数据拉取 + upsert。
 
     配置保存只唤醒本循环重读运行配置。拉取的唯一判定条件是到期时刻已经过去，到期时刻为
     ``last_start + max(60 秒, scheduled_update_interval_minutes)``，其中 ``last_start`` 是上一次
     拉取**开始**时的 monotonic 时刻（拉取异常同样占用本轮，因此失败后等满一个周期而不是快速
-    重试），为 ``None`` 即从未拉取过时视为已到期。被提前唤醒但尚未到点时继续等待剩余时间，
+    重试），首轮以线程启动时刻为计时基准。被提前唤醒但尚未到点时继续等待剩余时间，
     因此周期既不会被重置也不会被提前；只有重算后已逾期才会立即拉取，例如把周期改短到已过期，
     或关闭超过一个周期后重新打开。
 
@@ -225,14 +229,8 @@ def _k8s_scheduler_loop(interval_seconds: float, startup_delay_seconds: float) -
         interval_seconds,
         interval_seconds / 60.0,
     )
-    if startup_delay_seconds > 0:
-        logger.info("[k8s_ingest] 首次自动拉取将在 %.0f 秒后执行", startup_delay_seconds)
-        if _k8s_stop_event.wait(startup_delay_seconds):
-            logger.info("[k8s_ingest] 后台调度器在首次拉取前停止")
-            return
-    first_run = True
-    # 上一次拉取开始时的 monotonic 时刻；None 表示还没跑过首轮。
-    last_start: Optional[float] = None
+    # 只运行正常定时轮次，不额外执行启动拉取。
+    last_start = time.monotonic()
     while not _k8s_stop_event.is_set():
         cfg = settings.k8s_prometheus
         if not cfg.scheduled_update_enabled:
@@ -243,7 +241,7 @@ def _k8s_scheduler_loop(interval_seconds: float, startup_delay_seconds: float) -
 
         # 每轮都按最新间隔重新推导到期时刻，因此改周期无需重启即可生效。
         interval_seconds = max(60.0, float(cfg.scheduled_update_interval_minutes) * 60.0)
-        next_due = time.monotonic() if last_start is None else last_start + interval_seconds
+        next_due = last_start + interval_seconds
         remaining = next_due - time.monotonic()
         if remaining > 0:
             _k8s_reload_event.wait(remaining)
@@ -259,9 +257,8 @@ def _k8s_scheduler_loop(interval_seconds: float, startup_delay_seconds: float) -
         try:
             run_k8s_prometheus_upsert(
                 fail_if_busy=False,
-                trigger_source="scheduled_startup" if first_run else "scheduled",
+                trigger_source="scheduled",
             )
-            first_run = False
         except Exception as exc:
             logger.error("[k8s_ingest] 调度循环异常: %s", exc)
         elapsed = time.monotonic() - last_start
@@ -295,7 +292,6 @@ def start_k8s_background_updater(
         if interval_minutes is not None
         else int(cfg.scheduled_update_interval_minutes)
     )
-    startup_delay = max(0, int(cfg.scheduled_update_startup_delay_seconds))
 
     if _k8s_scheduler_thread is not None and _k8s_scheduler_thread.is_alive():
         return _k8s_scheduler_thread
@@ -303,7 +299,7 @@ def start_k8s_background_updater(
     _k8s_stop_event.clear()
     _k8s_scheduler_thread = threading.Thread(
         target=_k8s_scheduler_loop,
-        args=(interval * 60.0, float(startup_delay)),
+        args=(interval * 60.0,),
         daemon=True,
         name="k8s-updater",
     )

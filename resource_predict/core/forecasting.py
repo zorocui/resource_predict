@@ -20,8 +20,7 @@ import pandas as pd
 from resource_predict.settings import settings
 logger = logging.getLogger(__name__)
 
-# 全局抑制 Prophet 及其依赖的日志输出，避免每次调用冗余设置
-logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+# 抑制 Prophet 的常规日志输出。
 logging.getLogger("prophet").setLevel(logging.WARNING)
 logging.getLogger("prophet.plot").setLevel(logging.CRITICAL)
 
@@ -353,8 +352,12 @@ def forecast_prophet(
     y_train = ensure_regular_freq(y_train)
     try:
         from prophet import Prophet  # type: ignore
+        from cmdstanpy.utils import get_logger
     except Exception as e:  # pragma: no cover
         raise RuntimeError("未安装 prophet。请先执行: pip install prophet") from e
+
+    # CmdStanPy 首次初始化会重设日志级别，须在初始化后抑制 Chain start/done 提示。
+    get_logger().setLevel(logging.WARNING)
 
     if freq is None:
         freq = infer_pandas_freq(y_train.index)

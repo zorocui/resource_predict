@@ -20,6 +20,8 @@ def build(root, output):
         "benchmarks/routing_feedback.py",
         "benchmarks/routing_policy_suite.py",
         "benchmarks/routing_effects.py", "benchmarks/routing_results.py",
+        "benchmarks/routing_memory_audit.py",
+        "benchmarks/routing_signal_audit.py",
         "requirements.txt", "docs/routing-offline.md", "docs/routing-research.md")]
     files += sorted((root / "resource_predict").rglob("*.py"))
     for path in files:

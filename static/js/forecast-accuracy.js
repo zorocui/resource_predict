@@ -10,8 +10,11 @@
   const note = text => `<p class="accuracy-note">${escape(text)}</p>`;
   const table = (heads, rows) => `<div class="accuracy-table-wrap" tabindex="0"><table><thead><tr>${heads.map(v => `<th scope="col">${escape(v)}</th>`).join("")}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(v => `<td>${escape(v)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
   const keys = ["source", "resource_type", "level", "metric", "model", "horizon", "q"];
-  const state = { source: "realized", resource_type: "", level: "resource", metric: "", model: "", horizon: "", q: "", from_local: "", to_local: "", page: 1, page_size: 50 };
-  let host, chart, items = [], sequence = 0, ready = false;
+  const state = { source: "realized", resource_type: "", level: "resource", metric: "", model: "", horizon: "", q: "", period: "all", from_local: "", to_local: "", page: 1, page_size: 50 };
+  let host, chart, items = [], sequence = 0, ready = false, saving = false, searchTimer;
+  let modelOptions = new Set();
+  const metricLabels = { cpu: "CPU", memory: "内存", disk: "磁盘", cpu_request: "CPU · Request", cpu_limit: "CPU · Limit", memory_request: "内存 · Request", memory_limit: "内存 · Limit" };
+  const modelLabels = { arima: "ARIMA", sarima: "SARIMA", prophet: "Prophet", seasonal_naive: "季节基线", rolling_mean: "滚动均值", ensemble: "集成模型" };
   const localTime = value => {
     if (!value) return null;
     const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
@@ -22,11 +25,54 @@
   function query(filters = state, paginated = true) {
     const params = new URLSearchParams();
     for (const key of [...keys, ...(paginated ? ["page", "page_size"] : [])]) if (filters[key] != null && filters[key] !== "") params.set(key, filters[key]);
-    const from = localTime(filters.from_local), to = localTime(filters.to_local);
+    const from = filters.from_ms ?? localTime(filters.from_local), to = filters.to_ms ?? localTime(filters.to_local);
     if (from != null && to != null && from >= to) throw new Error("目标结束时间必须晚于开始时间。");
     if (from != null) params.set("from_ms", from);
     if (to != null) params.set("to_ms", to);
     return params.toString();
+  }
+  function periodRange(period, now = Date.now()) {
+    if (period === "24h" || period === "7d") return { from_ms: now - (period === "24h" ? 24 : 168) * 3600000, to_ms: now };
+    return { from_ms: null, to_ms: null };
+  }
+  function refreshOptions(payload = {}) {
+    const form = host.querySelector("form");
+    const metrics = state.resource_type === "openstack_vm" ? ["cpu", "memory", "disk"] : state.resource_type === "k8s_workload" ? ["cpu_request", "cpu_limit", "memory_request", "memory_limit"] : Object.keys(metricLabels);
+    for (const row of [...(payload.summary || []), ...(payload.items || [])]) if (row.model) modelOptions.add(String(row.model));
+    if (state.model) modelOptions.add(state.model);
+    for (const [name, values, titles, all] of [["metric", metrics, metricLabels, "全部指标"], ["model", [...modelOptions].sort(), modelLabels, "全部模型"]]) {
+      const node = form.querySelector(`[name="${name}"]`);
+      if (!node) continue;
+      const options = new Set(values);
+      if (state[name]) options.add(state[name]);
+      node.innerHTML = `<option value="">${all}</option>` + [...options].map(value => `<option value="${escape(value)}">${escape(titles[value] || value)}</option>`).join("");
+      node.value = state[name];
+    }
+  }
+  function applyFilters(event) {
+    event?.preventDefault();
+    clearTimeout(searchTimer);
+    const form = host.querySelector("form"), values = new FormData(form);
+    const next = { ...state, page: 1 };
+    for (const key of [...keys, "period", "from_local", "to_local"]) next[key] = String(values.get(key) ?? state[key] ?? "").trim();
+    if (next.source !== state.source || next.resource_type !== state.resource_type || next.level !== state.level) {
+      next.metric = next.model = "";
+      modelOptions = new Set();
+    }
+    if (next.source === "legacy") next.period = "all";
+    if (next.period !== "custom") next.from_local = next.to_local = "";
+    Object.assign(next, periodRange(next.period));
+    const error = host.querySelector("#accuracy-filter-error");
+    try { query(next); } catch (cause) { error.textContent = `${cause.message} 当前报告和导出仍使用上次有效筛选。`; return; }
+    error.textContent = "";
+    Object.assign(state, next);
+    form.querySelector('[name="period"]').value = state.period;
+    form.querySelector('[name="period"]').disabled = state.source === "legacy";
+    const custom = form.querySelector(".accuracy-custom-range");
+    custom.hidden = state.period !== "custom";
+    if (!custom.hidden) form.querySelector("details").open = true;
+    refreshOptions();
+    load();
   }
   const identity = row => [label(row.resource_type || row.type), row.resource_id, row.container || label(row.level || "resource"), label(row.metric), row.model, row.basis_unit || row.unit, row.horizon].filter(Boolean).join(" · ");
   function renderSummary(payload) {
@@ -49,7 +95,7 @@
     const fields = ["resource_type", "resource_id", "container", "metric", "model", "batch", "basis_unit", "unit"];
     return rows.filter(row => fields.every(k => row[k] === selected[k])).sort((a, b) => a.target_ms - b.target_ms);
   }
-  function showCurve(index) {
+  function showCurve(index, scroll = true) {
     const selected = items[index];
     if (!selected) return;
     const target = host.querySelector("#accuracy-curve");
@@ -62,7 +108,7 @@
     if (selected.unit === "percentage_points") series[0].markArea = { silent: true, itemStyle: { color: "rgba(37,99,235,.12)" }, data: rows.filter(row => finite(row.predicted)).map(row => [{ xAxis: row.target_ms - 30000, yAxis: row.predicted - 5 }, { xAxis: row.target_ms + 30000, yAxis: row.predicted + 5 }]) };
     chart = window.echarts.init(target.querySelector(".accuracy-chart"));
     chart.setOption({ color: ["#2563eb", "#c05a1b"], tooltip: { trigger: "item", renderMode: "richText" }, legend: {}, grid: { left: 65, right: 25, top: 45, bottom: 65 }, xAxis: { type: "time" }, yAxis: { type: "value", name: selected.unit === "percentage_points" ? "利用率 %" : unit(selected.unit) }, dataZoom: [{ type: "inside" }, { type: "slider", height: 18 }], series });
-    target.scrollIntoView?.({ block: "nearest" });
+    if (scroll) target.scrollIntoView?.({ block: "nearest" });
   }
   function renderSnapshot(payload, filters) {
     const href = String(payload.download_url || "");
@@ -73,14 +119,22 @@
     const button = host.querySelector("#accuracy-snapshot");
     const output = host.querySelector("#accuracy-snapshot-result");
     const filters = query(state, false);
+    if (saving || !ready) return;
+    saving = true;
     button.disabled = true; output.innerHTML = note("正在冻结本次筛选的汇总及全部证据；完成后提供下载。");
     try {
       const response = await fetch("/api/forecast-accuracy/snapshots", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.fromEntries(new URLSearchParams(filters))) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       output.innerHTML = renderSnapshot(payload, filters);
+      const download = document.createElement("a");
+      download.href = payload.download_url;
+      download.download = "";
+      document.body.appendChild(download);
+      download.click();
+      download.remove();
     } catch (error) { output.innerHTML = `<p class="accuracy-error" role="alert">快照未完成：${escape(error.message)}</p>`; }
-    finally { button.disabled = !ready; }
+    finally { saving = false; button.disabled = !ready; }
   }
   const warningText = text => ({ "Independent tests use preprocessed historical data, not production observations.": "独立测试来自预处理历史数据，不等于生产实测。", "issued_ms is an archive/generation-time proxy, not confirmed frontend publication time.": "issued_ms 是留档/生成时间代理，不等于前端正式可见时间。", "Realized evidence evaluates selected models; it is not a fair all-model comparison.": "兑现证据只评估已选择的模型，不适合据此公平比较所有模型。", "No archived point evidence is available; historical reports are not backfilled.": "尚无逐点留档证据；旧报告不会回填为新证据。" }[text] || text);
   async function load() {
@@ -97,22 +151,48 @@
       const payload = await window.ResourceApi.requestJson(`/api/forecast-accuracy?${query()}`, 1);
       if (request !== sequence) return;
       items = payload.items || []; ready = true;
-      host.querySelector("#accuracy-snapshot").disabled = false;
+      host.querySelector("#accuracy-snapshot").disabled = saving;
+      refreshOptions(payload);
       result.innerHTML = `<h3>${escape(label(payload.source))}</h3>${note(`查询生成：${date(payload.generated_at_ms)} · 筛选：${query(state, false)}`)}${(payload.warnings || []).map(w => note(warningText(w))).join("")}${renderSummary(payload)}<h3>证据明细</h3>${renderItems(payload)}<div class="accuracy-pages"><button type="button" class="secondary-btn" data-accuracy-page="${state.page - 1}" ${state.page <= 1 ? "disabled" : ""}>上一页</button><span>第 ${number(payload.page)} 页 · 共 ${number(payload.total)} 条</span><button type="button" class="secondary-btn" data-accuracy-page="${state.page + 1}" ${state.page * state.page_size >= (payload.total || 0) ? "disabled" : ""}>下一页</button></div>`;
+      const first = items.findIndex(row => row.status === "matched");
+      if (first >= 0 && payload.source !== "legacy") showCurve(first, false);
     } catch (error) { if (request === sequence) result.innerHTML = `<p class="accuracy-error" role="alert">评估加载失败：${escape(error.message || error)}。尚未取得可核验结果，请重试。</p>`; }
   }
   function init() {
     if (host) return;
     host = document.getElementById("accuracy-view"); if (!host) return;
     const select = (name, title, options) => `<label>${title}<select name="${name}">${options.map(([value, text]) => `<option value="${escape(value)}"${state[name] === value ? " selected" : ""}>${escape(text)}</option>`).join("")}</select></label>`;
-    host.innerHTML = `<section class="accuracy-hero"><div class="accuracy-kicker">FORECAST / EVIDENCE</div><h2>预测准确性</h2><p>以冻结预测，对照后来发生的真实值。</p>${note("预测兑现、独立历史测试与旧报告分开查看。默认留档滚动保留 7 天，长期佐证请主动保存报告快照；已完成快照独立保留。")}</section><form class="accuracy-filters" aria-label="预测准确性独立筛选">${select("source", "评估来源", [["realized", labels.realized], ["holdout", labels.holdout], ["legacy", labels.legacy]])}${select("resource_type", "资源类型", [["", "全部"], ["openstack_vm", "VM"], ["k8s_workload", "K8S Workload"]])}${select("level", "统计层级", [["resource", "资源"], ["container", "容器"]])}<label>指标<input name="metric" placeholder="如 cpu、memory" /></label><label>模型<input name="model" placeholder="模型名称，留空不限" /></label>${select("horizon", "预测提前量", [["", "全部"], ...["0-1h", "1-6h", "6-24h", ">24h"].map(v => [v, v])])}<label>资源 ID<input name="q" type="search" placeholder="搜索资源 ID" /></label><label>目标开始时间（含）<input name="from_local" type="datetime-local" /></label><label>目标结束时间（不含）<input name="to_local" type="datetime-local" /></label><button type="submit" class="primary-btn">查询 / 刷新</button>${note("目标时刻按本地时区筛选，包含开始、不包含结束。CSV、快照与打印使用已提交查询的筛选；汇总覆盖全范围，表格和对照图按页。")}</form><div id="accuracy-filter-error" role="alert"></div><div class="accuracy-actions"><a id="accuracy-summary-csv" class="secondary-btn">导出汇总 CSV</a><a id="accuracy-points-csv" class="secondary-btn">导出全部证据 CSV</a><button id="accuracy-snapshot" type="button" class="secondary-btn" disabled>保存报告快照</button><button id="accuracy-print" type="button" class="secondary-btn">打印当前报告</button></div><div id="accuracy-snapshot-result" aria-live="polite"></div><div id="accuracy-result" aria-live="polite"></div><section id="accuracy-curve" hidden></section>`;
-    host.querySelector("form").addEventListener("submit", event => {
-      event.preventDefault(); const form = new FormData(event.currentTarget); const next = { ...state, page: 1 };
-      for (const key of [...keys, "from_local", "to_local"]) next[key] = String(form.get(key) || "").trim();
-      const error = host.querySelector("#accuracy-filter-error");
-      try { query(next); } catch (cause) { error.textContent = `${cause.message} 当前报告和导出仍使用上次有效筛选。`; return; }
-      error.textContent = ""; Object.assign(state, next); load();
+    host.innerHTML = `<section class="accuracy-hero"><div class="accuracy-kicker">FORECAST / EVIDENCE</div><h2>预测准确性</h2><p>打开即可查看全部可用评估，选择条件后自动刷新。</p>${note("兑现评估、独立测试与旧报告分别统计。长期佐证可一键保存并下载完整报告。")}</section>
+      <form class="accuracy-filters" aria-label="预测准确性独立筛选">
+        <fieldset class="accuracy-source-tabs"><legend>评估来源</legend>${["realized", "holdout", "legacy"].map(value => `<label><input type="radio" name="source" value="${value}"${state.source === value ? " checked" : ""} /><span>${labels[value]}</span></label>`).join("")}</fieldset>
+        ${select("resource_type", "资源类型", [["", "全部资源"], ["openstack_vm", "VM"], ["k8s_workload", "K8S Workload"]])}
+        ${select("metric", "指标", [["", "全部指标"]])}
+        ${select("period", "目标时间范围", [["all", "全部可用数据"], ["24h", "最近24小时"], ["7d", "最近7天"], ["custom", "自定义时间"]])}
+        <button type="submit" class="secondary-btn">刷新</button>
+        <details class="accuracy-advanced"><summary>高级筛选（可选）</summary><div class="accuracy-advanced-fields">
+          ${select("level", "统计层级", [["resource", "资源"], ["container", "容器"]])}
+          ${select("model", "模型", [["", "全部模型"]])}
+          ${select("horizon", "预测提前量", [["", "全部提前量"], ...["0-1h", "1-6h", "6-24h", ">24h"].map(v => [v, v])])}
+          <label>查找资源（可选）<input name="q" type="search" placeholder="输入后自动查找" /></label>
+          <div class="accuracy-custom-range" hidden><label>目标开始时间（含）<input name="from_local" type="datetime-local" /></label><label>目标结束时间（不含）<input name="to_local" type="datetime-local" /></label></div>
+          <button id="accuracy-reset" type="button" class="secondary-btn">重置筛选</button>
+        </div></details>
+      </form><div id="accuracy-filter-error" role="alert"></div>
+      <div class="accuracy-actions"><button id="accuracy-snapshot" type="button" class="primary-btn" disabled>保存并下载报告</button><button id="accuracy-print" type="button" class="secondary-btn">打印当前报告</button><details class="accuracy-export-more"><summary>更多导出</summary><a id="accuracy-summary-csv" class="secondary-btn">汇总 CSV</a><a id="accuracy-points-csv" class="secondary-btn">全部证据 CSV</a></details></div>
+      <div id="accuracy-snapshot-result" aria-live="polite"></div><div id="accuracy-result" aria-live="polite"></div><section id="accuracy-curve" hidden></section>`;
+    const form = host.querySelector("form");
+    form.addEventListener("submit", applyFilters);
+    form.addEventListener("change", event => {
+      if (event.target.name === "q") return;
+      applyFilters();
     });
+    form.addEventListener("input", event => {
+      if (event.target.name !== "q") return;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(applyFilters, 400);
+    });
+    host.querySelector("#accuracy-reset").addEventListener("click", () => { form.reset(); applyFilters(); });
+    refreshOptions();
     host.addEventListener("click", event => {
       const button = event.target.closest("button"); if (!button || button.disabled) return;
       if (button.dataset.accuracyPage) { state.page = Number(button.dataset.accuracyPage); load(); }
@@ -122,5 +202,5 @@
     host.querySelector("#accuracy-print").addEventListener("click", () => window.print());
     window.addEventListener("resize", () => chart?.resize());
   }
-  window.ForecastAccuracy = { init, load, query, number, rate, renderSummary, renderItems, curvePoints, renderSnapshot, saveSnapshot };
+  window.ForecastAccuracy = { init, load, query, number, rate, renderSummary, renderItems, curvePoints, renderSnapshot, saveSnapshot, periodRange };
 })();

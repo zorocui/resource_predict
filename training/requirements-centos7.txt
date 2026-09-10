@@ -1,0 +1,6 @@
+# CentOS 7.6 / glibc 2.17 / x86_64 / CPython 3.10
+# 阿里云上 torch 2.6.0 的 cp310 manylinux1_x86_64 wheel；不可替换成 2.7+。
+# 最小训练依赖；先比较 seasonal_naive / rolling_mean，不要求 Prophet。
+torch==2.6.0
+numpy==1.26.4
+pandas==2.2.3

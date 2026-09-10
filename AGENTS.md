@@ -1,5 +1,7 @@
 # Project Working Notes
 
+- 用户持久偏好：涉及软件包下载时使用国内阿里云镜像源。Python/pip 使用 `https://mirrors.aliyun.com/pypi/simple/`；不要默认切回境外源。其他包管理器使用对应的阿里云镜像，若无可用镜像先说明限制。
+
 These notes capture project-specific mistakes already encountered in this repo. Follow them before making future edits.
 
 - Treat `README.md` as a CentOS/Linux-facing document. Use `bash` command blocks, `source .venv/bin/activate`, `export ...`, and `python ...`; do not introduce PowerShell commands.

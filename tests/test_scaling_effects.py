@@ -2,11 +2,14 @@ import csv
 import hashlib
 import io
 import json
+import re
+import sqlite3
 import time
 from types import SimpleNamespace
 
 from flask import Flask
 import pandas as pd
+import pytest
 
 from resource_predict.api.scaling_effects import register_scaling_effect_routes
 from resource_predict.services.scaling import effects, tasks
@@ -114,6 +117,77 @@ def test_conflicting_evidence_is_not_silently_overwritten(tmp_path):
     changed = evidence(START-HOUR, START, 4, usage=2)
     effects.ingest_evidence(tmp_path, [{"resource_id": "vm-1", "scaling_evidence": changed}], now_ms=START)
     assert effects.event_evidence([tmp_path], "task-1")["event"]["status"] == "evidence_conflict"
+
+
+def test_legacy_sample_sql_upgrades_null_and_preserves_first_valid_value(tmp_path, monkeypatch):
+    connect = effects.sqlite3.connect
+
+    class LegacyConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            assert not re.search(r"\bWITH\b|\bOVER\s*\(|\bON\s+CONFLICT\b", sql, re.I), sql
+            return super().execute(sql, parameters)
+
+        def executemany(self, sql, parameters):
+            assert not re.search(r"\bON\s+CONFLICT\b", sql, re.I), sql
+            return super().executemany(sql, parameters)
+
+    monkeypatch.setattr(effects.sqlite3, "connect",
+                        lambda *args, **kwargs: connect(*args, factory=LegacyConnection, **kwargs))
+    # An existing pre-deadline-column database must remain usable in place.
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        db.execute("CREATE TABLE events (task_id TEXT PRIMARY KEY, resource_id TEXT, resource_type TEXT, "
+                   "action TEXT, status TEXT, started_ms INTEGER, payload TEXT)")
+    task = {"task_id": "task-1", "resource_id": "vm-1", "resource_type": "openstack_vm", "mode": "execute"}
+    effects.start_event(tmp_path, task, {"cpu_cores": 4}, {"cpu_cores": 2}, now_ms=START, policy=POLICY,
+                        evidence=evidence(START-HOUR, START, 4, usage=None))
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        original_hash = db.execute("SELECT batch_hash FROM samples LIMIT 1").fetchone()[0]
+        assert db.execute("SELECT COUNT(*) FROM samples WHERE usage IS NULL").fetchone()[0] == 5
+    changed = evidence(START-HOUR, START, 4, usage=2)
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm-1", "scaling_evidence": changed}], now_ms=START)
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        saved = db.execute("SELECT ts,usage,capacity,batch_hash FROM samples ORDER BY ts").fetchall()
+    assert len(saved) == 5
+    assert all(row[1:3] == (2, 4) and row[3] != original_hash for row in saved)
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm-1", "scaling_evidence": changed}], now_ms=START)
+    changed["series"][0]["usage"] = [3] * 5
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm-1", "scaling_evidence": changed}], now_ms=START)
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        assert db.execute("SELECT ts,usage,capacity,batch_hash FROM samples ORDER BY ts").fetchall() == saved
+    assert effects.event_evidence([tmp_path], "task-1")["event"]["status"] == "evidence_conflict"
+
+
+def test_sample_insert_and_upgrade_roll_back_together(tmp_path, monkeypatch):
+    begin(tmp_path)
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        db.execute("UPDATE samples SET usage=NULL")
+        original = db.execute("SELECT * FROM samples ORDER BY ts").fetchall()
+        batch_count = db.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
+    save = effects._save
+
+    def fail_after_samples(db, event):
+        if event.get("computed_at_ms") == START + 1:
+            raise RuntimeError("injected failure after sample writes")
+        return save(db, event)
+
+    monkeypatch.setattr(effects, "_save", fail_after_samples)
+    with pytest.raises(RuntimeError, match="after sample writes"):
+        effects.ingest_evidence(tmp_path, [{"resource_id": "vm-1", "scaling_evidence":
+                                          evidence(START-HOUR, START, 4, usage=2)}], now_ms=START+1)
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        assert db.execute("SELECT * FROM samples ORDER BY ts").fetchall() == original
+        assert db.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == batch_count
+
+
+def test_duplicate_sample_keys_in_one_batch_keep_first_valid_value(tmp_path):
+    observed = evidence(START-HOUR, START, 4, usage=None)
+    series = observed["series"][0]
+    observed["series"].extend([{**series, "usage": [2] * 5}, {**series, "usage": [3] * 5}])
+    task = {"task_id": "task-1", "resource_id": "vm-1", "resource_type": "openstack_vm", "mode": "execute"}
+    effects.start_event(tmp_path, task, {"cpu_cores": 4}, {"cpu_cores": 2}, now_ms=START,
+                        policy=POLICY, evidence=observed)
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        assert db.execute("SELECT usage,capacity FROM samples").fetchall() == [(2, 4)] * 5
 
 
 def test_api_filters_export_pagination_and_empty_state(tmp_path):

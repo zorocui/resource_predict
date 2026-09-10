@@ -5,7 +5,7 @@ import copy
 import hashlib
 import json
 import logging
-import sqlite3
+from resource_predict.sqlite_runtime import sqlite3
 import time
 from contextlib import closing
 from dataclasses import asdict

@@ -12,6 +12,8 @@
 
 ## 配置文件概览
 
+Python3.10可以链接旧SQLite；项目现已兼容原生SQLite3.7.17，不安装替代驱动。若此前准确性查询因deterministic或窗口函数失败，更新代码后保留原库即可。见 [sqlite-compatibility.md](sqlite-compatibility.md)。
+
 调配成效独立保存于各类型输出目录的 `scaling_effects.sqlite3`，不受任务JSON最近1000条限制。默认前24小时、稳定1小时、后24小时、80%有效覆盖率，事件冻结政策版本；来源契约、补齐期限与存储边界见 [scaling-effects.md](scaling-effects.md)。
 
 | 文件 | 用途 | 是否提交 Git |
@@ -138,8 +140,7 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
 | `reuse_backtest_model_for_future` | `False` | 已停用的兼容读取字段，旧输入 `True` 也不会启用延伸预测。未来预测始终用最新完整历史重新拟合。 |
-| `archive_enabled` | `True` | 是否将本轮新生成的入选预测写入各 scope 的 `forecast_history/`。 |
-| `archive_retention_days` | `7` | 留档保留天数，须为正数；成功写入非空批次后清理过期批次。代码级配置，不在页面暴露。 |
+| `archive_retention_days` | `7` | 只读旧校准证据的有效期；逐点留档生成和SQLite导入已删除，不再用于自动清理留档。 |
 | `prophet_routing_enabled` | `True` | `True` 表示仅在轻量统计特征显示存在明显趋势或季节性时运行 Prophet。若 Prophet 是唯一启用模型，则仍会运行。 |
 | `prophet_routing_mode` | `auto` | `auto` 使用自动路由规则，`always` 表示启用 Prophet 时总是运行，`never` 表示存在其他兜底模型时跳过 Prophet。 |
 | `rolling_backtest_folds` | `1` | 训练段内的时间验证折数；每折长度等于 `test_size`，外层独立测试另计。多折时选型分数为 `0.65 × 最近验证折RMSE + 0.35 × 全部验证残差RMSE`。不足折数时记录实际折数；候选须完成全部可用折。 |
@@ -159,20 +160,19 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 预测（VM/K8S 验证与预测窗口、候选模型、Ensemble）以及决策（策略等级、扩缩容阈值、确认轮次、
 冷却时间和命名空间策略）。Prophet 底层参数、缓存、分页、mock 随机种子等实现细节不再作为用户配置。
 
-保存时服务端先校验完整配置；任何字段或集群配置错误都会整体拒绝。调度配置变化会唤醒唯一的
-K8S 后台调度线程重新读取开关和周期，不需要重启应用。
+保存时服务端先校验完整配置；任何字段或集群配置错误都会整体拒绝。应用启动时保留 K8S 定时调度线程，调度配置变化会唤醒该线程重读开关和周期。保存配置不额外触发拉取。
 
 唤醒本身不等于拉取。调度循环只在一个条件下取数：到期时刻已经过去。到期时刻按
 `last_start + max(60 秒, scheduled_update_interval_minutes)` 计算，`last_start` 是上一次拉取
-**开始**时的时刻（拉取失败同样占用本轮，因此不会快速重试），从未拉取过时视为已到期。保存配置只是让
+**开始**时的时刻（拉取失败同样占用本轮，因此不会快速重试），首轮以线程启动时刻为计时基准。保存配置只是让
 循环提前重新评估这个条件，于是有四种结果：
 
 - 新的到期时刻仍在未来：不拉取，继续等待剩余时间，周期既不被重置也不被提前。
 - 把周期改短到 `last_start + 新周期` 已经落在过去：立即拉取一轮。
 - 关闭定时拉取后再打开：关闭时长不足一个周期则等到原到期时刻，超过则立即拉取一轮。
-- 应用启动后从未拉取过（含线程启动时开关是关闭、之后才打开的情况）：立即执行首轮。
+- 应用启动不额外触发拉取，正常定时周期继续生效（默认每 6 小时）。
 
-首轮以及此后任何一次成功拉取之前的重试都标记为 `scheduled_startup`，之后标记为 `scheduled`。
+定时拉取统一标记为 `scheduled`。
 需要马上取数请显式调用 `POST /api/cluster-configs/k8s-fetch` 或页面上的拉取按钮。
 
 计时锚定在**开始**时刻而不是完成时刻，是为了让两轮拉取的实际间隔严格等于配置周期。增量回看
@@ -235,7 +235,7 @@ HTTP 层重试之外还有一层整轮重试：某个集群查询成功但聚合
 | `GenerationConfig` | `default_test_size` / `default_future_steps` / `freq` / `detail_chunk_size` / `detail_history_points_default` / `detail_history_points_max` / `raw_resource_cache_items` | `72` / `24` / `h` / `25` / `1000` / `10000` / `100` |
 | `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `False` / `True` / `auto` / `3.5` |
 | `DecisionConfig` | `scale_out_threshold` / `scale_in_threshold` / `scale_in_max_reduction_ratio` / `scale_out_confirmations` / `scale_in_confirmations` / `action_gate_state_retention_days` | `0.8` / `0.2` / `0.5` / `2` / `3` / `30` |
-| `UpdateConfig` | `enabled` / `interval_minutes` / `startup_delay_seconds` / `sliding_window` | `False` / `60` / `60` / `False` |
+| `UpdateConfig` | `enabled` / `interval_minutes` / `sliding_window` | `False` / `60` / `False` |
 | `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` / `range_query_chunk_hours` / `request_max_attempts` / `retry_backoff_seconds` / `max_interpolation_gap_steps` | `7` / `60` / `600` / `15m` / `True` / `360` / `24` / `3` / `1.0` / `3` |
 
 `rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值 `15m`。默认 `step_seconds=600` 表示每 10 分钟返回一个结果点，两个参数彼此独立。
@@ -243,7 +243,7 @@ HTTP 层重试之外还有一层整轮重试：某个集群查询成功但聚合
 K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_refresh=true` 时，会按 `history_days` 拉取全量历史窗口（默认最近 7 天）。已有本地基线后的普通拉取会使用增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认 `360 + 60 = 420` 分钟，即最近 7 小时。
 这两个拉取窗口都与本地 `retention_days=30` 保留窗口独立。
 
-通过 `python app.py` 启动时，将 `scheduled_update_enabled` 设为 `True` 会启用 K8S Prometheus 后台定时拉取：启动后等待 `scheduled_update_startup_delay_seconds`（默认 60 秒）执行首次拉取，此后按 `scheduled_update_interval_minutes` 执行。VM 数据更新仍需通过页面按钮、更新 API 或 CLI 手动触发。
+通过 `python app.py` 启动时会启动 K8S 定时调度线程。启用定时拉取后，仍按 `scheduled_update_interval_minutes`（默认 360 分钟，即 6 小时）执行；仅取消启动时额外拉取的那一轮，并移除启动拉取延迟配置。VM 数据更新仍需通过页面按钮、API 或 CLI 手动触发。
 
 ### 预测窗口配置说明
 
@@ -341,35 +341,9 @@ outputs/
 
 报告包含容器维度（聚合指标的 `container` 为 `null`），实际测试时间边界、评估角色和来源。失败模型保留失败原因与空误差；不能把空误差当作零。旧产物缺少来源时标记为 `legacy_holdout`，不追认独立测试。`p95_error` 是绝对误差的分位值；未来曲线 P95 和规则 `confidence_score` 都不是统计预测覆盖率。
 
-### `forecast_history/forecast_<timestamp>_<uuid>.jsonl.gz`
+### `forecast_accuracy_summary.json`
 
-每轮按 scope 保存独立 gzip JSONL 文件，一行一个新预测资源，含 `forecasts`、`container_forecasts`、容器规格、数据质量和当轮原始建议。每条预测仅保存入选模型、未来时间轴、预测值和 `provenance`，不重复保存训练曲线或全部候选模型。
-
-`provenance` 包含 `generated_at_epoch_ms`、`data_end_ms`、`train_end_ms`、`forecast_start_ms`、`forecast_end_ms`、`config_hash`、`model_version`、`actual_future_methods`、`ensemble_members`。模型降级时入选名称和实际曲线名称一致，原选型记录在诊断中。
-
-留档发生在旧预测恢复、增量合并和跨轮次 action-gate 确认之前，因此仅记录本轮实际生成的预测，建议不是最终执行凭证。失败的批次不会发布半个文件；留档失败不阻止预测产物更新，日志与 `generation_stats.json.forecast_archive` 记录状态。真实值评分见下节；尚未实现概率区间校准。
-
-### `forecast_realized.sqlite3` / `forecast_realized_report.json`
-
-预测准确性页面直接只读查询SQLite，不依赖可能滞后的JSON汇总。新版本增加独立测试逐点表 `holdout_curves/holdout_points`，与批次保留期级联清理；新未来留档含 `holdout_forecasts`。写入使用WAL。用户主动保存的长期快照位于输出根目录 `accuracy_snapshots/`，不会跟随7天账本清理；应定期备份和规划容量。详见 [forecast-accuracy.md](forecast-accuracy.md)。
-
-各 scope 的 raw 提交后、预测留档后自动回填历史预测误差。SQLite 的 `batches`、`curves`、`points` 分别保存导入批次、入选曲线及逐点评分，唯一键避免重复导入和计分。首次真实评分保留不变，迟到数据可以补评未评分点。只读取未导入的压缩批次，按资源和指标索引匹配，不把全部历史加载到内存。
-
-性能优化后，raw 提交只持久化评分及执行保留期清理，延迟生成 JSON 汇总；预测结束或显式评分 CLI 才发布报告，避免一轮两次扫描完整账本。若 raw 已提交但后续预测失败，数据库评分仍有效，报告可能较旧，可运行下方 CLI 更新。返回状态 `report_published=false`、`coverage=null` 表示本次未汇总，不是零覆盖。`generation_stats.json.forecast_realized` 记录导入、评分、保留期/报告、校准和影子建议生成的阶段耗时。
-
-评分必须有 `observation_evidence`（schema_version=1）：`source`、`resource_type`、`spec`、`container_metric_modes`、`metrics` 和 `container_metrics`。两种指标映射中的每个指标使用 `timestamps`（整数毫秒）和 `values` 数组，只能包含未填补的真实采样。K8S provider 自动生成同频聚合的真实采样证据；证据以独立规格快照写入 raw 分片。VM/自定义 provider 需显式提供此契约；mock 和无证据的旧 raw 不追认为真实观测。证据当前仅保留最近接收批次，连续多轮评分失败后的完整恢复需要重新提供遗漏批次。
-
-目标时间必须精确匹配且已到达，并严格晚于数据截止及留档批次开始时间/模型生成时间的较大值。缺失来源、非有限观测、规格、口径或 K8S 观测成员变化均不计分。K8S 规格来自拉取时快照，仍无法证明整个历史窗口规格不变；该限制适用于跨规格变更的实验。
-
-JSON 报告 `evaluation_role=realized_selected_forecast`，按模型、指标、单位口径、资源/容器层级和数据截止提前量分组（0–1h、1–6h、6–24h、>24h），输出 `count`、`mae`、`rmse`、`underestimate_rate`、`mean_underestimate`。最后一项是所有评分点的 `max(actual-predicted,0)` 均值。`coverage` 区分 scored、awaiting_target、awaiting_observation、missing_provenance、not_future_at_publication、nonfinite_observation、basis_mismatch；未评分不是零误差。仅统计当时入选的模型，不能据此公平比较所有候选。
-
-保留期沿用 `archive_retention_days`（默认 7 天），按批次时间清理账本记录。SQLite 空闲页复用，文件不会每轮缩小；该周期之外的迟到数据不再补评。日志和 `generation_stats.json.forecast_realized` 记录评分状态，失败不撤销已提交 raw/预测。账本可查询预测来源、原预测值、真实值、评分时间，以及 `target_ms-data_end_ms` 和 `target_ms-issued_ms` 两种提前量；`issued_ms` 是保守批次时间代理，并非前端实际可见时间。
-
-重试（按 scope 分别运行）：
-
-```bash
-python -m resource_predict.pipeline.realized_error --out-dir outputs/k8s
-```
+每次预测保存本轮实际选用模型的独立历史测试汇总：资源、容器、指标、模型、有效点、无效点、达标点、准确率、MAE和测试时间。只保留最新一轮，不累积逐点记录。口径与使用说明见[预测准确率](forecast-accuracy.md)。逐点留档和SQLite导入入口已删除，旧证据只读分析不再自动补入新数据。
 
 ### 经验预测上界（观察阶段）
 
@@ -379,7 +353,7 @@ python -m resource_predict.pipeline.realized_error --out-dir outputs/k8s
 
 `status` 为 calibrated、partial、insufficient_samples、missing_provenance 或 failed；样本不足的点 `upper=null`，不能按零解释，也不能把部分时段的峰值当成完整窗口上界。`buckets` 记录样本数、余量、样本时间范围和摘要，基准时间与口径随上界保存。增量合并保留旧指标原上界；当前规格不再匹配时，建议摘要标记 basis_changed 并隐藏峰值。
 
-上界随原曲线留档，SQLite 增加 `calibrations`（参数 JSON）和 `upper_bounds`（逐点原上界），旧库自动增表。`forecast_realized_report.json.calibration_rows` 按模型、指标、层级、单位和提前量统计 `count`、`empirical_coverage`（actual≤upper 的比例）、`mean_exceedance`（max(actual-upper,0) 的均值）、`mean_margin`（upper-predicted 的均值）。仅核验当时留档的上界，不事后重算；旧预测没有上界时不追补覆盖记录。
+旧版本曾将上界随原曲线留档；以下仅说明已有证据，当前不再写入或补建表。旧SQLite包含 `calibrations`（参数 JSON）和 `upper_bounds`（逐点原上界），当前不再自动增表。`forecast_realized_report.json.calibration_rows` 按模型、指标、层级、单位和提前量统计 `count`、`empirical_coverage`（actual≤upper 的比例）、`mean_exceedance`（max(actual-upper,0) 的均值）、`mean_margin`（upper-predicted 的均值）。仅核验当时留档的上界，不事后重算；旧预测没有上界时不追补覆盖记录。
 
 95% 是经验校准目标，尚非生产实测覆盖保证；时序相关、业务漂移及 K8S 历史规格证据的限制仍适用。严格分组可能长期样本不足，这是保留原策略的正常状态。当前还不能据此声称降低资源预留或费用。
 

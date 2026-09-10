@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
-import sqlite3
+from resource_predict.sqlite_runtime import sqlite3
 
 from flask import Flask, Response, jsonify, request
 

@@ -56,26 +56,47 @@ def _policy(run):
 
 
 def _metric_evidence(db, run_ids, container, metric, now_ms):
-    placeholders = ",".join("?" for _ in run_ids)
+    # These IDs come from the ledger, and may exceed SQLite 3.7's 999 bind limit.
+    # Validate before rendering integers; all external text remains bound.
+    if any(type(run_id) is not int for run_id in run_ids):
+        raise ValueError("shadow run IDs must be integers")
+    identifiers = ",".join(str(run_id) for run_id in run_ids) or "NULL"
     sql = (
-        "WITH ranked AS (SELECT p.*,b.baseline_ratio,b.shadow_ratio,b.baseline_allocation,b.shadow_allocation,"
-        "ROW_NUMBER() OVER (PARTITION BY p.target_ms ORDER BY c.issued_ms DESC,c.batch DESC,c.id DESC) AS rank "
+        "SELECT p.target_ms,CASE WHEN p.actual IS NOT NULL AND p.scored_at_ms<=? "
+        "AND ABS(p.actual)<1e300 AND p.actual>=0 THEN 1 ELSE 0 END AS matched,"
+        "CASE WHEN p.actual>b.baseline_ratio THEN 1.0 ELSE 0 END,"
+        "CASE WHEN p.actual>b.shadow_ratio THEN 1.0 ELSE 0 END,"
+        "MAX(p.actual-b.baseline_ratio,0),MAX(p.actual-b.shadow_ratio,0),"
+        "b.baseline_allocation,b.shadow_allocation "
         "FROM shadow_budgets b JOIN curves c ON c.id=b.curve_id JOIN points p ON p.curve_id=c.id "
-        f"WHERE b.run_id IN ({placeholders}) AND c.container=? AND c.metric=? "
-        "AND p.target_ms<=? AND p.target_ms>c.issued_ms AND p.target_ms>c.data_end_ms AND c.eligible=1), "
-        "observations AS (SELECT *,CASE WHEN actual IS NOT NULL AND scored_at_ms<=? "
-        "AND ABS(actual)<1e300 AND actual>=0 THEN 1 ELSE 0 END AS matched FROM ranked WHERE rank=1) "
-        "SELECT COUNT(*) AS due_targets,COALESCE(SUM(matched),0) AS matched_targets,"
-        "MIN(CASE WHEN matched=1 THEN target_ms END) AS first_target_ms,"
-        "MAX(CASE WHEN matched=1 THEN target_ms END) AS last_target_ms,"
-        "AVG(CASE WHEN matched=1 THEN CASE WHEN actual>baseline_ratio THEN 1.0 ELSE 0 END END) AS baseline_rate,"
-        "AVG(CASE WHEN matched=1 THEN CASE WHEN actual>shadow_ratio THEN 1.0 ELSE 0 END END) AS shadow_rate,"
-        "AVG(CASE WHEN matched=1 THEN MAX(actual-baseline_ratio,0) END) AS baseline_excess,"
-        "AVG(CASE WHEN matched=1 THEN MAX(actual-shadow_ratio,0) END) AS shadow_excess,"
-        "AVG(CASE WHEN matched=1 THEN baseline_allocation END) AS baseline_allocation,"
-        "AVG(CASE WHEN matched=1 THEN shadow_allocation END) AS shadow_allocation FROM observations"
+        f"WHERE b.run_id IN ({identifiers}) AND c.container=? AND c.metric=? "
+        "AND p.target_ms<=? AND p.target_ms>c.issued_ms AND p.target_ms>c.data_end_ms AND c.eligible=1 "
+        "ORDER BY p.target_ms,c.issued_ms DESC,c.batch DESC,c.id DESC"
     )
-    result = next(_rows(db, sql, (*run_ids, container, metric, now_ms, now_ms)))
+    fields = ("baseline_rate", "shadow_rate", "baseline_excess", "shadow_excess",
+              "baseline_allocation", "shadow_allocation")
+    totals, counts = [0.0]*len(fields), [0]*len(fields)
+    result = dict(due_targets=0, matched_targets=0, first_target_ms=None, last_target_ms=None)
+    previous_target = None
+    # Select the latest publication before checking its observation. An older scored
+    # prediction must never fill a missing observation on the newest prediction.
+    for target, matched, *values in db.execute(sql, (now_ms, container, metric, now_ms)):
+        if target == previous_target:
+            continue
+        previous_target = target
+        result["due_targets"] += 1
+        if not matched:
+            continue
+        result["matched_targets"] += 1
+        if result["first_target_ms"] is None:
+            result["first_target_ms"] = target
+        result["last_target_ms"] = target
+        for index, value in enumerate(values):
+            if value is not None:
+                totals[index] += value
+                counts[index] += 1
+    result.update((field, total/count if count else None)
+                  for field, total, count in zip(fields, totals, counts))
     count, due = result["matched_targets"], result["due_targets"]
     result["observation_coverage"] = count/due if due else 0.0
     result["span_hours"] = ((result["last_target_ms"]-result["first_target_ms"])/HOUR_MS) if count else 0.0

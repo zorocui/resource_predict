@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 import math
-import sqlite3
+from resource_predict.sqlite_runtime import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -78,6 +78,8 @@ def _connect(out_base: Path):
         if "deadline_ms" not in {row[1] for row in db.execute("PRAGMA table_info(events)")}:
             db.execute("ALTER TABLE events ADD COLUMN deadline_ms INTEGER")
         with db:
+            # SAVEPOINT release must not commit evidence before the outer operation succeeds.
+            db.execute("BEGIN")
             yield db
     finally:
         db.close()
@@ -357,12 +359,16 @@ def _ingest(db: sqlite3.Connection, event: dict, evidence: dict, now: int) -> No
     digest = hashlib.sha256(_json({"metadata": metadata, "points": changed}).encode("utf-8")).hexdigest()
     if changed:
         db.execute("INSERT OR IGNORE INTO batches VALUES (?,?,?)", (event["task_id"], digest, _json(metadata)))
-    db.executemany(
-        "INSERT INTO samples VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id,container,metric,basis,ts) "
-        "DO UPDATE SET usage=excluded.usage,capacity=excluded.capacity,batch_hash=excluded.batch_hash "
-        "WHERE samples.usage IS NULL AND excluded.usage IS NOT NULL",
-        [(event["task_id"], *p, digest) for p in changed],
-    )
+    # Keep each insert/update pair together: duplicate points must retain the first valid value.
+    for container, metric, basis, unit, ts, usage, capacity in changed:
+        db.execute("INSERT OR IGNORE INTO samples VALUES (?,?,?,?,?,?,?,?,?)",
+                   (event["task_id"], container, metric, basis, unit, ts, usage, capacity, digest))
+        if usage is not None:
+            db.execute(
+                "UPDATE samples SET usage=?,capacity=?,batch_hash=? "
+                "WHERE task_id=? AND container=? AND metric=? AND basis=? AND ts=? AND usage IS NULL",
+                (usage, capacity, digest, event["task_id"], container, metric, basis, ts),
+            )
     event["computed_at_ms"] = now
     if effective is not None:
         event["metrics"] = evaluate_series(_series(db, event["task_id"]), started_at_ms=start,

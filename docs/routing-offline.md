@@ -1,5 +1,45 @@
 # 内网离线实验操作说明
 
+收益尺度诊断后，下一批按 [尺度候选冻结协议](routing-scale-confirmation.md) 使用现有 signal-audit 包复核。
+尚无新观测时不必再次运行旧明细，也不必搬运新包。
+
+## 历史信号、收益尺度与成本排序诊断（signal-audit 版）
+
+使用 routing-experiment-signal-audit.zip 解压后的 routing-experiment，复用已有明细：
+
+```bash
+python -X utf8 -m benchmarks.routing_signal_audit --run-dir /data/pilot-k8s-new --output share-routing-signal-audit.json
+```
+
+仅回传内部审核通过的 share-routing-signal-audit.json；不重新拟合 Prophet。
+一次回答：测试期高收益资源在训练期是否也有正收益；训练期前 3 名在测试期捕获多少正收益；
+不除成本与除成本如何改变选择；把归一化预测乘回历史尺度后效果如何变化。
+四种排序共享预测正值过滤、同一成本估计和预算，无暂停干扰。
+乘回历史尺度不等于重训原始目标模型；不同指标的原始尺度不具有共同业务价值，不能混算后宣称最佳。
+历史前 3 名按训练平均有符号收益排序；测试前 3 名按测试正收益总量选出，只作事后描述，绝不参与路由。
+因此两套排序的重合程度不是纯粹预测准确率；需结合资源窗口数和收益分布解释。
+报告不含资源名，但含匿名少量高收益资源的历史统计，需按内部规定审核后再分享。
+保持现有模型与默认策略不变，本次不作新的参数搜索或独立验证结论。
+
+## 核心路由诊断（memory-audit 版）
+
+使用 routing-experiment-memory-audit.zip 解压后的 routing-experiment 文件夹，复用 pilot-k8s-new：
+
+```bash
+python -X utf8 -m benchmarks.routing_memory_audit --run-dir /data/pilot-k8s-new --output share-routing-memory-audit.json
+```
+
+不运行 Prophet，不运行暂停规则，只比较相同冻结模型与名义预算下的核心路由。
+输出按指标划分的正收益漏选原因：预测收益非正、预测成本超过整批预算、排名或剩余预算不足。
+原因按上述次序互斥分类，不代表因果贡献分解；同时保留选中的负收益和实际误差。
+另报告前三个资源贡献的正收益份额，仅数值不含身份，检查改善是否集中于少数资源。
+
+四个固定对照：原收益/成本路由、保留收益正值过滤的内存优先、取消过滤的内存优先、取消过滤的随机顺序。
+盲目内存优先与随机顺序都是单个固定种子，不作为统计显著性证据；内存优先用完后可选其他指标。
+每个对照给出实际误差、完整阶段耗时估算和边际预算超支，不能只比较正收益捕获比例。
+只回传内部审核通过的 share-routing-memory-audit.json，多目录仍可一次汇总。
+本次依据开发结果提出内存优先假设，不代表已验证应在生产优先内存。
+
 ## 直接查看预测误差与计算成本（results 版）
 
 使用 routing-experiment-results.zip 解压后的 routing-experiment 文件夹，复用已有明细：

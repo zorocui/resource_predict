@@ -1,5 +1,7 @@
 """SQLite storage and paired summaries for frozen shadow recommendations."""
-import json
+from itertools import groupby
+
+from resource_predict.sqlite_runtime import register_functions
 
 
 SCHEMA = """
@@ -22,35 +24,12 @@ CREATE INDEX IF NOT EXISTS shadow_budgets_run ON shadow_budgets(run_id);
 """
 
 
-def _encode(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def import_shadow(db, batch, record):
-    snapshot = record.get("shadow_comparison")
-    if not isinstance(snapshot, dict):
-        return
-    if snapshot.get("version") != 1 or snapshot.get("executable") is not False:
-        raise ValueError("invalid shadow comparison")
-    cursor = db.execute(
-        "INSERT INTO shadow_runs(batch,resource_id,resource_type,basis,status,snapshot,baseline,candidate) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (batch, record["resource_id"], record.get("resource_type", "openstack_vm"),
-         _encode([record.get("spec", {}), record.get("container_metric_modes", {})]), snapshot["status"],
-         _encode(snapshot), _encode(snapshot.get("baseline")), _encode(snapshot.get("candidate"))),
-    )
-    run_id = cursor.lastrowid
-    for row in snapshot.get("budgets", []):
-        curve = db.execute("SELECT id FROM curves WHERE batch=? AND resource_id=? AND container=? AND metric=?",
-                           (batch, record["resource_id"], row["container"], row["metric"])).fetchone()
-        if curve is None:
-            raise ValueError("shadow budget has no archived forecast")
-        db.execute("INSERT INTO shadow_budgets VALUES (?,?,?,?,?,?,?,?,?)",
-                   (curve[0], run_id, row["unit"], row["role"], row["baseline_allocation"], row["shadow_allocation"],
-                    row["baseline_ratio"], row["shadow_ratio"], row["skip_reason"]))
 
 
 def shadow_report(db):
+    register_functions(db)
     allocation_rows = []
     for kind, metric, unit, role, count, baseline, candidate in db.execute(
         "SELECT r.resource_type,c.metric,b.unit,b.role,COUNT(*),AVG(b.baseline_allocation),AVG(b.shadow_allocation) "
@@ -77,21 +56,32 @@ def shadow_report(db):
                                shadow_exceedance_rate=after, baseline_mean_excess_ratio=before_excess,
                                shadow_mean_excess_ratio=after_excess))
     changes = []
-    for kind, count, before, after in db.execute(
-        "SELECT resource_type,COUNT(*),SUM(baseline!=prev_baseline),SUM(candidate!=prev_candidate) FROM ("
-        "SELECT r.*,LAG(baseline) OVER w AS prev_baseline,LAG(candidate) OVER w AS prev_candidate,"
-        "LAG(basis) OVER w AS prev_basis,LAG(status) OVER w AS prev_status "
+    transitions = db.execute(
+        "SELECT r.resource_type,r.resource_id,r.baseline,r.candidate,r.basis,r.status "
         "FROM shadow_runs r JOIN batches b ON b.name=r.batch "
-        "WINDOW w AS (PARTITION BY resource_type,resource_id ORDER BY b.issued_ms,r.batch)) "
-        "WHERE status='paired' AND prev_status='paired' AND basis=prev_basis GROUP BY resource_type"
-    ):
-        changes.append(dict(resource_type=kind, comparable_transitions=count,
-                            baseline_changes=before, shadow_changes=after,
-                            baseline_change_rate=before/count, shadow_change_rate=after/count))
+        "ORDER BY r.resource_type,r.resource_id,b.issued_ms,r.batch"
+    )
+    for kind, rows in groupby(transitions, key=lambda row: row[0]):
+        count, before, after = 0, None, None
+        previous = None
+        for row in rows:
+            _, resource_id, baseline, candidate, basis, status = row
+            if (previous is not None and resource_id == previous[1]
+                    and status == previous[5] == "paired" and basis == previous[4]):
+                count += 1
+                if baseline is not None and previous[2] is not None:
+                    before = (before or 0) + (baseline != previous[2])
+                if candidate is not None and previous[3] is not None:
+                    after = (after or 0) + (candidate != previous[3])
+            previous = row
+        if count:
+            changes.append(dict(resource_type=kind, comparable_transitions=count,
+                                baseline_changes=before, shadow_changes=after,
+                                baseline_change_rate=before/count, shadow_change_rate=after/count))
     return {"mode": "shadow", "executable": False,
             "run_counts": dict(db.execute("SELECT status,COUNT(*) FROM shadow_runs GROUP BY status")),
             "unavailable_reasons": dict(db.execute(
-                "SELECT json_extract(snapshot,'$.reason'),COUNT(*) FROM shadow_runs WHERE status!='paired' GROUP BY 1")),
+                "SELECT rp_json_field(snapshot,'reason'),COUNT(*) FROM shadow_runs WHERE status!='paired' GROUP BY 1")),
             "budget_skip_reasons": dict(db.execute(
                 "SELECT skip_reason,COUNT(*) FROM shadow_budgets WHERE skip_reason IS NOT NULL GROUP BY skip_reason")),
             "allocation_rows": allocation_rows, "actual_rows": actual_rows, "change_rows": changes}

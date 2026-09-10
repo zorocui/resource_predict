@@ -17,11 +17,9 @@ from resource_predict.pipeline.action_gate_state import (
 )
 from resource_predict.pipeline._types import WorkerContext
 from resource_predict.pipeline.constants import MANIFEST_FILENAME
-from resource_predict.pipeline.forecast_archive import archive_forecasts
 from resource_predict.pipeline.calibration import calibrate_forecasts, refresh_calibration_advice
 from resource_predict.pipeline.controlled_activation import apply_controlled_advice
 from resource_predict.pipeline.shadow import build_shadow_advice
-from resource_predict.pipeline.realized_error import try_score_realized_forecasts
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_execution_plan
 from resource_predict.pipeline.parallel import execute_metric_jobs
@@ -182,7 +180,6 @@ def generate_forecasts(
             raw_stats["files_removed"],
         )
     # Preserve untrimmed evidence even when a metric cannot currently be forecast.
-    realized_items = prepared_data
     prediction_skips: List[Dict[str, str]] = []
     if resource_family == "workload":
         prepared_data, prediction_skips = prepare_recent_contiguous_forecast_data(
@@ -321,29 +318,18 @@ def generate_forecasts(
         item.pop("_timings", None)
         item.pop("_slot", None)
 
+    from resource_predict.services.accuracy_summary import write_accuracy_summary
+    write_accuracy_summary(out_base, resources_items)
     calibration_started = time.perf_counter()
     calibrate_forecasts(out_base, resources_items, retention_days=settings.forecast.archive_retention_days)
     calibration_seconds = time.perf_counter()-calibration_started
     shadow_started = time.perf_counter()
     build_shadow_advice(resources_items)
     shadow_seconds = time.perf_counter()-shadow_started
-    try:
-        archive_metadata = archive_forecasts(
-            out_base,
-            resources_items,
-            enabled=bool(getattr(settings.forecast, "archive_enabled", True)),
-            retention_days=int(getattr(settings.forecast, "archive_retention_days", 7)),
-        )
-        logger.info("[forecast_archive] %s", archive_metadata)
-    except Exception as exc:
-        archive_metadata = {"status": "failed", "path": None, "count": 0, "error": str(exc)}
-        logger.warning("[forecast_archive] status=failed; forecasts will continue: %s", exc)
-
     for item in resources_items:
         item.pop("_accuracy_holdout", None)
-    realized_metadata = try_score_realized_forecasts(out_base, realized_items)
-    realized_metadata["calibration_seconds"] = calibration_seconds
-    realized_metadata["shadow_generation_seconds"] = shadow_seconds
+    execution_stats["calibration_seconds"] = calibration_seconds
+    execution_stats["shadow_generation_seconds"] = shadow_seconds
     predicted_count = len(resources_items)
     predicted_resource_ids = {
         str(item.get("resource_id"))
@@ -388,7 +374,7 @@ def generate_forecasts(
             item["shadow_comparison"] = {**comparison, "status": "unavailable", "reason": "current_spec_changed"}
     apply_controlled_advice(resources_items, fresh_ids=predicted_resource_ids,
                             report_path=out_base / "forecast_realized_report.json",
-                            archive_metadata=archive_metadata,feedback_metadata=realized_metadata)
+                            archive_metadata={"status": "removed"}, feedback_metadata={"status": "removed"})
     refresh_calibration_advice(resources_items)
     action_gate_state = apply_action_gate_confirmations(
         resources_items,
@@ -429,8 +415,6 @@ def generate_forecasts(
         total_elapsed=total_elapsed,
         raw_stats=raw_stats,
         prediction_skips=prediction_skips,
-        forecast_archive=archive_metadata,
-        forecast_realized=realized_metadata,
         execution_stats=execution_stats,
     )
     try:

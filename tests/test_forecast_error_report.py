@@ -1,8 +1,6 @@
 import copy
-import json
 
-from resource_predict.pipeline.constants import GENERATION_STATS_FILENAME
-from resource_predict.pipeline.write_outputs import _build_forecast_error_report, write_prediction_outputs
+from resource_predict.pipeline.write_outputs import _build_forecast_error_report
 
 
 def _report(items):
@@ -103,16 +101,3 @@ def test_container_only_and_duplicate_resource_ids_count_uniquely():
     assert report["meta"]["resources"] == 1
     assert report["meta"]["rows"] == 2
     assert report["rows"][0]["rmse"] is None
-
-
-def test_archive_failure_metadata_is_visible_in_generation_stats(tmp_path):
-    archive = {"status": "failed", "path": None, "count": 0, "error": "disk full"}
-    write_prediction_outputs(
-        out_base=tmp_path, resources_items=[], active_methods=["arima"],
-        test_size=12, future_steps=6, forecast_window={}, detail_chunk_size=10,
-        predicted_count=0, partial_resource_ids=set(), metric_filter_by_id={},
-        metric_partial_enabled=False, total_elapsed=0, raw_stats={},
-        forecast_archive=archive,
-    )
-    stats = json.loads((tmp_path / GENERATION_STATS_FILENAME).read_text(encoding="utf-8"))
-    assert stats["forecast_archive"] == archive

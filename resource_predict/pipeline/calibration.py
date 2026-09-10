@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import math
-import sqlite3
+from resource_predict.sqlite_runtime import register_functions, sqlite3
 from contextlib import closing
 from pathlib import Path
 
@@ -46,6 +46,7 @@ def _calibrate_curve(db, item, container, metric, chart, diagnostics, retention_
     result["data_end_ms"] = origin
     samples = {}
     if db is not None:
+        register_functions(db)
         # A single ordered cursor replaces repeated window sorts; retain at most 500 per bucket.
         query = (
             "SELECT p.actual-p.predicted,p.target_ms,p.scored_at_ms,c.batch,"
@@ -53,8 +54,8 @@ def _calibrate_curve(db, item, container, metric, chart, diagnostics, retention_
             "WHERE c.resource_id=? AND c.container=? AND c.metric=? AND c.model=? AND c.unit=? "
             "AND c.basis=? AND p.actual IS NOT NULL AND p.scored_at_ms<? AND p.target_ms<=? "
             "AND c.issued_ms>=? AND p.target_ms>c.data_end_ms "
-            "AND json_extract(c.provenance,'$.model_version')=? "
-            "AND json_extract(c.provenance,'$.config_hash')=? "
+            "AND rp_json_field(c.provenance,'model_version')=? "
+            "AND rp_json_field(c.provenance,'config_hash')=? "
             "ORDER BY p.target_ms DESC,c.issued_ms DESC,c.id DESC"
         )
         seen = {bucket: set() for bucket in range(len(HORIZONS))}

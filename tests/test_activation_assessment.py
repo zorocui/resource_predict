@@ -1,12 +1,12 @@
 import json
+import re
 import sqlite3
 from contextlib import closing
-from unittest.mock import patch
 
 import pytest
 
 from resource_predict.pipeline.activation_assessment import activation_assessment
-from resource_predict.pipeline.realized_error import _SCHEMA, DB_NAME, REPORT_NAME, score_realized_forecasts
+from resource_predict.pipeline.realized_error import _SCHEMA, DB_NAME
 from resource_predict.pipeline.shadow_evaluation import SCHEMA as SHADOW_SCHEMA
 
 NOW = 1_788_700_000_000
@@ -203,20 +203,6 @@ def test_k8s_limit_reduction_alone_is_not_reservation_benefit(tmp_path):
         assert "insufficient_reservation_benefit" in assess(db)["reasons"]
 
 
-def test_report_entry_empty_evidence_and_no_automatic_activation(tmp_path):
-    with closing(sqlite3.connect(tmp_path/DB_NAME)) as db:
-        db.executescript(_SCHEMA+SHADOW_SCHEMA)
-        assert activation_assessment(db,NOW,7)["status"] == "no_shadow_evidence"
-        seed(db)
-    with patch("time.time",return_value=NOW/1000):
-        score_realized_forecasts(tmp_path)
-    first = json.loads((tmp_path/REPORT_NAME).read_text())["activation_assessment"]
-    with patch("time.time",return_value=NOW/1000):
-        score_realized_forecasts(tmp_path)
-    second = json.loads((tmp_path/REPORT_NAME).read_text())["activation_assessment"]
-    assert first == second
-    assert first["automatic_activation"] is False
-    assert first["resources"][0]["status"] == "eligible_for_review"
 
 
 @pytest.mark.parametrize("missing,eligible",[(9,True),(10,False)])
@@ -253,3 +239,99 @@ def test_execution_recheck_can_limit_to_requested_resource(db):
     result=activation_assessment(db,NOW,7,resource_ids=("vm-b",))
     assert [row["resource_id"] for row in result["resources"]]==["vm-b"]
     assert activation_assessment(db,NOW,7,resource_ids=())["status"]=="no_shadow_evidence"
+
+
+def test_shadow_stream_matches_window_reference_across_resource_and_regime_boundaries(db):
+    from resource_predict.pipeline.shadow_evaluation import shadow_report
+
+    seed(db, rid="vm-b")
+    seed(db, rid="k8s-a", kind="k8s_workload")
+    with db:
+        db.execute("UPDATE shadow_runs SET status='unavailable',snapshot=? WHERE id%5=0",
+                   (encode({"reason": "missing_evidence"}),))
+        db.execute("UPDATE shadow_runs SET basis='changed' WHERE id%7=0")
+        db.execute("UPDATE shadow_runs SET candidate='changed' WHERE id%3=0")
+        db.execute("UPDATE shadow_runs SET baseline='changed' WHERE id%4=0")
+    # A modern-SQL oracle only in this test protects the former LAG semantics.
+    expected = list(db.execute(
+        "SELECT resource_type,COUNT(*),SUM(baseline!=prev_baseline),SUM(candidate!=prev_candidate) FROM ("
+        "SELECT r.*,LAG(baseline) OVER w AS prev_baseline,LAG(candidate) OVER w AS prev_candidate,"
+        "LAG(basis) OVER w AS prev_basis,LAG(status) OVER w AS prev_status "
+        "FROM shadow_runs r JOIN batches b ON b.name=r.batch "
+        "WINDOW w AS (PARTITION BY resource_type,resource_id ORDER BY b.issued_ms,r.batch)) "
+        "WHERE status='paired' AND prev_status='paired' AND basis=prev_basis GROUP BY resource_type"
+    ))
+    report = shadow_report(db)
+    actual = [(row["resource_type"], row["comparable_transitions"], row["baseline_changes"],
+               row["shadow_changes"]) for row in report["change_rows"]]
+    assert actual == expected
+    assert report["unavailable_reasons"] == {"missing_evidence": 9}
+
+
+class LegacySQLGuard:
+    """Reject newer SQL and binding counts before modern SQLite can accept them."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql, parameters=()):
+        self.check(sql)
+        assert len(parameters) <= 999
+        return self.connection.execute(sql, parameters)
+
+    def executescript(self, sql):
+        self.check(sql)
+        return self.connection.executescript(sql)
+
+    def create_function(self, name, count, function):
+        # Deliberately lacks the unsupported deterministic keyword.
+        return self.connection.create_function(name, count, function)
+
+    @staticmethod
+    def check(sql):
+        assert not re.search(r"\b(?:WITH|OVER|WINDOW|RETURNING|json_\w+)\b", sql, re.I)
+        assert not re.search(r"ON\s+CONFLICT.*DO\s+", sql, re.I | re.S)
+        assert not re.search(r"CREATE\s+(?:UNIQUE\s+)?INDEX[^;]*\bWHERE\b", sql, re.I)
+
+
+def test_metric_evidence_accepts_more_than_999_internal_run_ids(db):
+    from resource_predict.pipeline.activation_assessment import _metric_evidence
+
+    # Existing IDs produce evidence; the additional genuine INTEGER IDs stress
+    # the selection size independently of the size of the point fixtures.
+    db.executemany("INSERT INTO batches VALUES (?,?)", ((f"extra-{i}", NOW) for i in range(1000)))
+    db.executemany(
+        "INSERT INTO shadow_runs(batch,resource_id,resource_type,basis,status,snapshot) VALUES (?,?,?,?,?,?)",
+        ((f"extra-{i}", "vm-a", "openstack_vm", "{}", "unavailable", "{}") for i in range(1000)),
+    )
+    run_ids = [row[0] for row in db.execute("SELECT id FROM shadow_runs")]
+    if hasattr(db, "setlimit"):
+        db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+    result = _metric_evidence(LegacySQLGuard(db), run_ids, "", "cpu", NOW)
+    assert len(run_ids) > 999
+    assert result["matched_targets"] == result["due_targets"] == 192
+    assert result["reservation_reduction"] == pytest.approx(0.2)
+    for invalid in ("1) OR 1=1 --", 1.0, True):
+        with pytest.raises(ValueError, match="must be integers"):
+            _metric_evidence(LegacySQLGuard(db), [invalid], "", "cpu", NOW)
+
+
+def test_pipeline_reports_and_calibration_use_legacy_sql(db):
+    from resource_predict.pipeline.calibration import _calibrate_curve
+    from resource_predict.pipeline.realized_error import _basis, _report, _unit
+
+    legacy = LegacySQLGuard(db)
+    legacy.executescript(_SCHEMA + SHADOW_SCHEMA)
+    report = _report(legacy, NOW, 7)
+    assert report["activation_assessment"]["resources"][0]["status"] == "eligible_for_review"
+    assert report["shadow_comparison"]["change_rows"][0]["comparable_transitions"] == 15
+    assert sum(row["count"] for row in report["rows"]) == 576
+    source = {"resource_id": "vm-a", "resource_type": "openstack_vm", "spec": {}}
+    db.execute("UPDATE curves SET basis=?,unit=?", (_basis(source, "", "cpu"), _unit(source, "", "cpu")))
+    chart = {"best_method": "rolling_mean", "x_pred_ms": [NOW+1000],
+             "preds_future": {"rolling_mean": [0.3]}}
+    diagnostics = {"provenance": {"model_version": "v1", "config_hash": "cfg",
+                                  "generated_at_epoch_ms": NOW, "data_end_ms": NOW}}
+    calibration = _calibrate_curve(legacy, source, "", "cpu", chart, diagnostics, 7)
+    assert calibration["buckets"][0]["sample_count"] == 32
+    assert calibration["status"] == "insufficient_samples"

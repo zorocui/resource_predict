@@ -279,7 +279,7 @@ VM 与 K8S Workload 共用证据链、置信度、紧急度、门控与执行反
 - **Pull 增量**：`POST /api/update-trigger` 调用可插拔的 `IncrementalProvider`，通过 `incremental_provider_path`（`module:function` 格式）指定自定义数据源，无需改动核心代码即可对接既有监控系统；
 - **Push 增量**：`POST /api/update-data`（仅更新已有）与 `POST /api/upsert-data`（更新或新增），支持秒 / 毫秒 / ISO 字符串混合时间戳，按 `duplicated(keep="last")` 去重；
 - **K8S Prometheus Pull**：页面按钮、API 或 CLI 三种触发方式，多集群并发拉取，支持 Bearer Token 与 Basic Auth 双认证、按集群覆盖命名空间正则；
-- **后台定时调度**：`python app.py` 启动后按配置周期自动拉取，配置保存即时生效无需重启。
+- **后台定时调度**：应用启动不额外拉取，正常定时拉取保留（默认每 6 小时），配置保存即时生效无需重启。
 
 合并后仅对真正发生变化的资源调用 `generate_predictions_only(resource_ids=...)` 做**部分重预测**，而非全量管线重跑。
 

@@ -2,14 +2,12 @@ import math
 import sqlite3
 from collections import defaultdict
 from contextlib import closing
-from unittest.mock import patch
 
 import pytest
 
 from benchmarks.forecast_feedback_benchmark import seed, resource, NOW, METRICS
 from resource_predict.pipeline.calibration import _calibrate_curve, HORIZONS
-from resource_predict.pipeline.realized_error import _report, _basis, _unit, _json, DB_NAME, REPORT_NAME, score_realized_forecasts
-from resource_predict.pipeline.forecast_archive import archive_forecasts
+from resource_predict.pipeline.realized_error import _report, _basis, _unit, _json, DB_NAME
 
 
 def test_streamed_calibration_matches_original_sql_per_horizon(tmp_path):
@@ -64,24 +62,3 @@ def test_two_stage_report_preserves_point_weighting(tmp_path):
             assert row["rmse"] == pytest.approx(math.sqrt(sum(e*e for e in errors)/len(errors)))
             assert row["underestimate_rate"] == pytest.approx(sum(e>0 for e in errors)/len(errors))
             assert row["mean_underestimate"] == pytest.approx(sum(max(e,0) for e in errors)/len(errors))
-
-
-def test_deferred_report_keeps_scores_then_publishes_without_double_count(tmp_path):
-    provenance = {"data_end_ms": NOW,"generated_at_epoch_ms": NOW}
-    item = {"resource_id": "vm", "spec": {},"charts_forecast": {"cpu": {
-        "x_pred_ms": [NOW+1000],"best_method": "rolling_mean","preds_future": {"rolling_mean": [0.2]}}},
-        "forecast_diagnostics": {"cpu": {"provenance": provenance}}}
-    with patch("time.time",return_value=NOW/1000):
-        archive_forecasts(tmp_path,[item])
-    incoming = {"resource_id": "vm","observation_evidence": {"schema_version": 1,"source": "test",
-                "spec": {},"metrics": {"cpu": {"timestamps": [NOW+1000],"values": [0.4]}}}}
-    with patch("time.time",return_value=(NOW+2000)/1000):
-        with patch("resource_predict.pipeline.realized_error._report",side_effect=AssertionError("must defer")):
-            result = score_realized_forecasts(tmp_path,[incoming],publish_report=False)
-        assert result["newly_scored"] == 1
-        assert result["coverage"] is None
-        assert not (tmp_path / REPORT_NAME).exists()
-        result = score_realized_forecasts(tmp_path,[incoming])
-    assert result["newly_scored"] == 0
-    assert result["coverage"] == {"scored": 1}
-    assert result["report_published"] is True

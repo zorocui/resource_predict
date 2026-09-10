@@ -62,8 +62,8 @@ test("detail advice renders backend scores, real zero, unknown and legacy withou
   }, urgency_breakdown: { version: 2, score: 0, kind: "none" } };
   context.window.ResourceCharts.renderAdvice(resource);
   assert.match(app.els.detailConfidence.innerHTML, /置信度 低 · 0\/100/);
-  assert.match(app.els.detailConfidence.innerHTML, /基础信号45 - 质量扣分45/);
-  assert.match(app.els.detailAdvice.innerHTML, /无需调整 · 0\/100/);
+  assert.match(app.els.detailConfidence.innerHTML, /基础信号：45\n质量扣分：-45\n结果：45 − 45 ≈ 0 分/);
+  assert.doesNotMatch(app.els.detailAdvice.innerHTML, /紧急度|无需调整 · 0\/100/);
   resource.scaling_advice.confidence_score = null;
   delete resource.scaling_advice.confidence_breakdown;
   delete resource.urgency_breakdown;
@@ -71,7 +71,7 @@ test("detail advice renders backend scores, real zero, unknown and legacy withou
   context.window.ResourceCharts.renderAdvice(resource);
   assert.match(app.els.detailConfidence.innerHTML, /置信度 待评估/);
   assert.doesNotMatch(app.els.detailConfidence.innerHTML, /0\/100|默认中等置信度/);
-  assert.match(app.els.detailAdvice.innerHTML, /旧版排序分 · 182/);
+  assert.doesNotMatch(app.els.detailAdvice.innerHTML, /紧急度|旧版排序分/);
   assert.doesNotMatch(app.els.detailAdvice.innerHTML, /182\/100/);
 });
 

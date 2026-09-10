@@ -18,17 +18,8 @@
     unknown: "待评估",
   };
 
-  const URGENCY_HELP = [
-    "紧急度是规则评分，不是故障概率，也不预测耗尽时间。容量风险与节省机会分别解释。",
-    "默认等级：低 <40，中 40–<70，高 70–<90；容量风险 ≥90 为紧急，节省机会 ≥90 为极高节省机会。",
-    "等级阈值未经生产回放校准。相关指标取最高分，不累加。",
-  ].join("\n");
-
-  const CONFIDENCE_HELP = [
-    "置信度是信号可靠程度的规则评分，不是预测正确的概率。",
-    "等级：低 <45，中 45–<72，高 ≥72。",
-    "具体加减项以本次后端分解为准；执行权限不加分。",
-  ].join("\n");
+  const URGENCY_HELP = "规则评分，非故障概率；等级未经生产回放校准。";
+  const CONFIDENCE_HELP = "信号可靠程度评分，不是预测正确的概率。";
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -72,37 +63,49 @@
     const parts = components
       .filter((part) => part && typeof part === "object" && scoreValue(part.value) !== null)
       .map((part) => ({ label: String(part.label || ""), value: Number(part.value) }));
-    const formulaTerms = parts.map((part, index) => {
-      const value = Math.abs(part.value);
-      const signedText = `${part.label}${formatNumber(value, 1)}`;
-      if (index === 0) return part.value < 0 ? `-${signedText}` : signedText;
-      return `${part.value < 0 ? "-" : "+"} ${signedText}`;
-    });
-    return formulaTerms.length ? `后端分解：${formulaTerms.join(" ")}` : "缺少评分分解。";
+    if (!parts.length) return "本次结果未保存计算明细。";
+    const terms = parts.map((part, index) =>
+      `${index ? (part.value < 0 ? "− " : "+ ") : (part.value < 0 ? "−" : "")}${formatNumber(Math.abs(part.value), 3)}`);
+    const score = scoreValue(breakdown.score);
+    return [
+      ...parts.map((part) => `${part.label}：${formatNumber(part.value, 3)}`),
+      `结果：${terms.join(" ")}${score === null ? "" : ` ≈ ${formatNumber(score, 3)} 分`}`,
+    ].join("\n");
   }
 
   function confidenceTooltip(item) {
     const breakdown = item?.scaling_advice?.confidence_breakdown;
-    return [confidenceText(item), CONFIDENCE_HELP,
-      breakdown?.version === 2 ? breakdownFormula(breakdown) : "缺少新版评分分解，无法解释本次实际加减项。",
-    ].join("\n");
+    const lines = [confidenceText(item), "公式：基础证据分 + 调整分（含封顶）"];
+    if (breakdown?.version === 2) {
+      lines.push("扩容取最高证据分，缩容取最低证据分。", "", breakdownFormula(breakdown));
+    } else {
+      lines.push("", "本次结果未保存计算明细。", "重新生成预测后可查看数值公式。");
+    }
+    lines.push("", "等级：低 <45 · 中 <72 · 高 ≥72", CONFIDENCE_HELP);
+    return lines.join("\n");
   }
 
   function urgencyTooltip(item) {
     const breakdown = item?.urgency_breakdown;
     if (breakdown?.version !== 2) return `${urgencyText(item)}\n旧版排序分不是百分制，不能套用新版等级。`;
-    const lines = [urgencyText(item), URGENCY_HELP, breakdownFormula(breakdown)];
-    const metricScores = Array.isArray(breakdown.metric_scores) ? breakdown.metric_scores : [];
-    if (metricScores.length) {
-      lines.push("相关指标评分（取最高值）:");
+    const lines = [urgencyText(item)];
+    if (breakdown.kind === "capacity_risk") {
+      lines.push("公式：触阈分 + 60 × 压力", "触阈分：达到阈值为 40，否则为 0。", "压力：max(P95 压力, 0.75 × 峰值压力)");
+    } else if (breakdown.kind === "savings") {
+      lines.push("公式：60 × 空闲度 + 25 × 低负载比例", "          + 15 × 容量回收比例");
+    }
+    if (breakdown.kind !== "unknown") lines.push("", breakdownFormula(breakdown));
+    else lines.push("有效指标不足，暂未评分。");
+    const metricScores = (Array.isArray(breakdown.metric_scores) ? breakdown.metric_scores : [])
+      .filter((part) => part && scoreValue(part.value) !== null);
+    if (metricScores.length > 1) {
+      lines.push("", "各指标取最高分，不累加：");
       metricScores.forEach((part) => {
-        if (!part || typeof part !== "object") return;
-        const value = scoreValue(part.value);
-        if (value === null) return;
         const metric = app.metricTitleMap[part.metric] || part.metric;
-        lines.push(`  ${part.container ? `${part.container} · ` : ""}${metric} ${actionLabel(part.action)}: ${formatNumber(value, 1)}`);
+        lines.push(`${part.container ? `${part.container} · ` : ""}${metric} ${actionLabel(part.action)}: ${formatNumber(part.value, 3)}`);
       });
     }
+    lines.push("", "等级：低 <40 · 中 <70 · 高 <90", breakdown.kind === "savings" ? "≥90：极高节省机会" : "≥90：紧急", URGENCY_HELP);
     return lines.join("\n");
   }
 

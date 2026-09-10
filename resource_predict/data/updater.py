@@ -1212,7 +1212,6 @@ def _scheduler_loop(
     interval_seconds: float,
     incremental_provider: Optional[IncrementalProvider],
     points_per_update: int,
-    startup_delay_seconds: float,
 ) -> None:
     """后台线程主循环：按间隔定时触发 run_update。"""
     logger.info(
@@ -1220,11 +1219,6 @@ def _scheduler_loop(
         interval_seconds,
         interval_seconds / 60.0,
     )
-    if startup_delay_seconds > 0:
-        logger.info("[updater] 首次自动更新将在 %.0f 秒后执行", startup_delay_seconds)
-        if _stop_event.wait(startup_delay_seconds):
-            logger.info("[updater] 后台调度器在首次更新前停止")
-            return
     while not _stop_event.is_set():
         try:
             run_update(
@@ -1258,7 +1252,6 @@ def start_background_updater(
     cfg = settings.update
     interval = interval_minutes if interval_minutes is not None else int(cfg.interval_minutes)
     points = points_per_update if points_per_update is not None else int(cfg.points_per_update)
-    startup_delay = max(0, int(cfg.startup_delay_seconds))
 
     if not bool(cfg.enabled):
         logger.info("[updater] 配置中 enabled=False，跳过后台自动更新（可通过 POST /api/update-trigger 手动触发）")
@@ -1272,7 +1265,7 @@ def start_background_updater(
     _stop_event.clear()
     _scheduler_thread = threading.Thread(
         target=_scheduler_loop,
-        args=(interval * 60.0, incremental_provider, points, float(startup_delay)),
+        args=(interval * 60.0, incremental_provider, points),
         daemon=True,
         name="data-updater",
     )
