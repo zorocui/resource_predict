@@ -33,6 +33,29 @@ def test_irregular_samples_are_time_weighted_with_observed_capacity():
     assert row["reclaimed_unit_hours"] == pytest.approx(.25)
 
 
+def test_provisional_uses_elapsed_window_and_preserves_final_window():
+    samples = [series([0, 1, 1.25, 1.5, 2], [1]*5, [4, 2, 2, 2, 2])]
+    partial = evaluate(samples, now_ms=1.5*HOUR)[0]
+    assert partial["status"] == "provisional"
+    assert partial["after"]["coverage"] == 1
+    assert partial["after"]["valid_hours"] == .5
+    assert partial["after"]["end_ms"] == 1.5*HOUR
+    assert partial["after"]["planned_end_ms"] == 2*HOUR
+    assert partial["delta_pp"] == 25
+    assert partial["reclaimed_unit_hours"] == 1
+    assert evaluate(samples)[0]["status"] == "evaluated"
+    assert evaluate(samples, now_ms=HOUR)[0]["delta_pp"] is None
+    assert evaluate(samples, now_ms=1.5*HOUR,
+                    policy={**POLICY, "stabilization_minutes": 60})[0]["delta_pp"] is None
+    assert evaluate(samples, now_ms=1.5*HOUR,
+                    interrupted_at_ms=1.25*HOUR)[0]["delta_pp"] is None
+    # 只有尾点、前基线不足、后窗口存在长缺口时，不能产生阶段性改善。
+    for times in ([0, 1, 2], [1, 1.25, 1.5], [0, 1, 1.25]):
+        row = evaluate([series(times, [1]*len(times), [2]*len(times))], now_ms=1.5*HOUR)[0]
+        assert row["status"] == "insufficient_data"
+        assert row["delta_pp"] is None
+
+
 def test_long_gap_skipped_entirely_and_no_tail_extrapolation():
     row = evaluate([series([0, .1, 1, 1.1, 1.2], [1] * 5, [2] * 5)],
                    policy={**POLICY, "max_gap_ms": .25 * HOUR})[0]

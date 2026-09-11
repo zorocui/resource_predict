@@ -29,8 +29,8 @@ def write_accuracy_summary(directory, items):
             evaluation = curve.get("evaluation", {})
             mode = (item.get("container_metric_modes", {}).get(container, {}).get(metric) if container
                     else item.get("spec", {}).get(f"{metric}_metric_mode"))
-            ratio = kind == "openstack_vm" or mode in RATIO_MODES or metric in {
-                "cpu_limit", "cpu_request", "memory_limit", "memory_request"}
+            # 缺少基线时同名指标存的是核数/GiB，不能按利用率计入准确率。
+            ratio = kind == "openstack_vm" or mode in RATIO_MODES
             valid = hits = invalid = 0
             error_sum = 0.0
             timestamps = curve["x_test_ms"]
@@ -45,7 +45,9 @@ def write_accuracy_summary(directory, items):
                     continue
                 error = abs(predicted-actual)
                 valid += 1
-                hits += int(ratio and error <= 0.050000000000001)
+                tolerance = max(0.05, abs(actual) * 0.05)
+                hits += int(ratio and (error <= tolerance or math.isclose(
+                    error, tolerance, rel_tol=1e-12, abs_tol=1e-15)))
                 error_sum += error * (100 if ratio else 1)
             rows.append(dict(resource_id=item["resource_id"], resource_type=kind,
                              container=container, metric=metric, model=curve["model"],
@@ -55,20 +57,23 @@ def write_accuracy_summary(directory, items):
                              unit="百分点" if ratio else mode or "未知单位",
                              test_start_ms=min(timestamps) if timestamps else None,
                              test_end_ms=max(timestamps) if timestamps else None))
-    payload = dict(version=1, generated_at_ms=int(time.time()*1000), rows=rows)
+    payload = dict(version=2, generated_at_ms=int(time.time()*1000), rows=rows)
     atomic_write_json(Path(directory)/FILENAME, payload, ensure_ascii=False, separators=(",", ":"))
     return payload
 
 
 def read_accuracy_summary(directories):
-    rows, runs = [], []
+    rows, runs, needs_regeneration = [], [], []
     for directory in directories:
         path = Path(directory)/FILENAME
         if not path.is_file():
             continue
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("version") != 1 or not isinstance(payload.get("rows"), list):
+        if payload.get("version") not in {1, 2} or not isinstance(payload.get("rows"), list):
             raise ValueError("invalid accuracy summary")
+        if payload["version"] == 1:
+            needs_regeneration.append(Path(directory).name)
+            continue
         runs.append(dict(scope=Path(directory).name, generated_at_ms=payload["generated_at_ms"]))
         rows.extend(payload["rows"])
     eligible = [row for row in rows if row["hit_points"] is not None]
@@ -79,4 +84,4 @@ def read_accuracy_summary(directories):
                 resource_count=len({(r["resource_type"], r["resource_id"]) for r in eligible if r["valid_points"]}),
                 invalid_points=sum(r["invalid_points"] for r in rows),
                 absolute_unit_points=sum(r["valid_points"] for r in rows if r["hit_points"] is None),
-                rows=rows, runs=runs)
+                rows=rows, runs=runs, needs_regeneration=needs_regeneration)

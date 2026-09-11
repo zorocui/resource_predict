@@ -261,7 +261,7 @@ K8S Fetch:  POST /api/cluster-configs/k8s-fetch -> run_k8s_prometheus_upsert（�
 
 K8S Prometheus 拉取窗口由 `run_k8s_prometheus_upsert()` 决定：如果 `outputs/k8s/raw_index.json` 缺失、指定集群没有本地基线，或请求传入 `full_refresh=true`，则按 `history_days` 拉取全量历史窗口（默认 7 天）；否则按 `scheduled_update_interval_minutes + incremental_overlap_minutes` 拉取增量窗口（默认 6 小时周期 + 1 小时 overlap = 最近 7 小时）。通过 `python app.py` 启动时保留 K8S 定时调度线程，启用后按配置周期（默认每 6 小时）拉取；仅取消启动时额外执行的那一轮。也可通过页面按钮、API 或 CLI 手动触发。
 
-调度线程的等待挂在 `_k8s_reload_event` 上，因此保存系统配置（`PUT /api/system-config`）会立刻唤醒它重读开关和周期，无需重启应用。唤醒本身不触发拉取：循环每轮按 `last_start + max(60 秒, scheduled_update_interval_minutes)` 重新推导到期时刻并继续等待剩余部分，所以周期既不会被重置也不会被提前。其中 `last_start` 是上一次拉取**开始**时的 monotonic 时刻，拉取异常同样占用本轮，因此失败后不会快速重试而是等满一个周期；首轮以线程启动时刻为计时基准。只有重算后已逾期的配置变更才会立即取数：把周期改短到已过期、关闭超过一个周期后重新打开。定时拉取的 `trigger_source` 统一为 `scheduled`。VM 侧的 `_scheduler_loop` 没有接入该事件，且 `start_background_updater()` 当前无调用方，因此 VM 数据不会被自动拉取。
+调度线程的等待挂在 `_k8s_reload_event` 上，因此保存系统配置（`PUT /api/system-config`）会立刻唤醒它重读开关和周期，无需重启应用。唤醒本身不触发拉取：循环每轮按 `last_start + max(60 秒, scheduled_update_interval_minutes)` 重新推导到期时刻并继续等待剩余部分，所以周期既不会被重置也不会被提前。其中 `last_start` 是上一次拉取**开始**时的 monotonic 时刻，拉取异常同样占用本轮，因此失败后不会快速重试而是等满一个周期；重启从输出根目录的 `k8s_scheduler_state.json` 恢复时间，并换算为进程内单调时钟；首次升级可从 `update_history.json` 中的自动拉取记录迁移。仅没有历史的首次接入以启动时刻为基准。重启时已过期则补跑一轮，手动拉取不更新自动计时。只有重算后已逾期的配置变更才会立即取数：把周期改短到已过期、关闭超过一个周期后重新打开。定时拉取的 `trigger_source` 统一为 `scheduled`。VM 侧的 `_scheduler_loop` 没有接入该事件，且 `start_background_updater()` 当前无调用方，因此 VM 数据不会被自动拉取。
 
 锚定开始时刻而非完成时刻是数据完整性的要求。增量回看窗口固定为 `scheduled_update_interval_minutes + incremental_overlap_minutes`，而窗口末端取的是 `_fetch_target()` 里构建查询时的 `time.time()`，也就是本轮拉取的起点。若按完成时刻计时，两轮起点的实际间隔会变成 `周期 + 拉取耗时`，一旦耗时超过 `incremental_overlap_minutes`（默认 60 分钟），窗口就盖不住上一轮的末端，中间那段数据永远不会被任何一轮取到，漏掉的时长等于 `拉取耗时 - incremental_overlap_minutes`。按开始时刻计时后实际间隔是 `max(周期, 拉取耗时)`，默认配置下拉取耗时不超过 420 分钟都不会漏；耗时超过周期时循环会记录 warning 并立即开始下一轮。漏掉的时间段若超过 `step_seconds × (max_interpolation_gap_steps + 1)`（默认 40 分钟），`recent_contiguous_segment()` 会判定断档并把可用历史截断到最近一段，该段点数不足 `test_size` 时 `prepare_recent_contiguous_forecast_data()` 记入 `prediction_skips` 并沿用旧预测。
 
@@ -325,15 +325,10 @@ sequenceDiagram
 
 **预测准确率**：`services/accuracy_summary.py` 在增量合并前汇总本轮新预测实际选用模型的独立历史测试，保存 `forecast_accuracy_summary.json`。只保存计数、MAE和测试边界，不保存逐点数组；页面自动展示±5个百分点达标率，支持汇总CSV和打印。
 
-**移除逐点写入**：逐点预测留档生成、SQLite导入和手动补导入入口已删除。`pipeline/realized_error.py` 仅保留旧证据的口径及只读报告辅助函数。已有旧证据不自动删除；扩缩容执行门控继续保留，缺少新证据不会自动通过评审。
+**移除逐点写入及校准验证**：逐点预测留档生成、SQLite 导入、手动补导入及校准验证处理已删除。已有旧证据不自动删除；扩缩容执行门控继续保留。
 
 ### VM 决策引擎（`core/decision.py`）
 
-`pipeline/activation_assessment.py` 在报告事务的同一 SQLite 快照内逐资源判定影子策略的评审条件：识别最新连续可比轮次，按指标去重目标，再对同一观测集合检查样本、新鲜度、风险、资源量与建议稳定性。判定随真实误差报告输出，不自行启用策略。默认关闭的 `controlled_activation.py` 只对显式允许资源核对本轮判定并重建完整校准建议，在跨轮次确认前切换；切换后确认计数重新积累。execute 路径额外核验校准授权及该资源当前账本，保留原有其他门控。
-
-`pipeline/shadow.py` 在校准后、留档前为完整新预测生成非执行对照：同一建议算法分别使用原入选曲线与校准上界。两套 action/target_spec/policy_tier 和基准规格随预测冻结，`shadow_evaluation.py` 在 SQLite 中关联对应曲线，使用后来到达的同批真实评分计算配对超出率、建议资源量差异和相邻建议变更率。K8S request/limit 分开、仅固定副本数的可比指标参与真实值评分；影子数据不流入正式执行门控。
-
-预测留档前，`pipeline/calibration.py` 从真实误差账本的只读快照中读取生成时已知的可比残差，为入选曲线附加经验上界。不同资源、容器、模型、口径和提前量不混用样本；上界随原预测留档，后续单独核验覆盖率。默认只输出观察信息；显式开启受控采用后，只有通过本轮判定的资源才由 controlled_activation 切换正式建议，仍受执行门控约束。
 
 - **扩容判断**：P95 / 峰值超过阈值 + 峰谷差 + 上升趋势斜率 + 窗口均值变化
 - **缩容判断**：均值 + P95 低于阈值，含 `max_reduction_ratio` 保护（防止 32 核 -> 1 核）
@@ -412,6 +407,8 @@ VM 使用 CPU、内存、磁盘；K8S 仅 CPU、内存。新 K8S 建议优先使
 默认等级：低 `<40`，中 `40–<70`，高 `70–<90`，`>=90` 的容量风险为“紧急”、节省机会为“极高”。`hold` 为“无需调整”；数据不足、缺失/非有限统计为“待评估”，排序值为 0，不能理解为低风险。这些是尚未经生产历史回放校准的工程默认值，不是 SLA。页面显示类别、中文等级及 `/100`，旧版排序分不会冒充百分制。
 
 ### 置信度评分（v2）
+
+完整变量定义、默认参数和逐步算例见 [紧急度与置信度计算说明](scoring-formulas.md)。
 
 置信度保留 `0..100` 范围与门控阈值：低 `<45`，中 `45–<72`，高 `>=72`。这是扩缩容证据的规则评分，仍未引入历史实测误差或区间覆盖率的概率校准；82 分不表示预测正确率 82%。
 

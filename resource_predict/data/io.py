@@ -296,8 +296,6 @@ def merge_charts_into_detail(
             "sample_interval_seconds": block.get("sample_interval_seconds"),
             "max_interpolation_gap_steps": block.get("max_interpolation_gap_steps"),
         }
-        if isinstance(block.get("calibration"), dict):
-            merged_charts[kind]["calibration"] = block["calibration"]
     out["charts"] = merged_charts
     container_charts = _merge_container_charts(
         raw,
@@ -372,8 +370,6 @@ def _merge_container_charts(
                 "sample_interval_seconds": block.get("sample_interval_seconds"),
                 "max_interpolation_gap_steps": block.get("max_interpolation_gap_steps"),
             }
-            if isinstance(block.get("calibration"), dict):
-                metric_out[str(metric)]["calibration"] = block["calibration"]
         if metric_out:
             out[str(container)] = metric_out
     return out

@@ -236,5 +236,39 @@ class ClusterConfigsTest(unittest.TestCase):
         self.assertEqual(failed.call_args.kwargs["cluster_results"], cluster_results)
 
 
+def test_new_cluster_gets_full_history_alongside_existing_clusters(tmp_path):
+    from resource_predict.providers import k8s_prometheus as provider
+
+    out_dir = tmp_path / "k8s"
+    out_dir.mkdir()
+    (out_dir / "raw_index.json").write_text(json.dumps({
+        "schema_version": 2,
+        "resources": {f"k8s:{name}:ns:deployment:api": {
+            "file": "raw/00/unused.json", "resource_type": "k8s_workload",
+        } for name in ("old-a", "old-b")},
+    }), encoding="utf-8")
+    fake_settings = SimpleNamespace(app=SimpleNamespace(out_dir=str(tmp_path)),
+        k8s_prometheus=SimpleNamespace(scheduled_update_interval_minutes=360,
+                                      incremental_overlap_minutes=0))
+    targets = [SimpleNamespace(cluster=name, prometheus_url=f"http://{name}")
+               for name in ("old-a", "old-b", "new")]
+    with patch.object(k8s_ingest, "settings", fake_settings), \
+         patch.object(provider, "_resolve_targets", return_value=targets), \
+         patch.object(provider, "_fetch_target_with_retry", return_value=[{"resource_id": "test"}]) as fetch:
+        for selected, full_refresh, expected in [
+            (None, False, [6.0, 6.0, None]),
+            (["old-a", "old-b", "new"], False, [6.0, 6.0, None]),
+            (["new"], False, [None]),
+            (["old-a"], False, [6.0]),
+            (None, True, [None, None, None]),
+        ]:
+            fetch.reset_mock()
+            hours = k8s_ingest._history_hours_for_fetch(
+                out_dir=out_dir, clusters=selected, full_refresh=full_refresh)
+            result = k8s_ingest.fetch_k8s_prometheus_result(selected, history_hours=hours)
+            assert [call.kwargs["history_hours"] for call in fetch.call_args_list] == expected
+            assert all(row["status"] == "success" for row in result["cluster_results"])
+
+
 if __name__ == "__main__":
     unittest.main()

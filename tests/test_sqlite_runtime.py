@@ -50,8 +50,7 @@ def test_helpers_do_not_request_new_sqlite_function_flags():
 
 
 def test_production_consumers_use_native_connection_helper():
-    from resource_predict.pipeline import calibration, controlled_activation, realized_error
     from resource_predict.services.scaling import effects, effect_reports
     from resource_predict.services import forecast_accuracy
-    for module in (calibration, controlled_activation, realized_error, effects, effect_reports, forecast_accuracy):
+    for module in (effects, effect_reports, forecast_accuracy):
         assert module.sqlite3 is sqlite3

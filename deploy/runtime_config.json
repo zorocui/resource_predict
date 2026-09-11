@@ -13,13 +13,15 @@
     "max_interpolation_gap_steps": 3
   },
   "prediction": {
-    "vm_test_duration": "72h",
+    "parallel_backend": "auto",
+    "max_workers": 0,
+    "vm_test_duration": "24h",
     "vm_future_duration": "24h",
     "workload_test_duration": "24h",
     "workload_future_duration": "24h",
     "enabled_methods": [
-      "seasonal_naive",
-      "prophet"
+      "prophet",
+      "seasonal_naive"
     ],
     "enable_ensemble": false
   },

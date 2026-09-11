@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -14,6 +16,8 @@ from resource_predict.data.updater import (
     run_upsert_with_data,
 )
 from resource_predict.data.raw_store import RawResourceStore
+from resource_predict.data.io import atomic_write_json
+from resource_predict.services.update_history import get_update_history, UPDATE_HISTORY_RETENTION
 from resource_predict.pipeline.output_paths import scoped_out_dir
 from resource_predict.providers.k8s_prometheus import fetch_k8s_workload_prometheus_result
 from resource_predict.settings import settings
@@ -28,6 +32,36 @@ _k8s_reload_event = threading.Event()
 _k8s_scheduler_thread: Optional[threading.Thread] = None
 
 
+def _load_scheduler_anchor() -> float:
+    """重启恢复自动调度基准；旧部署从自动拉取历史迁移，忽略手动任务。"""
+    now = time.time()
+    path = Path(settings.app.out_dir) / "k8s_scheduler_state.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        anchor = payload.get("anchor_epoch_seconds")
+        if payload.get("version") == 1 and type(anchor) in (int, float) and math.isfinite(anchor) and 0 < anchor <= now:
+            return float(anchor)
+        logger.warning("[k8s_ingest] 调度状态无效，尝试从自动拉取历史恢复: %s", path)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, AttributeError):
+        logger.exception("[k8s_ingest] 无法读取调度状态，尝试历史恢复: %s", path)
+    sources = {_trigger_source_label("scheduled"), _trigger_source_label("scheduled_startup")}
+    anchors = [record.get("started_at") for record in get_update_history(
+        limit=UPDATE_HISTORY_RETENTION, out_dir=settings.app.out_dir) if record.get("task_source") in sources]
+    valid = [float(value) for value in anchors
+             if type(value) in (int, float) and math.isfinite(value) and 0 < value <= now]
+    return max(valid) if valid else now
+
+
+def _save_scheduler_anchor(anchor: float) -> None:
+    try:
+        atomic_write_json(Path(settings.app.out_dir) / "k8s_scheduler_state.json",
+                          {"version": 1, "anchor_epoch_seconds": anchor})
+    except OSError:
+        logger.exception("[k8s_ingest] 无法保存调度时间，当前进程继续按原周期运行")
+
+
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -37,12 +71,18 @@ def fetch_k8s_prometheus_result(
     *,
     history_hours: Optional[float] = None,
 ) -> Dict[str, Any]:
+    # 批量/定时拉取中，新集群不能继承其他集群的增量窗口。
+    windows = None
+    if history_hours is not None:
+        windows = {cluster: history_hours for cluster in _existing_k8s_raw_clusters(
+            scoped_out_dir("k8s", settings.app.out_dir))}
     result = fetch_k8s_workload_prometheus_result(
         resources=0,
         n=0,
         freq="5min",
         clusters=clusters,
         history_hours=history_hours,
+        history_hours_by_cluster=windows,
     )
     if not isinstance(result, dict):
         raise RuntimeError("Prometheus provider returned an invalid K8S fetch result")
@@ -169,9 +209,8 @@ def _fetch_window_label(history_hours: Optional[float]) -> str:
     if history_hours is None:
         days = int(getattr(settings.k8s_prometheus, "history_days", 7))
         return f"全量历史窗口：最近 {days} 天"
-    if float(history_hours).is_integer():
-        return f"增量窗口：最近 {int(history_hours)} 小时"
-    return f"增量窗口：最近 {float(history_hours):.1f} 小时"
+    hours = f"{float(history_hours):g}"
+    return f"已有集群增量窗口：最近 {hours} 小时；无本地历史的集群使用全量历史窗口"
 
 
 def _trigger_source_label(trigger_source: str) -> str:
@@ -183,26 +222,28 @@ def _trigger_source_label(trigger_source: str) -> str:
 
 
 def _has_existing_k8s_raw_data(out_dir: Path, clusters: Optional[Iterable[str]]) -> bool:
+    existing = _existing_k8s_raw_clusters(out_dir)
+    wanted = {str(x).strip() for x in clusters or [] if str(x).strip()}
+    return bool(existing & wanted if wanted else existing)
+
+
+def _existing_k8s_raw_clusters(out_dir: Path) -> set[str]:
     generation_cfg = getattr(settings, "generation", None)
     store = RawResourceStore(
         out_dir,
         max_cache_items=int(getattr(generation_cfg, "raw_resource_cache_items", 100)),
     )
     if not store.exists():
-        return False
+        return set()
     try:
         resource_ids = store.resource_ids()
     except Exception:
-        return False
-    if not resource_ids:
-        return False
-    wanted = {str(x).strip() for x in clusters or [] if str(x).strip()}
-    if not wanted:
-        return True
-    return any(
-        len(parts := resource_id.split(":")) >= 2 and parts[0] == "k8s" and parts[1] in wanted
+        return set()
+    return {
+        parts[1]
         for resource_id in resource_ids
-    )
+        if len(parts := resource_id.split(":")) >= 2 and parts[0] == "k8s" and parts[1]
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +257,7 @@ def _k8s_scheduler_loop(interval_seconds: float) -> None:
     配置保存只唤醒本循环重读运行配置。拉取的唯一判定条件是到期时刻已经过去，到期时刻为
     ``last_start + max(60 秒, scheduled_update_interval_minutes)``，其中 ``last_start`` 是上一次
     拉取**开始**时的 monotonic 时刻（拉取异常同样占用本轮，因此失败后等满一个周期而不是快速
-    重试），首轮以线程启动时刻为计时基准。被提前唤醒但尚未到点时继续等待剩余时间，
+    重试），重启从持久化时间恢复，首次接入才以启动时刻为基准。被提前唤醒但尚未到点时继续等待剩余时间，
     因此周期既不会被重置也不会被提前；只有重算后已逾期才会立即拉取，例如把周期改短到已过期，
     或关闭超过一个周期后重新打开。
 
@@ -229,8 +270,10 @@ def _k8s_scheduler_loop(interval_seconds: float) -> None:
         interval_seconds,
         interval_seconds / 60.0,
     )
-    # 只运行正常定时轮次，不额外执行启动拉取。
-    last_start = time.monotonic()
+    anchor = _load_scheduler_anchor()
+    _save_scheduler_anchor(anchor)
+    # 跨进程保存墙上时间，进程内仍用单调时钟，避免校时扰动等待周期。
+    last_start = time.monotonic() - max(0.0, time.time() - anchor)
     while not _k8s_stop_event.is_set():
         cfg = settings.k8s_prometheus
         if not cfg.scheduled_update_enabled:
@@ -254,6 +297,7 @@ def _k8s_scheduler_loop(interval_seconds: float) -> None:
 
         # 先记开始时刻再拉取：拉取耗时不会把下一轮往后推。
         last_start = time.monotonic()
+        _save_scheduler_anchor(time.time())
         try:
             run_k8s_prometheus_upsert(
                 fail_if_busy=False,

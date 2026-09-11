@@ -998,7 +998,11 @@ def _do_update(
             for rid, new_info in new_by_id.items():
                 if rid in existing_ids:
                     continue
-                new_res = _build_new_resource_from_upsert(new_info)
+                try:
+                    new_res = _build_new_resource_from_upsert(new_info)
+                except ValueError as exc:
+                    all_warnings.append(f"跳过新增资源 {rid}：{exc}")
+                    continue
                 _trim_resource_to_retention(new_res, retention_days)
                 prepared.append(new_res)
                 existing_ids.add(rid)
@@ -1170,6 +1174,7 @@ def _run_scoped_data_update(
             record_history=False,
         )
         results["results_by_scope"][scope] = result
+        results["warnings"].extend(result.get("warnings") or [])
         if not result.get("success"):
             results["success"] = False
             results["error"] = result.get("error")
@@ -1184,7 +1189,6 @@ def _run_scoped_data_update(
         results["predicted_resources"] += int(result.get("predicted_resources") or 0)
         results["updated_resource_ids"].extend(result.get("updated_resource_ids") or [])
         results["created_resource_ids"].extend(result.get("created_resource_ids") or [])
-        results["warnings"].extend(result.get("warnings") or [])
         metrics_by_resource = result.get("updated_metrics_by_resource") or {}
         if isinstance(metrics_by_resource, dict):
             results["updated_metrics_by_resource"].update(metrics_by_resource)

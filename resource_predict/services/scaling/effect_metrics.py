@@ -63,6 +63,19 @@ def _window(points, start, end, max_gap, observed_until):
     }
 
 
+def _snapshot(points, start, end):
+    """单次采样没有覆盖时长、P95 或累计容量时。"""
+    timestamp = max((ts for ts in points if start <= ts <= end), default=None)
+    usage, capacity = points[timestamp] if timestamp is not None else (None, None)
+    valid = _valid(usage, capacity)
+    return {
+        "start_ms": timestamp, "end_ms": timestamp, "observation_kind": "snapshot",
+        "valid_hours": None, "coverage": None, "p95_pct": None, "overload_hours": None,
+        "mean_usage": usage if valid else None, "mean_capacity": capacity if valid else None,
+        "utilization_pct": usage / capacity * 100 if valid else None,
+    }
+
+
 def evaluate_series(series: list[dict], *, started_at_ms: int, effective_at_ms: int,
                     policy: dict, now_ms: int, interrupted_at_ms: int | None = None) -> list[dict]:
     """Evaluate each container and the complete Workload cohort independently.
@@ -72,11 +85,14 @@ def evaluate_series(series: list[dict], *, started_at_ms: int, effective_at_ms: 
     missing containers/values produce missing data, never smaller denominators.
     This function does not infer or certify attainment of a declared target.
     """
+    snapshot = policy.get("evaluation_mode") == "next_collection"
     before_start = started_at_ms - policy.get("before_hours", 24) * HOUR_MS
     after_start = effective_at_ms + policy.get("stabilization_minutes", 60) * 60_000
     after_end = after_start + policy.get("after_hours", 24) * HOUR_MS
     interrupted = interrupted_at_ms is not None and interrupted_at_ms < after_end
     observed_until = min(now_ms, interrupted_at_ms) if interrupted else now_ms
+    partial = not interrupted and now_ms < after_end
+    observed_end = max(after_start, min(now_ms, after_end)) if partial else after_end
     max_gap = policy.get("max_gap_ms", 900_000)
     coverage = policy.get("min_coverage", 0.8)
     grouped = defaultdict(dict)
@@ -102,21 +118,29 @@ def evaluate_series(series: list[dict], *, started_at_ms: int, effective_at_ms: 
 
     results = []
     for (container, metric, basis, unit), points in sorted(grouped.items()):
-        before = _window(points, before_start, started_at_ms, max_gap, now_ms)
-        after = _window(points, after_start, after_end, max_gap, observed_until)
+        if snapshot:
+            before = _snapshot(points, 0, started_at_ms)
+            after = _snapshot(points, effective_at_ms, now_ms)
+        else:
+            before = _window(points, before_start, started_at_ms, max_gap, now_ms)
+            after = _window(points, after_start, observed_end, max_gap, observed_until)
+            after["planned_end_ms"] = after_end
         status = "insufficient_data"
-        if interrupted:
+        if interrupted or (snapshot and interrupted_at_ms is not None):
             status = "interrupted"
-        elif now_ms >= after_end and before["coverage"] >= coverage and after["coverage"] >= coverage:
+        elif snapshot:
             if before["mean_capacity"] is not None and after["mean_capacity"] is not None:
                 status = "evaluated"
+        elif before["coverage"] >= coverage and after["coverage"] >= coverage and after["valid_hours"] > 0:
+            if before["mean_capacity"] is not None and after["mean_capacity"] is not None:
+                status = "provisional" if partial else "evaluated"
         result = {
             "container": container, "metric": metric, "basis": basis, "unit": unit,
             "status": status, "before": before, "after": after,
             "delta_pp": None, "relative_change_pct": None, "reclaimed_capacity": None,
             "capacity_reduction_pct": None, "reclaimed_unit_hours": None,
         }
-        if status == "evaluated":
+        if status in {"evaluated", "provisional"}:
             delta = after["utilization_pct"] - before["utilization_pct"]
             reclaimed = before["mean_capacity"] - after["mean_capacity"]
             result.update(
@@ -124,7 +148,7 @@ def evaluate_series(series: list[dict], *, started_at_ms: int, effective_at_ms: 
                 relative_change_pct=delta / before["utilization_pct"] * 100 if before["utilization_pct"] else None,
                 reclaimed_capacity=reclaimed,
                 capacity_reduction_pct=reclaimed / before["mean_capacity"] * 100,
-                reclaimed_unit_hours=reclaimed * after["valid_hours"],
+                reclaimed_unit_hours=None if snapshot else reclaimed * after["valid_hours"],
             )
         results.append(result)
     return results

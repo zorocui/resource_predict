@@ -114,6 +114,8 @@ python app.py
 
 访问 `http://127.0.0.1:5000`
 
+资源详情包含“结论、指标、规格”三个标签；预测准确性在顶部独立页面查看。“校准与验证”及对应后处理已移除，更新内容见 [版本更新说明](docs/release-notes.md)。
+
 ### 2.5 K8S 数据接入
 
 ```bash
@@ -273,6 +275,8 @@ python -m pytest -q
 
 | 文档 | 内容 |
 | --- | --- |
+| [docs/release-notes.md](docs/release-notes.md) | 最新版本变更、升级注意事项与验证结果 |
+| [docs/scoring-formulas.md](docs/scoring-formulas.md) | 紧急度与置信度公式、变量取值、VM/K8S 差异及逐步算例 |
 | [docs/architecture.md](docs/architecture.md) | 目录结构、总体架构、管线流程、数据更新机制、核心模块说明 |
 | [docs/configuration.md](docs/configuration.md) | 部署配置文件详解、全局参数默认值、输出产物结构 |
 | [docs/api-reference.md](docs/api-reference.md) | API 端点详细参数、请求体格式、curl 使用示例 |

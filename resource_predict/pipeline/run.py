@@ -17,9 +17,6 @@ from resource_predict.pipeline.action_gate_state import (
 )
 from resource_predict.pipeline._types import WorkerContext
 from resource_predict.pipeline.constants import MANIFEST_FILENAME
-from resource_predict.pipeline.calibration import calibrate_forecasts, refresh_calibration_advice
-from resource_predict.pipeline.controlled_activation import apply_controlled_advice
-from resource_predict.pipeline.shadow import build_shadow_advice
 from resource_predict.pipeline.partial import load_existing_forecast_items, merge_partial_forecast_items
 from resource_predict.pipeline.plan import normalize_metric_filter, resolve_execution_plan
 from resource_predict.pipeline.parallel import execute_metric_jobs
@@ -320,16 +317,8 @@ def generate_forecasts(
 
     from resource_predict.services.accuracy_summary import write_accuracy_summary
     write_accuracy_summary(out_base, resources_items)
-    calibration_started = time.perf_counter()
-    calibrate_forecasts(out_base, resources_items, retention_days=settings.forecast.archive_retention_days)
-    calibration_seconds = time.perf_counter()-calibration_started
-    shadow_started = time.perf_counter()
-    build_shadow_advice(resources_items)
-    shadow_seconds = time.perf_counter()-shadow_started
     for item in resources_items:
         item.pop("_accuracy_holdout", None)
-    execution_stats["calibration_seconds"] = calibration_seconds
-    execution_stats["shadow_generation_seconds"] = shadow_seconds
     predicted_count = len(resources_items)
     predicted_resource_ids = {
         str(item.get("resource_id"))
@@ -366,16 +355,6 @@ def generate_forecasts(
         else:
             logger.warning("[progress] 未找到既有预测产物，本次仅输出已重算资源")
 
-    refresh_calibration_advice(resources_items)
-    for item in resources_items:
-        comparison = item.get("shadow_comparison")
-        if (isinstance(comparison, dict) and comparison.get("status") == "paired"
-                and comparison.get("source_spec") != item.get("spec", {})):
-            item["shadow_comparison"] = {**comparison, "status": "unavailable", "reason": "current_spec_changed"}
-    apply_controlled_advice(resources_items, fresh_ids=predicted_resource_ids,
-                            report_path=out_base / "forecast_realized_report.json",
-                            archive_metadata={"status": "removed"}, feedback_metadata={"status": "removed"})
-    refresh_calibration_advice(resources_items)
     action_gate_state = apply_action_gate_confirmations(
         resources_items,
         eligible_resource_ids=predicted_resource_ids,

@@ -2,7 +2,7 @@
 
 本文档详细说明系统所有 API 端点及完整使用方法。
 
-当前预测准确率页面使用 `GET /api/forecast-accuracy/summary` 读取轻量JSON。返回实际选用模型的独立历史测试准确率（±5个百分点达标点/有效点）、资源数、样本数、测试区间和各scope更新时间。无有效样本为null，读取损坏文件为503。旧逐点只读接口不再用于默认页面，逐点留档与SQLite导入已删除。
+当前预测准确率页面使用 `GET /api/forecast-accuracy/summary` 读取轻量JSON。返回实际选用模型的独立历史测试准确率（绝对误差不超过 `max(5个百分点, 实际值绝对值×5%)` 的达标点/有效点）、资源数、样本数、测试区间和各scope更新时间。汇总产物版本为2；版本1的旧口径结果不计入，待重新预测的scope列在 `needs_regeneration`。无有效样本为null，读取损坏文件为503。旧逐点只读接口不再用于默认页面，逐点留档与SQLite导入已删除。
 
 ## 页面路由
 
@@ -19,14 +19,13 @@
 | GET | `/api/resources` | 资源列表（支持分页、筛选、搜索） |
 | GET | `/api/resources/<id>` | 资源元数据详情；可选返回 charts |
 | GET | `/api/resources/<id>/charts` | 按指标、容器和时间范围加载目标资源图表 |
-| GET | `/api/resources/<id>/feedback` | 当前资源的启用评审、规则、报告更新时间与受控配置状态；只读，不触发评分 |
 | GET | `/api/resources/details?ids=a,b` | 批量详情（最多 100 个） |
 | GET | `/api/resources/advice-summary` | 建议统计（action/confidence 计数） |
 | GET | `/api/resources/<id>/scaling-history` | 资源调配历史 |
 
 ### 列表参数
 
-调配成效使用独立只读接口：`GET /api/scaling-effects`（列表及汇总）、`GET /api/scaling-effects/<task_id>`（单事件）、`GET /api/scaling-effects/export.csv`（筛选范围完整CSV）、`GET /api/scaling-effects/<task_id>/evidence.json`（原始证据包及SHA256）。列表/CSV支持 `resource_type`、`action=scale_in|scale_out|mixed|unknown`、`status`、`q`（资源或任务ID子串）、`from_ms`（调配开始时间含边界）、`to_ms`（不含边界）；列表另支持 `page`、`page_size=1..200`。详情返回 `{schema_version,event,sha256}`；列表返回 `{version,policy,summary,items,total,page,page_size,generated_at_ms}`。未知任务404，非法参数400，账本读取失败503。没有账本时返回真实空列表，不创建示例数据。完整字段、算法和证据契约见 [scaling-effects.md](scaling-effects.md)。
+调配成效使用独立只读接口：`GET /api/scaling-effects`（列表及汇总）、`GET /api/scaling-effects/<task_id>`（单事件）、`GET /api/scaling-effects/export.csv`（筛选范围完整CSV）、`GET /api/scaling-effects/<task_id>/evidence.json`（原始证据包及SHA256）。列表/CSV支持 `resource_type`、`action=scale_in|scale_out|mixed|unknown`、`status`、`q`（资源或任务ID子串）、`from_ms`（调配开始时间含边界）、`to_ms`（不含边界）；列表另支持 `page`、`page_size=1..200`。详情返回 `{schema_version,event,sha256}`；列表返回 `{version,policy,summary,items,total,page,page_size,generated_at_ms}`。未知任务404，非法参数400，账本读取失败503。没有账本时返回真实空列表，不创建示例数据。默认政策版本2（`evaluation_mode=next_collection`）在调配后的下一次有效采集确认生效后，即以调配前最近采样和本轮调配后采样形成 `evaluated` 结果并进入汇总；不等待稳定期或24小时窗口。单点前后指标的 `observation_kind=snapshot`、`start_ms=end_ms` 为采样时间；`coverage`、`valid_hours`、P95、超限时长及 `reclaimed_unit_hours` 为null。CSV另包含 `evaluation_mode`、`before_observation_kind`、`after_observation_kind`。`provisional` 保留用于历史窗口事件，旧默认窗口未完成事件在下次有效采集升级，已评估历史结果不改写。完整字段、算法和证据契约见 [scaling-effects.md](scaling-effects.md)。
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
@@ -150,7 +149,7 @@ K8S 多集群拉取中，只要至少一个集群成功且后续 upsert/预测�
 - K8S Workload 可额外携带 `container_metrics.<container>.<metric>`；系统会继续保留 Workload 级 `metrics` 作为汇总视图，并对 container 级序列分别预测。资源详情会返回 `container_charts.<container>.<metric>`，前端在同一 ECharts 图中展示多个 container 的实际/预测曲线。
 - 多 container Workload 的 request/limit 建议写入 `scaling_advice.target_spec.containers.<container>`；副本数建议仍写入 Workload 级 `scaling_advice.target_spec.replicas`。
 - `/api/update-data` 和 `/api/upsert-data` 均为异步接口（HTTP 202），合并与预测在后台线程执行
-- `/api/upsert-data` 新增资源时，该资源必须提供所有指标的完整非空序列
+- `/api/upsert-data` 新增资源时，该资源必须提供所有指标的完整非空序列。单个新增资源校验失败（如指标缺失、序列为空或时间和值数量不一致）时跳过该资源，其余资源继续合并和预测；可在 `/api/update-status` 的 `last_result.warnings` 中查看资源 ID 和跳过原因。若整批没有任何资源被更新或新增，任务仍返回失败。
 - 并发冲突时返回 HTTP 409，查询 `/api/update-status` 确认当前状态
 
 ## 调配
@@ -453,19 +452,3 @@ curl -X POST http://127.0.0.1:5000/api/scaling-tasks/<task_id>/confirm \
   -H 'Content-Type: application/json' \
   -d '{"confirm":true,"operator":"ops"}'
 ```
-
-## 预测上界附加字段
-
-页面资源详情新增“校准与验证”，显示正式采用/观察/待重新核验状态、上界完整性、影子分配量、评审有效期及未通过项。图例“校准上界”可开关预测上界曲线；null 时段保留断开。旧预测或缺少真实报告时展示等待状态，不生成演示评分。
-
-`GET /api/resources/<id>/feedback` 返回 resource_id、server_time_ms、report_status（available/missing/stale/error）、report_generated_at_ms、assessment（仅当前资源，可能为 null）、rules、policy_enabled、resource_allowlisted。24 小时以上或时间异常的报告标记 stale，资源不存在返回 404。页面展示的是最近发布报告，不代替执行前的实时核验。
-
-受控启用能力默认关闭。配置开关及显式资源列表开启后，满足当前批次判定的正式建议可带 `scaling_advice.calibration_activation.status=active`；其 baseline_advice 为回退快照，valid_until_epoch_ms 为授权证据期限。`prediction_upper_bound.mode=active` 且 applied_to_targets=true 表示正式采用，其余仍为观察。此能力没有新增启用 API，具体配置和失败回退规则见 configuration.md。
-
-启用评审判定位于各 scope 的 `forecast_realized_report.json.activation_assessment`，本轮未新增自动启用 API。`resources[].status=eligible_for_review` 只表示满足报告中的经验评审条件；消费者必须校验 valid_until_epoch_ms、当前规格/配置及最新数据，不能将它作为 execute 授权。
-
-资源摘要与详情还可返回 `shadow_comparison`：version、mode=shadow、executable=false、status、reason、baseline、candidate、source_spec、forecast_windows、budgets。只有完整新预测才生成 paired；部分校准或局部重算返回 unavailable。baseline/candidate 是确认前的 action/target_spec/policy_tier 快照，既有 scaling_advice 仍是正式建议。实际配对评分在各 scope 的 `forecast_realized_report.json.shadow_comparison`，本轮未增加执行或报表 API。
-
-资源详情图表及容器详情图表增加可选 `calibration`：`status`、`mode=observe`、`target_coverage=0.95`、与 `x_pred_ms` 对齐的 `upper`、`buckets` 样本统计及口径。`upper=null` 表示该时段样本不足；partial 不代表全窗口有效。
-
-建议对象增加 `prediction_upper_bound`：默认 `applied_to_targets=false`、`metrics[]`（container、metric、status、upper_peak、complete、unit）。默认观察模式不修改既有 action、confidence、规格目标或扩缩容授权；显式受控采用时按上文标记 active。旧产物可以没有该字段。完整算法及覆盖率报告见 [configuration.md](configuration.md)。

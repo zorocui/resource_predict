@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path, PurePosixPath
@@ -22,6 +23,8 @@ RAW_INDEX_SCHEMA_VERSION = 2
 RAW_INDEX_FILENAME = "raw_index.json"
 RAW_RESOURCES_DIRNAME = "raw"
 RAW_STALE_FILE_GRACE_SECONDS = 300
+_WRITE_LOCK = threading.RLock()
+_CLEANUP_TIMERS: Dict[Path, threading.Timer] = {}
 
 
 class RawResourceStore:
@@ -130,6 +133,7 @@ def write_raw_resource_dataset(
     *,
     freq: str,
     changed_resource_ids: Optional[Iterable[str]] = None,
+    defer_cleanup: bool = False,
 ) -> Dict[str, int]:
     """原子提交一份 raw 资源索引；指定 changed IDs 时复用其他资源引用。"""
     base = Path(out_base)
@@ -141,86 +145,84 @@ def write_raw_resource_dataset(
     if not prepared_by_id:
         raise ValueError("不能写入空 raw 资源数据集")
 
-    old_index = _read_existing_index(base)
-    old_resources = old_index.get("resources", {}) if isinstance(old_index, dict) else {}
-    if not isinstance(old_resources, dict):
-        old_resources = {}
-    changed = None if changed_resource_ids is None else {str(x) for x in changed_resource_ids}
-    if changed is not None:
-        missing_changed = changed - set(prepared_by_id)
-        if missing_changed:
-            raise ValueError(
-                "changed_resource_ids 缺少对应资源数据: "
-                + ", ".join(sorted(missing_changed))
-            )
-    now_ms = int(time.time() * 1000)
-    new_resources: Dict[str, Dict[str, Any]] = (
-        {
-            str(rid): dict(ref)
-            for rid, ref in old_resources.items()
-            if isinstance(ref, dict) and (changed is None or str(rid) not in changed)
+    with _WRITE_LOCK:
+        old_index = _read_existing_index(base)
+        old_resources = old_index.get("resources", {}) if isinstance(old_index, dict) else {}
+        if not isinstance(old_resources, dict):
+            old_resources = {}
+        changed = None if changed_resource_ids is None else {str(x) for x in changed_resource_ids}
+        if changed is not None:
+            missing_changed = changed - set(prepared_by_id)
+            if missing_changed:
+                raise ValueError(
+                    "changed_resource_ids 缺少对应资源数据: "
+                    + ", ".join(sorted(missing_changed))
+                )
+        now_ms = int(time.time() * 1000)
+        new_resources: Dict[str, Dict[str, Any]] = (
+            {
+                str(rid): dict(ref)
+                for rid, ref in old_resources.items()
+                if isinstance(ref, dict) and (changed is None or str(rid) not in changed)
+            }
+            if changed is not None
+            else {}
+        )
+        written = 0
+        reused = 0
+
+        for rid, item in prepared_by_id.items():
+            old_ref = old_resources.get(rid)
+            if changed is not None and rid not in changed and isinstance(old_ref, dict):
+                old_path = _resolve_raw_path(base, str(old_ref.get("file") or ""))
+                if not old_path.exists():
+                    raise FileNotFoundError(f"未变化资源的 raw 文件不存在: {old_path}")
+                new_resources[rid] = dict(old_ref)
+                reused += 1
+                continue
+            record = prepared_dict_to_raw_record(item)
+            text = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            resource_hash = hashlib.sha256(rid.encode("utf-8")).hexdigest()
+            content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            relative = PurePosixPath(
+                RAW_RESOURCES_DIRNAME,
+                resource_hash[:2],
+                f"{resource_hash}-{content_hash}.json",
+            ).as_posix()
+            path = _resolve_raw_path(base, relative)
+            if not path.exists():
+                atomic_write_text(path, text, encoding="utf-8")
+                written += 1
+            else:
+                reused += 1
+            lengths = [
+                len(item[metric])
+                for metric in metric_names_for_resource(item)
+                if hasattr(item.get(metric), "__len__")
+            ]
+            new_resources[rid] = {
+                "file": relative,
+                "resource_type": resource_type_of(item),
+                "points": min(lengths) if lengths else 0,
+                "updated_at_epoch_ms": now_ms,
+            }
+
+        payload = {
+            "schema_version": RAW_INDEX_SCHEMA_VERSION,
+            "generated_at_epoch_ms": now_ms,
+            "freq": str(freq),
+            "resources": new_resources,
         }
-        if changed is not None
-        else {}
-    )
-    written = 0
-    reused = 0
+        atomic_write_json(base / RAW_INDEX_FILENAME, payload, ensure_ascii=False, separators=(",", ":"))
+        index_bytes = int((base / RAW_INDEX_FILENAME).stat().st_size)
 
-    for rid, item in prepared_by_id.items():
-        old_ref = old_resources.get(rid)
-        if changed is not None and rid not in changed and isinstance(old_ref, dict):
-            old_path = _resolve_raw_path(base, str(old_ref.get("file") or ""))
-            if not old_path.exists():
-                raise FileNotFoundError(f"未变化资源的 raw 文件不存在: {old_path}")
-            new_resources[rid] = dict(old_ref)
-            reused += 1
-            continue
-        record = prepared_dict_to_raw_record(item)
-        text = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        resource_hash = hashlib.sha256(rid.encode("utf-8")).hexdigest()
-        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-        relative = PurePosixPath(
-            RAW_RESOURCES_DIRNAME,
-            resource_hash[:2],
-            f"{resource_hash}-{content_hash}.json",
-        ).as_posix()
-        path = _resolve_raw_path(base, relative)
-        if not path.exists():
-            atomic_write_text(path, text, encoding="utf-8")
-            written += 1
-        else:
-            reused += 1
-        lengths = [
-            len(item[metric])
-            for metric in metric_names_for_resource(item)
-            if hasattr(item.get(metric), "__len__")
-        ]
-        new_resources[rid] = {
-            "file": relative,
-            "resource_type": resource_type_of(item),
-            "points": min(lengths) if lengths else 0,
-            "updated_at_epoch_ms": now_ms,
-        }
-
-    payload = {
-        "schema_version": RAW_INDEX_SCHEMA_VERSION,
-        "generated_at_epoch_ms": now_ms,
-        "freq": str(freq),
-        "resources": new_resources,
-    }
-    atomic_write_json(base / RAW_INDEX_FILENAME, payload, ensure_ascii=False, separators=(",", ":"))
-    index_bytes = int((base / RAW_INDEX_FILENAME).stat().st_size)
-
-    old_files = {
-        str(ref.get("file"))
-        for ref in old_resources.values()
-        if isinstance(ref, dict) and ref.get("file")
-    }
-    new_files = {str(ref["file"]) for ref in new_resources.values()}
-    removed = _remove_unreferenced_files(base, old_files - new_files)
-    # 上一次提交中处于安全宽限期的旧分片，不再出现在当前 old_files 中；
-    # 每轮提交都扫描一次孤立分片，保证纯增量运行也能最终回收它们。
-    removed += _remove_orphan_raw_files(base, new_files)
+        new_files = {str(ref["file"]) for ref in new_resources.values()}
+    removed = 0
+    if defer_cleanup:
+        _schedule_raw_cleanup(base)
+    else:
+        # 常规数据提交继续回收已经超过安全宽限期的孤立分片。
+        removed = _remove_orphan_raw_files(base)
     from resource_predict.services.scaling.effects import try_ingest_evidence
 
     try_ingest_evidence(base, (
@@ -234,6 +236,32 @@ def write_raw_resource_dataset(
         "files_removed": removed,
         "index_bytes": index_bytes,
     }
+
+
+def _schedule_raw_cleanup(out_base: Path) -> None:
+    """合并同目录请求，距最后一次调配提交一个安全宽限期后清理。"""
+    base = out_base.resolve()
+    with _WRITE_LOCK:
+        previous = _CLEANUP_TIMERS.get(base)
+        if previous is not None:
+            previous.cancel()
+        timer = threading.Timer(RAW_STALE_FILE_GRACE_SECONDS, _run_deferred_cleanup, args=(base,))
+        timer.daemon = True
+        _CLEANUP_TIMERS[base] = timer
+        timer.start()
+
+
+def _run_deferred_cleanup(base: Path) -> None:
+    """扫描不持有写锁；每次删除前核对最新索引，并与数据提交互斥。"""
+    try:
+        removed = _remove_orphan_raw_files(base)
+        logger.info("[raw_cleanup] 后台清理完成: directory=%s removed=%d", base, removed)
+    except Exception:
+        logger.exception("[raw_cleanup] 后台清理失败，下次数据提交时重试: %s", base)
+    finally:
+        with _WRITE_LOCK:
+            if _CLEANUP_TIMERS.get(base) is threading.current_thread():
+                _CLEANUP_TIMERS.pop(base, None)
 
 
 def _read_existing_index(out_base: Path) -> Dict[str, Any]:
@@ -259,40 +287,32 @@ def _resolve_raw_path(out_base: Path, relative_file: str) -> Path:
     return path
 
 
-def _remove_unreferenced_files(out_base: Path, relative_files: Iterable[str]) -> int:
+def _remove_orphan_raw_files(out_base: Path) -> int:
+    base = out_base.resolve()
+    index_version = None
+    referenced: set[str] = set()
     removed = 0
-    for relative_file in relative_files:
-        try:
-            path = _resolve_raw_path(out_base, relative_file)
-            if path.exists() and _old_enough_to_remove(path):
-                path.unlink()
-                removed += 1
-        except OSError as exc:
-            logger.warning("无法清理旧 raw 资源文件 %s: %s", relative_file, exc)
-    return removed
-
-
-def _remove_orphan_raw_files(out_base: Path, referenced: set[str]) -> int:
-    raw_dir = out_base / RAW_RESOURCES_DIRNAME
-    if not raw_dir.exists():
-        return 0
-    removed = 0
-    for path in raw_dir.rglob("*.json"):
-        relative = path.relative_to(out_base).as_posix()
-        if relative in referenced:
+    # 遍历不持写锁；仅索引核验与单个文件删除占用锁。
+    for candidate in (base / RAW_RESOURCES_DIRNAME).rglob("*.json"):
+        if not _old_enough_to_remove(candidate):
             continue
-        if not _old_enough_to_remove(path):
-            continue
-        try:
-            path.unlink()
-            removed += 1
-        except OSError as exc:
-            logger.warning("无法清理孤立 raw 资源文件 %s: %s", path, exc)
-    for directory in sorted((p for p in raw_dir.rglob("*") if p.is_dir()), reverse=True):
-        try:
-            directory.rmdir()
-        except OSError:
-            pass
+        with _WRITE_LOCK:
+            stat = (base / RAW_INDEX_FILENAME).stat()
+            version = (stat.st_mtime_ns, stat.st_size)
+            if version != index_version:
+                index = _read_existing_index(base)
+                referenced = {str(ref["file"]) for ref in index["resources"].values()}
+                index_version = version
+            relative = candidate.relative_to(base).as_posix()
+            if relative in referenced:
+                continue
+            path = _resolve_raw_path(base, relative)
+            try:
+                if _old_enough_to_remove(path):
+                    path.unlink()
+                    removed += 1
+            except OSError as exc:
+                logger.warning("无法清理孤立 raw 资源文件 %s: %s", path, exc)
     return removed
 
 

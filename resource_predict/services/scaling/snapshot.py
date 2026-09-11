@@ -283,6 +283,7 @@ def _update_raw(
         [item],
         freq=freq,
         changed_resource_ids={resource_id},
+        defer_cleanup=True,
     )
     updated["raw_updated"] = True
 

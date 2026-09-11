@@ -11,7 +11,7 @@ from flask import Flask
 
 from resource_predict.api.forecast_accuracy import register_forecast_accuracy_routes
 from resource_predict.services import accuracy_exports
-from resource_predict.pipeline.realized_error import _SCHEMA
+from tests.accuracy_schema import _SCHEMA
 from resource_predict.services.forecast_accuracy import DB_NAME
 from test_forecast_accuracy import add
 

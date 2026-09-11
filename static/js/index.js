@@ -504,6 +504,7 @@
           <strong>${list.escapeHtml(cfg.cluster || "未命名接入")}</strong>
           <button class="link-btn" type="button" data-config-remove>删除</button>
           <button class="link-btn" type="button" data-k8s-fetch-single>拉取</button>
+          <button class="link-btn" type="button" data-k8s-fetch-full title="仅重新拉取本集群配置的完整历史窗口">全量拉取</button>
         </div>
         <div class="config-grid">
           ${configInput("集群名", "cluster", cfg.cluster || "")}
@@ -734,15 +735,16 @@
     }
   }
 
-  async function fetchK8sPrometheusData(clusterNames) {
+  async function fetchK8sPrometheusData(clusterNames, fullRefresh = false) {
     const names = Array.isArray(clusterNames)
       ? clusterNames
       : collectClusterConfigs().k8s_prometheus_clusters.map((item) => item.cluster).filter(Boolean);
     const label = names.length === 1 ? names[0] : `${names.length} 个集群`;
-    setClusterConfigMessage(`正在提交 ${label} 的 K8S 数据拉取任务...`);
+    const action = fullRefresh ? "全量拉取" : "拉取";
+    setClusterConfigMessage(`正在提交 ${label} 的 K8S 数据${action}任务...`);
     try {
-      const payload = await api.postJson("/api/cluster-configs/k8s-fetch", { clusters: names });
-      setClusterConfigMessage(payload.message || `${label} K8S 数据拉取任务已提交。`);
+      const payload = await api.postJson("/api/cluster-configs/k8s-fetch", { clusters: names, full_refresh: fullRefresh });
+      setClusterConfigMessage(payload.message || `${label} K8S 数据${action}任务已提交。`);
       setView("updates");
       startUpdatePolling();
     } catch (e) {
@@ -798,7 +800,7 @@
           setClusterConfigMessage("配置已在页面移除，保存后生效。");
           return;
         }
-        const fetchSingle = event.target.closest("[data-k8s-fetch-single]");
+        const fetchSingle = event.target.closest("[data-k8s-fetch-single], [data-k8s-fetch-full]");
         if (fetchSingle) {
           const row = fetchSingle.closest("[data-config-kind='k8s']");
           const cluster = rowValue(row, "cluster");
@@ -806,7 +808,7 @@
             setClusterConfigMessage("请先填写集群名并保存配置。", true);
             return;
           }
-          fetchK8sPrometheusData([cluster]);
+          fetchK8sPrometheusData([cluster], fetchSingle.hasAttribute("data-k8s-fetch-full"));
         }
       });
     });

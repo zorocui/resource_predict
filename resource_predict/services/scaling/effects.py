@@ -19,7 +19,8 @@ __all__ = ["start_event", "complete_event", "capture_failure", "ingest_evidence"
 
 logger = logging.getLogger(__name__)
 DB_NAME = "scaling_effects.sqlite3"
-POLICY = {"version": 1, "before_hours": 24, "after_hours": 24, "stabilization_minutes": 60,
+POLICY = {"version": 2, "evaluation_mode": "next_collection",
+          "before_hours": 0, "after_hours": 0, "stabilization_minutes": 0,
           "min_coverage": 0.8, "max_gap_ms": 900000}
 _TERMINAL = {"evaluated", "failed", "interrupted", "basis_changed", "evidence_conflict", "expired"}
 _SCHEMA = """
@@ -200,7 +201,9 @@ def start_event(out_base: Path, task: dict, before_spec: dict, target_spec: dict
             previous_rules = previous["policy"]
             previous_end = (previous_effective + int((previous_rules["after_hours"] + previous_rules["stabilization_minutes"] / 60) * 3600000)
                             if previous_effective is not None else None)
-            if previous["status"] not in _TERMINAL and (previous_end is None or now < previous_end):
+            if previous["status"] not in _TERMINAL and (
+                previous_rules.get("evaluation_mode") == "next_collection" or previous_end is None or now < previous_end
+            ):
                 previous.update(status="interrupted", interrupted_at_ms=now, reason="观察窗口内再次调配")
                 _save(db, previous)
         db.execute("INSERT INTO events(task_id,resource_id,resource_type,action,status,started_ms,payload,deadline_ms) VALUES (?,?,?,?,?,?,?,?)", (
@@ -289,22 +292,40 @@ def _ingest(db: sqlite3.Connection, event: dict, evidence: dict, now: int) -> No
         _save(db, event)
         return
     start, rules = event["started_at_ms"], event["policy"]
+    # 未完成的旧默认窗口随下一次有效采集升级；已评估账本保持冻结。
+    if (rules.get("version", 1) == 1 and not rules.get("evaluation_mode") and rules.get("before_hours") == 24
+            and rules.get("after_hours") == 24 and rules.get("stabilization_minutes") == 60):
+        event["previous_policy"] = dict(rules)
+        rules = event["policy"] = {**rules, **POLICY}
+    snapshot = rules.get("evaluation_mode") == "next_collection"
     low = start - int(rules["before_hours"] * 3600000) - int(rules["max_gap_ms"])
     effective = event.get("effective_at_ms")
     high = (effective or now) + int((rules["after_hours"] + rules["stabilization_minutes"] / 60) * 3600000) + int(rules["max_gap_ms"])
+    if snapshot:
+        low = 0
+        high = now
     points = [p for p in points if low <= p[4] <= high]
+    if snapshot:
+        # 前后各保留最近采样，适配不同拉取间隔，不复制整个监控历史。
+        latest = {}
+        for point in points:
+            key = (*point[:3], point[4] <= start)
+            if key not in latest or point[4] > latest[key][4]:
+                latest[key] = point
+        points = list(latest.values())
     old = _capacities(event["before_spec"], event["resource_type"])
     target = _capacities(event["target_spec"], event["resource_type"])
     spec_matches = bool(target) and _spec_matches(evidence.get("spec", {}), event["target_spec"], event["resource_type"])
     completed = event.get("completed_at_ms")
-    if completed is not None and event["status"] != "failed" and effective is None and spec_matches:
+    confirmed = []
+    if completed is not None and event["status"] != "failed" and spec_matches:
         matches: dict[int, set] = {}
         for container, metric, basis, _unit, ts, usage, capacity in points:
             key = (container, metric, basis)
-            if ts >= completed and usage is not None and key in target and math.isclose(capacity, target[key], rel_tol=1e-6):
+            if ts >= completed and ts > start and usage is not None and key in target and math.isclose(capacity, target[key], rel_tol=1e-6):
                 matches.setdefault(ts, set()).add(key)
         confirmed = [ts for ts, keys in matches.items() if keys >= target.keys()]
-        if confirmed:
+        if confirmed and effective is None:
             effective = min(confirmed)
             event.update(effective_at_ms=effective, after_spec=evidence["spec"], status="observing",
                          reason="已由同期真实用量与容量确认生效，收集观察窗口")
@@ -315,6 +336,8 @@ def _ingest(db: sqlite3.Connection, event: dict, evidence: dict, now: int) -> No
             }
     post_start = effective + int(rules["stabilization_minutes"] * 60000) if effective is not None else None
     post_end = post_start + int(rules["after_hours"] * 3600000) if post_start is not None else None
+    if snapshot and effective is not None:
+        post_start, post_end = effective, now + 1
     existing = {(r[0], r[1], r[2], r[3]): (r[4], r[5]) for r in db.execute(
         "SELECT container,metric,basis,ts,usage,capacity FROM samples WHERE task_id=?", (event["task_id"],))}
     kept = []
@@ -341,7 +364,8 @@ def _ingest(db: sqlite3.Connection, event: dict, evidence: dict, now: int) -> No
             if ts <= start and evidence["collected_at_ms"] > start:
                 # Incomplete later reconstruction is missing evidence, not proof of an earlier capacity change.
                 continue
-            if (start - rules["before_hours"] * 3600000 <= ts < start) or (post_start is not None and post_start <= ts < post_end):
+            baseline_start = start - (rules["max_gap_ms"] if snapshot else rules["before_hours"] * 3600000)
+            if (baseline_start <= ts < start) or (post_start is not None and post_start <= ts < post_end):
                 event.update(status="basis_changed", reason="评估窗口内真实容量发生额外变化，无法归因于本次调配")
             continue
         kept.append(point)
@@ -374,8 +398,20 @@ def _ingest(db: sqlite3.Connection, event: dict, evidence: dict, now: int) -> No
         event["metrics"] = evaluate_series(_series(db, event["task_id"]), started_at_ms=start,
                                            effective_at_ms=effective, policy=rules, now_ms=now)
         if event["status"] not in _TERMINAL:
-            if now < post_end:
-                event.update(status="observing", reason="调配后观察窗口尚未结束")
+            if snapshot:
+                ready = bool(confirmed) and {(m["metric"], m["basis"]) for m in event["metrics"]
+                         if m["status"] == "evaluated" and not m["container"]} >= {
+                    (metric, basis) for _, metric, basis in target}
+                event.update(status="evaluated" if ready else "insufficient_data",
+                             reason="首次采集已完成调配前后对比；单次观测不代表长期收益" if ready
+                             else "缺少调配前最近采样或调配后完整采样，等待真实数据补齐")
+            elif now < post_end:
+                ready = {(m["metric"], m["basis"]) for m in event["metrics"]
+                         if m["status"] == "provisional" and not m["container"]} >= {
+                    (metric, basis) for _, metric, basis in target}
+                event.update(status="provisional" if ready else "observing",
+                             reason="阶段性成效已更新，完整观察窗口结束后形成正式评估" if ready
+                             else "稳定期或有效观测不足，等待后续采集")
             elif {(m["metric"], m["basis"]) for m in event["metrics"] if m["status"] == "evaluated" and not m["container"]} >= {
                 (metric, basis) for _, metric, basis in target
             }:
@@ -404,6 +440,8 @@ def ingest_evidence(out_base: Path, items: Iterable[dict], *, now_ms: int | None
             if not isinstance(evidence, dict):
                 continue
             for event in pending.get(str(item.get("resource_id")), []):
+                if event["status"] in _TERMINAL:
+                    continue
                 db.execute("SAVEPOINT effect_evidence")
                 try:
                     _ingest(db, event, evidence, now)

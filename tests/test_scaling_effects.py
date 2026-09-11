@@ -16,7 +16,8 @@ from resource_predict.services.scaling import effects, tasks
 
 HOUR = 3600000
 START = int(time.time() * 1000) - 2 * HOUR
-POLICY = {"before_hours": 1, "after_hours": 1, "stabilization_minutes": 0, "max_gap_ms": HOUR // 4}
+POLICY = {"version": 1, "evaluation_mode": "window", "before_hours": 1, "after_hours": 1,
+          "stabilization_minutes": 0, "max_gap_ms": HOUR // 4}
 
 
 def evidence(start, end, capacity, *, usage=1, collected=None):
@@ -40,6 +41,113 @@ def finish(path, task_id="task-1", resource_id="vm-1", *, usage=1):
     return effects.event_evidence([path], task_id)["event"]
 
 
+def test_next_collection_single_sample_is_evaluated_and_exported(tmp_path):
+    task = {"task_id": "instant", "resource_id": "vm", "resource_type": "openstack_vm", "mode": "execute"}
+    effects.start_event(tmp_path, task, {"cpu_cores": 4}, {"cpu_cores": 2}, now_ms=START,
+                        evidence=evidence(START, START, 4))
+    effects.complete_event(tmp_path, "instant", success=True, now_ms=START+1)
+    pulled = START + 600000
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm", "scaling_evidence": evidence(pulled, pulled, 2)}], now_ms=pulled)
+    event = effects.event_evidence([tmp_path], "instant")["event"]
+    assert event["status"] == "evaluated"
+    assert event["policy"]["version"] == 2
+    metric = event["metrics"][0]
+    assert metric["before"]["utilization_pct"] == 25
+    assert metric["after"]["utilization_pct"] == 50
+    assert metric["after"]["observation_kind"] == "snapshot"
+    assert metric["after"]["valid_hours"] is None
+    assert metric["reclaimed_unit_hours"] is None
+    report = effects.outcome_report([tmp_path])
+    assert report["summary"]["metrics"][0]["reclaimed_capacity"] == 2
+    app = Flask(__name__)
+    register_scaling_effect_routes(app, lambda: [tmp_path])
+    rows = list(csv.DictReader(io.StringIO(app.test_client().get(
+        "/api/scaling-effects/export.csv").data.decode("utf-8-sig"))))
+    assert rows[0]["after_utilization_pct"] == "50.0"
+    assert rows[0]["reclaimed_unit_hours"] == ""
+    assert rows[0]["evaluation_mode"] == "next_collection"
+    assert rows[0]["after_observation_kind"] == "snapshot"
+    # 结果冻结，不被重复或后续采集重写。
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm", "scaling_evidence": evidence(pulled, pulled, 2, usage=9)}], now_ms=pulled)
+    assert effects.event_evidence([tmp_path], "instant")["event"]["metrics"] == event["metrics"]
+
+
+@pytest.mark.parametrize("case", ["missing_baseline", "missing_usage", "old_timestamp", "wrong_spec", "mock"])
+def test_next_collection_requires_real_fresh_complete_evidence(tmp_path, case):
+    task = {"task_id": "instant", "resource_id": "vm", "resource_type": "openstack_vm", "mode": "execute"}
+    baseline_time = START
+    baseline = None if case == "missing_baseline" else evidence(baseline_time, baseline_time, 4)
+    effects.start_event(tmp_path, task, {"cpu_cores": 4}, {"cpu_cores": 2}, now_ms=START, evidence=baseline)
+    effects.complete_event(tmp_path, "instant", success=True, now_ms=START+1)
+    pulled = START+600000
+    post = evidence(pulled, pulled, 2)
+    if case == "missing_usage":
+        post["series"][0]["usage"] = [None]
+    elif case == "old_timestamp":
+        post["series"][0]["timestamps"] = [START]
+    elif case == "wrong_spec":
+        post["spec"]["cpu_cores"] = 4
+    elif case == "mock":
+        post["source"] = "mock"
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm", "scaling_evidence": post}], now_ms=pulled)
+    assert effects.outcome_report([tmp_path])["summary"]["metrics"] == []
+    assert effects.event_evidence([tmp_path], "instant")["event"]["status"] != "evaluated"
+
+
+def test_next_collection_uses_last_pull_baseline_without_a_fixed_interval(tmp_path):
+    task = {"task_id": "slow-pull", "resource_id": "vm", "resource_type": "openstack_vm", "mode": "execute"}
+    effects.start_event(tmp_path, task, {"cpu_cores": 4}, {"cpu_cores": 2}, now_ms=START,
+                        evidence=evidence(START-7*HOUR, START-6*HOUR, 4))
+    effects.complete_event(tmp_path, "slow-pull", success=True, now_ms=START+1)
+    pulled = START+6*HOUR
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm", "scaling_evidence": evidence(pulled, pulled, 2)}], now_ms=pulled)
+    event = effects.event_evidence([tmp_path], "slow-pull")["event"]
+    assert event["status"] == "evaluated"
+    assert event["metrics"][0]["before"]["end_ms"] == START-6*HOUR
+    assert len(event["series"][0]["timestamps"]) == 2
+
+
+def test_legacy_pending_default_window_upgrades_on_next_pull(tmp_path):
+    task = {"task_id": "legacy", "resource_id": "vm", "resource_type": "openstack_vm", "mode": "execute"}
+    effects.start_event(tmp_path, task, {"cpu_cores": 4}, {"cpu_cores": 2}, now_ms=START,
+                        evidence=evidence(START, START, 4))
+    effects.complete_event(tmp_path, "legacy", success=True, now_ms=START+1)
+    # 模拟升级前已经保存的旧政策，不通过新建任务路径。
+    with sqlite3.connect(tmp_path / effects.DB_NAME) as db:
+        event = json.loads(db.execute("SELECT payload FROM events").fetchone()[0])
+        event["policy"] = {"version": 1, "before_hours": 24, "after_hours": 24,
+                           "stabilization_minutes": 60, "min_coverage": .8, "max_gap_ms": 900000}
+        db.execute("UPDATE events SET payload=?", (json.dumps(event),))
+    pulled = START+600000
+    effects.ingest_evidence(tmp_path, [{"resource_id": "vm", "scaling_evidence": evidence(pulled, pulled, 2)}], now_ms=pulled)
+    event = effects.event_evidence([tmp_path], "legacy")["event"]
+    assert event["status"] == "evaluated"
+    assert event["previous_policy"]["after_hours"] == 24
+    assert event["policy"]["after_hours"] == 0
+
+
+def test_next_collection_k8s_requires_all_container_metrics(tmp_path):
+    before_spec = {"replicas": 2, "containers": {"app": {"cpu_request_cores": 1}, "sidecar": {"cpu_request_cores": .5}}}
+    target_spec = {"replicas": 1, "containers": before_spec["containers"]}
+    def observed(timestamp, spec, missing=False):
+        result = evidence(timestamp, timestamp, 2)
+        result["spec"] = spec
+        result["series"] = [{**result["series"][0], "container": name, "basis": "request",
+                              "capacity": [values["cpu_request_cores"]*spec["replicas"]]}
+                             for name, values in spec["containers"].items() if not (missing and name == "sidecar")]
+        return result
+    task = {"task_id": "workload", "resource_id": "workload", "resource_type": "k8s_workload", "mode": "execute"}
+    effects.start_event(tmp_path, task, before_spec, target_spec, now_ms=START, evidence=observed(START, before_spec))
+    effects.complete_event(tmp_path, "workload", success=True, now_ms=START+1)
+    for offset, missing in [(600000, True), (1800000, False)]:
+        pulled = START+offset
+        effects.ingest_evidence(tmp_path, [{"resource_id": "workload", "scaling_evidence": observed(pulled, target_spec, missing)}], now_ms=pulled)
+        event = effects.event_evidence([tmp_path], "workload")["event"]
+        assert (event["status"] == "evaluated") == (not missing)
+    aggregate = next(m for m in event["metrics"] if not m["container"])
+    assert aggregate["reclaimed_capacity"] == 1.5
+
+
 def test_end_to_end_real_window_and_reproducible_evidence(tmp_path):
     begin(tmp_path)
     event = finish(tmp_path)
@@ -55,6 +163,31 @@ def test_end_to_end_real_window_and_reproducible_evidence(tmp_path):
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     assert hashlib.sha256(canonical.encode()).hexdigest() == digest
     assert payload["event"]["series"][0]["usage"]
+
+
+def test_provisional_progress_export_and_final_transition(tmp_path):
+    begin(tmp_path)
+    effects.complete_event(tmp_path, "task-1", success=True, now_ms=START+1)
+    for duration, status in [(HOUR//2, "provisional"), (HOUR, "evaluated")]:
+        end = START + 1 + duration
+        effects.ingest_evidence(tmp_path, [{"resource_id": "vm-1", "scaling_evidence":
+            evidence(START+1, end, 2)}], now_ms=end)
+        report = effects.outcome_report([tmp_path])
+        event = report["items"][0]
+        assert event["status"] == status
+        assert event["metrics"][0]["delta_pp"] == 25
+        assert event["metrics"][0]["after"]["valid_hours"] == duration/HOUR
+        assert bool(report["summary"]["metrics"]) == (status == "evaluated")
+        app = Flask(__name__)
+        register_scaling_effect_routes(app, lambda: [tmp_path])
+        client = app.test_client()
+        response = client.get(f"/api/scaling-effects?status={status}")
+        assert response.status_code == 200
+        assert response.get_json()["total"] == 1
+        rows = list(csv.DictReader(io.StringIO(client.get(
+            f"/api/scaling-effects/export.csv?status={status}").data.decode("utf-8-sig"))))
+        assert rows[0]["metric_status"] == status
+        assert float(rows[0]["delta_pp"]) == 25
 
 
 def test_dry_run_not_recorded_and_success_not_effective(tmp_path):

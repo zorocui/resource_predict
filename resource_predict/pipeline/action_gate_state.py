@@ -78,11 +78,6 @@ def apply_action_gate_confirmations(
         previous = records.get(resource_id, {})
         previous_direction = str(previous.get("action_direction") or "")
         previous_rounds = _positive_int(previous.get("consistent_rounds"), default=0)
-        activation = advice.get("calibration_activation",{})
-        strategy = ("calibrated:"+str(activation.get("policy_signature",""))
-                    if activation.get("status")=="active" else "baseline")
-        if previous.get("strategy","baseline") != strategy:
-            previous_rounds = 0
         observed = previous_rounds + 1 if previous_direction == direction else 1
         required = max(1, _positive_int(gate.get("required_consistent_rounds"), default=1))
         observed = min(observed, required)
@@ -92,7 +87,6 @@ def apply_action_gate_confirmations(
             "action_direction": direction,
             "consistent_rounds": observed,
             "last_confirmed_at": timestamp,
-            "strategy": strategy,
         }
         gate["observed_consistent_rounds"] = observed
         gate["state"] = "ready" if ready else "observe"

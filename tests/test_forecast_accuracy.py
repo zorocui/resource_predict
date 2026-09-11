@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from resource_predict.pipeline.realized_error import _SCHEMA
+from tests.accuracy_schema import _SCHEMA
 from resource_predict.services.forecast_accuracy import DB_NAME, accuracy_session
 from resource_predict.services import forecast_accuracy
 

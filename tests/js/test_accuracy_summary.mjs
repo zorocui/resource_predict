@@ -16,4 +16,15 @@ test("CSV exports every row, safely, with the scoring rule", () => {
   const csv = window.ForecastAccuracy.csv({...data, rows});
   assert.equal(csv.split("'=formula").length-1, 101);
   assert.match(csv, /5个百分点/);
+  assert.match(csv, /实际值绝对值×5%/);
+});
+
+test("new rule and pending old summaries are clearly identified", () => {
+  const pending = { ...data, needs_regeneration: ["k8s"] };
+  const html = window.ForecastAccuracy.render(pending);
+  assert.match(html, /4000%/);
+  assert.match(html, /200 个百分点/);
+  assert.match(html, /重新预测/);
+  assert.match(html, /旧口径，未计入当前准确率/);
+  assert.match(window.ForecastAccuracy.csv(pending), /待重新预测范围（旧口径未计入）/);
 });

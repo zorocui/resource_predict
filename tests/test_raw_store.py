@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import time
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import pandas as pd
 
 from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.data import updater
+from resource_predict.data import raw_store
 from resource_predict.data.updater import run_update_with_data, run_upsert_with_data
 from resource_predict.pipeline.constants import RAW_INDEX_FILENAME
 from resource_predict.pipeline.partial import load_existing_forecast_items
@@ -461,6 +463,61 @@ class RawResourceStoreTest(unittest.TestCase):
 
             self.assertTrue(result["success"], result.get("error"))
             self.assertFalse(updater._update_exclusive.locked())
+
+
+def test_deferred_cleanup_preserves_current_and_grace_period_files(tmp_path):
+    with patch.object(raw_store, "_schedule_raw_cleanup"):
+        write_raw_resource_dataset(tmp_path, [_vm("vm-1")], freq="5min", defer_cleanup=True)
+        old = tmp_path / RawResourceStore(tmp_path).raw_ref("vm-1")["file"]
+        write_raw_resource_dataset(tmp_path, [_vm("vm-1", (.4, .5, .6))], freq="5min", defer_cleanup=True)
+        current = tmp_path / RawResourceStore(tmp_path).raw_ref("vm-1")["file"]
+        assert old.exists()
+        raw_store._run_deferred_cleanup(tmp_path)
+        assert old.exists()  # 尚在五分钟宽限期内。
+        expired = time.time() - 301
+        for path in (old, current):
+            os.utime(path, (expired, expired))
+        raw_store._run_deferred_cleanup(tmp_path)
+        assert not old.exists()
+        assert current.exists()
+        assert RawResourceStore(tmp_path).get("vm-1") is not None
+
+
+def test_cleanup_requests_are_coalesced_without_waiting(tmp_path):
+    with patch.dict(raw_store._CLEANUP_TIMERS, clear=True), patch.object(raw_store.threading, "Timer") as timer:
+        raw_store._schedule_raw_cleanup(tmp_path)
+        raw_store._schedule_raw_cleanup(tmp_path)
+        assert timer.call_count == 2
+        timer.return_value.cancel.assert_called_once()
+        assert timer.return_value.daemon is True
+        timer.return_value.join.assert_not_called()
+        timer.assert_called_with(300, raw_store._run_deferred_cleanup, args=(tmp_path.resolve(),))
+
+
+def test_background_scan_does_not_hold_up_resource_commit(tmp_path):
+    scanning, release = threading.Event(), threading.Event()
+    original = Path.rglob
+
+    def slow_scan(path, pattern):
+        scanning.set()
+        assert release.wait(5)
+        yield from original(path, pattern)
+
+    with patch.object(raw_store, "_schedule_raw_cleanup"):
+        write_raw_resource_dataset(tmp_path, [_vm("vm-1")], freq="5min", defer_cleanup=True)
+        with patch.object(Path, "rglob", slow_scan):
+            background = threading.Thread(target=raw_store._run_deferred_cleanup, args=(tmp_path,))
+            background.start()
+            try:
+                assert scanning.wait(2)
+                write_raw_resource_dataset(tmp_path, [_vm("vm-1", (.4, .5, .6))],
+                                           freq="5min", defer_cleanup=True)
+                assert background.is_alive()
+                assert RawResourceStore(tmp_path).get("vm-1")["cpu"].iloc[0] == .4
+            finally:
+                release.set()
+                background.join(5)
+            assert not background.is_alive()
 
 
 if __name__ == "__main__":

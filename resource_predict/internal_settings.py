@@ -103,8 +103,6 @@ class ForecastConfig:
     enable_ensemble: bool = False
     # 旧字段仅用于兼容配置读取；在线预测始终使用最新完整历史重新拟合。
     reuse_backtest_model_for_future: bool = False
-    # 仅用于读取旧校准证据时的有效期，不再生成或导入逐点留档。
-    archive_retention_days: int = 7
     # 是否仅在值得承担训练成本的序列上运行 Prophet。
     prophet_routing_enabled: bool = True
     # Prophet 路由模式；auto 在速度和质量之间自动取舍。
@@ -115,9 +113,6 @@ class ForecastConfig:
 
 @dataclass(frozen=True)
 class DecisionConfig:
-    # 校准建议受控启用：默认关闭，且必须显式列出资源 ID。
-    calibrated_advice_enabled: bool = False
-    calibrated_advice_resource_ids: Tuple[str, ...] = ()
     # VM 指标 P95 达到该使用率时，触发扩容判断。
     scale_out_threshold: float = 0.8
     # VM 指标平均值低于该使用率时，进入缩容候选判断。

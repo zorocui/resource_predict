@@ -88,8 +88,6 @@ def write_prediction_outputs(
         }
         if isinstance(item.get("data_quality"), dict):
             row["data_quality"] = item["data_quality"]
-        if isinstance(item.get("shadow_comparison"), dict):
-            row["shadow_comparison"] = item["shadow_comparison"]
         summary_resources.append(row)
 
     summary_resources.sort(

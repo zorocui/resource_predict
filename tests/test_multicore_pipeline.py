@@ -37,6 +37,13 @@ def test_single_workload_container_tasks_spawn_and_keep_artifacts(tmp_path, monk
     detail = json.loads((tmp_path / "details" / "part-00000.json").read_text(encoding="utf-8"))["resources"][0]
     assert set(detail["container_charts_forecast"]) == {"app", "sidecar"}
     assert "_accuracy_holdout" not in detail
+    assert "shadow_comparison" not in detail
+    assert "calibration_activation" not in detail["scaling_advice"]
+    assert "prediction_upper_bound" not in detail["scaling_advice"]
+    for chart in detail["charts_forecast"].values():
+        assert "calibration" not in chart
+    for charts in detail["container_charts_forecast"].values():
+        assert all("calibration" not in chart for chart in charts.values())
     summary = json.loads((tmp_path / "forecast_accuracy_summary.json").read_text(encoding="utf-8"))
     assert len(summary["rows"]) == 8
     assert not (tmp_path / "forecast_history").exists()

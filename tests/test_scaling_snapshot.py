@@ -94,8 +94,12 @@ def test_scaling_success_updates_sharded_raw_and_prediction_snapshots():
             generation=SimpleNamespace(raw_resource_cache_items=10, freq="h"),
         )
 
-        with patch.object(snapshot, "settings", fake_settings):
+        with patch.object(snapshot, "settings", fake_settings), \
+             patch("resource_predict.data.raw_store._schedule_raw_cleanup") as cleanup, \
+             patch("resource_predict.data.raw_store._remove_orphan_raw_files") as scan:
             result = snapshot.apply_scaling_success_snapshot(plan)
+            cleanup.assert_called_once_with(out_dir)
+            scan.assert_not_called()
 
         loaded_raw = RawResourceStore(out_dir).get("vm-1")
         loaded_summary = json.loads((out_dir / "summary_index.json").read_text(encoding="utf-8"))

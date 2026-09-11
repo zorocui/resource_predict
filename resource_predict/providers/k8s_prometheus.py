@@ -247,12 +247,14 @@ def fetch_k8s_workload_prometheus_result(
     freq: str,
     clusters: Optional[Iterable[str]] = None,
     history_hours: Optional[float] = None,
+    history_hours_by_cluster: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Fetch K8S Workloads and report the result of every target cluster.
 
     ``resources <= 0`` means unlimited, which is useful for production upsert.
     The ``n`` and ``freq`` arguments are accepted for compatibility with the
     generic data provider interface.
+    提供 history_hours_by_cluster 时，未包含的集群使用完整历史窗口。
     """
     cfg = settings.k8s_prometheus
     targets = _resolve_targets()
@@ -280,6 +282,8 @@ def fetch_k8s_workload_prometheus_result(
         started_at,
     )
     for target in targets:
+        target_history_hours = (history_hours_by_cluster.get(target.cluster)
+                                if history_hours_by_cluster is not None else history_hours)
         if bool(cfg.fail_fast) and any(item["status"] == "failed" for item in cluster_results):
             cluster_results.append(
                 _cluster_fetch_result(
@@ -302,10 +306,10 @@ def fetch_k8s_workload_prometheus_result(
                 target.cluster,
                 target.prometheus_url,
                 "unlimited" if remaining <= 0 else str(remaining),
-                history_hours if history_hours is not None else "default",
+                target_history_hours if target_history_hours is not None else "default",
                 target_started_at,
             )
-            items = _fetch_target_with_retry(target, remaining, history_hours=history_hours)
+            items = _fetch_target_with_retry(target, remaining, history_hours=target_history_hours)
             fetched_count = len(items)
             if not items:
                 # _fetch_target 已按断点抛出带根因的错误，这里只兜底意外情况。

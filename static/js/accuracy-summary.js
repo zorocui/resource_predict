@@ -7,14 +7,16 @@
   function render(data) {
     const times = data.rows.flatMap(row => [row.test_start_ms, row.test_end_ms]).filter(Number.isFinite);
     const range = times.reduce((v, t) => [Math.min(v[0], t), Math.max(v[1], t)], [Infinity, -Infinity]);
-    return `<h2>预测准确率</h2><p>历史留出测试 · 只评估实际选用的模型 · 误差不超过 ±5 个百分点即达标</p>
+    return `<h2>预测准确率</h2><p>历史留出测试 · 只评估实际选用的模型 · 允许误差取 5 个百分点与实际值绝对值的 5% 中较大者</p>
       <div class="accuracy-actions"><strong style="font-size:2.5rem">${rate(data.accuracy)}</strong><span>测试资源 ${number(data.resource_count)} 个</span><span>有效测试点 ${number(data.valid_points)} 个</span><span>达标点 ${number(data.hit_points)} 个</span></div>
       <p>计算方式：达标点 ÷ 有效测试点。K8S 优先采用容器测试，避免与 Workload 汇总重复统计。</p>
+      <p>例如实际使用率 4000%，允许相差 200 个百分点（预测 3800%～4200% 达标）；实际使用率 50%，允许相差 5 个百分点。平均绝对误差仍按百分点报告。</p>
+      ${(data.needs_regeneration || []).length ? `<p role="status">${escape(data.needs_regeneration.join("、"))} 的汇总仍为旧口径，未计入当前准确率；请重新预测以生成新口径结果。</p>` : ""}
       <p>测试时间：${date(range[0])} 至 ${date(range[1])}</p>
       <p>${data.runs.map(run => `${escape(run.scope)} 更新于 ${date(run.generated_at_ms)}`).join("；") || "尚未生成简化版评估。下一次预测完成后自动显示，无需手动评估。"}</p>
       <p>每类资源采用最近一次预测运行的测试汇总，增量预测仅代表本次重算范围。这是经过预处理的历史数据测试，不代表未来预测已兑现。</p>
       ${data.invalid_points ? `<p>无效或非独立测试点：${number(data.invalid_points)}，未计入准确率。</p>` : ""}
-      ${data.absolute_unit_points ? `<p>另有 ${number(data.absolute_unit_points)} 个核数、GiB 或其他非百分比点，仅报告误差，不计入 ±5 个百分点准确率。</p>` : ""}
+      ${data.absolute_unit_points ? `<p>另有 ${number(data.absolute_unit_points)} 个核数、GiB 或其他非百分比点，仅报告误差，不计入准确率。</p>` : ""}
       ${data.valid_points === 0 && data.runs.length ? "<p>本次没有可计算百分比准确率的有效测试点，准确率显示 —，不是 0%。</p>" : ""}
       <div class="accuracy-actions"><button id="accuracy-summary-refresh" class="secondary-btn">刷新</button><button id="accuracy-summary-export" class="primary-btn" ${data.runs.length ? "" : "disabled"}>导出汇总 CSV</button><button id="accuracy-summary-print" class="secondary-btn">打印 / 保存 PDF</button></div>
       <p>下表显示前 100 条测试汇总；导出包含全部记录。</p>
@@ -23,7 +25,7 @@
   function csv(data) {
     const fields = ["resource_id", "resource_type", "container", "metric", "model", "accuracy", "valid_points", "hit_points", "invalid_points", "mae", "unit", "test_start_ms", "test_end_ms"];
     const cell = v => `"${String(v ?? "").replace(/^[=+@-]/, "'$&").replace(/"/g, '""')}"`;
-    const lines = [["评估口径", "独立历史测试；准确率为误差≤5个百分点的有效点比例"], ["总准确率", data.accuracy], ["有效点", data.valid_points], ["达标点", data.hit_points], ...data.runs.map(r => [r.scope, r.generated_at_ms]), fields, ...data.rows.map(r => fields.map(f => r[f]))];
+    const lines = [["评估口径", "独立历史测试；准确率为绝对误差≤max(5个百分点, 实际值绝对值×5%)的有效点比例"], ["总准确率", data.accuracy], ["有效点", data.valid_points], ["达标点", data.hit_points], ["待重新预测范围（旧口径未计入）", (data.needs_regeneration || []).join("；")], ...data.runs.map(r => [r.scope, r.generated_at_ms]), fields, ...data.rows.map(r => fields.map(f => r[f]))];
     return "\ufeff" + lines.map(row => row.map(cell).join(",")).join("\r\n");
   }
   async function load() {

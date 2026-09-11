@@ -14,7 +14,7 @@
 
 Python3.10可以链接旧SQLite；项目现已兼容原生SQLite3.7.17，不安装替代驱动。若此前准确性查询因deterministic或窗口函数失败，更新代码后保留原库即可。见 [sqlite-compatibility.md](sqlite-compatibility.md)。
 
-调配成效独立保存于各类型输出目录的 `scaling_effects.sqlite3`，不受任务JSON最近1000条限制。默认前24小时、稳定1小时、后24小时、80%有效覆盖率，事件冻结政策版本；来源契约、补齐期限与存储边界见 [scaling-effects.md](scaling-effects.md)。
+调配成效独立保存于各类型输出目录的 `scaling_effects.sqlite3`，不受任务JSON最近1000条限制。默认政策版本2：调配后下一次有效采集确认生效，即与调配前最近采样对比并计入汇总，不等待稳定期或24小时窗口；单点不计算累计容量时。缺少数据则继续等待采集，最长补齐7天。旧版默认窗口的未完成事件随采集升级，已评估历史保持冻结；来源契约、采样要求与存储边界见 [scaling-effects.md](scaling-effects.md)。
 
 | 文件 | 用途 | 是否提交 Git |
 | --- | --- | --- |
@@ -140,7 +140,6 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | 字段 | 默认值 | 作用 |
 | --- | --- | --- |
 | `reuse_backtest_model_for_future` | `False` | 已停用的兼容读取字段，旧输入 `True` 也不会启用延伸预测。未来预测始终用最新完整历史重新拟合。 |
-| `archive_retention_days` | `7` | 只读旧校准证据的有效期；逐点留档生成和SQLite导入已删除，不再用于自动清理留档。 |
 | `prophet_routing_enabled` | `True` | `True` 表示仅在轻量统计特征显示存在明显趋势或季节性时运行 Prophet。若 Prophet 是唯一启用模型，则仍会运行。 |
 | `prophet_routing_mode` | `auto` | `auto` 使用自动路由规则，`always` 表示启用 Prophet 时总是运行，`never` 表示存在其他兜底模型时跳过 Prophet。 |
 | `rolling_backtest_folds` | `1` | 训练段内的时间验证折数；每折长度等于 `test_size`，外层独立测试另计。多折时选型分数为 `0.65 × 最近验证折RMSE + 0.35 × 全部验证残差RMSE`。不足折数时记录实际折数；候选须完成全部可用折。 |
@@ -164,15 +163,16 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 
 唤醒本身不等于拉取。调度循环只在一个条件下取数：到期时刻已经过去。到期时刻按
 `last_start + max(60 秒, scheduled_update_interval_minutes)` 计算，`last_start` 是上一次拉取
-**开始**时的时刻（拉取失败同样占用本轮，因此不会快速重试），首轮以线程启动时刻为计时基准。保存配置只是让
+**开始**时的时刻（拉取失败同样占用本轮，因此不会快速重试），重启恢复原计时基准；没有调度状态或自动拉取历史的首次接入才以启动时刻为基准。保存配置只是让
 循环提前重新评估这个条件，于是有四种结果：
 
 - 新的到期时刻仍在未来：不拉取，继续等待剩余时间，周期既不被重置也不被提前。
 - 把周期改短到 `last_start + 新周期` 已经落在过去：立即拉取一轮。
 - 关闭定时拉取后再打开：关闭时长不足一个周期则等到原到期时刻，超过则立即拉取一轮。
-- 应用启动不额外触发拉取，正常定时周期继续生效（默认每 6 小时）。
+- 应用重启后沿用原周期，未到期继续等待，已过期补跑一轮；无历史的首次接入等待完整周期。
 
 定时拉取统一标记为 `scheduled`。
+调度基准保存在输出根目录的 `k8s_scheduler_state.json`，每次自动任务开始前原子写入，手动拉取不改写。首次升级没有状态文件时，从 `update_history.json` 恢复最近一次后台自动拉取的开始时间，忽略手动记录。部署迁移需保留这两个文件。例如自动任务05:48开始、周期6小时，重启后仍等到11:48；若12:00才启动则立即补跑一次，下一轮按补跑开始时间计时，不逐个补跑停机期间的过期轮次。状态损坏时记录日志并尝试历史恢复；保存失败时当前进程仍运行，但不能保证下次重启恢复。
 需要马上取数请显式调用 `POST /api/cluster-configs/k8s-fetch` 或页面上的拉取按钮。
 
 计时锚定在**开始**时刻而不是完成时刻，是为了让两轮拉取的实际间隔严格等于配置周期。增量回看
@@ -241,6 +241,8 @@ HTTP 层重试之外还有一层整轮重试：某个集群查询成功但聚合
 `rate_window` 会用于真实 CPU usage 查询中的 `rate(container_cpu_usage_seconds_total[...])` 窗口；未在集群配置中指定时使用全局默认值 `15m`。默认 `step_seconds=600` 表示每 10 分钟返回一个结果点，两个参数彼此独立。
 
 K8S Prometheus 首次接入、本地 K8S raw 数据缺失或 API 传入 `full_refresh=true` 时，会按 `history_days` 拉取全量历史窗口（默认最近 7 天）。已有本地基线后的普通拉取会使用增量窗口：`scheduled_update_interval_minutes + incremental_overlap_minutes`，默认 `360 + 60 = 420` 分钟，即最近 7 小时。
+
+窗口按集群分别判断，适用于单集群、批量和后台定时拉取：即使已有其他集群的 raw 数据，新集群仍使用完整历史窗口，已有集群继续增量。若新集群已受旧逻辑影响而只保存了增量数据，可在监控集群所在行点击“全量拉取”补齐历史；页面调用拉取 API，仅提交该集群并传入 `full_refresh=true`，其他集群不参与本次拉取和预测。
 这两个拉取窗口都与本地 `retention_days=30` 保留窗口独立。
 
 通过 `python app.py` 启动时会启动 K8S 定时调度线程。启用定时拉取后，仍按 `scheduled_update_interval_minutes`（默认 360 分钟，即 6 小时）执行；仅取消启动时额外拉取的那一轮，并移除启动拉取延迟配置。VM 数据更新仍需通过页面按钮、API 或 CLI 手动触发。
@@ -344,80 +346,6 @@ outputs/
 ### `forecast_accuracy_summary.json`
 
 每次预测保存本轮实际选用模型的独立历史测试汇总：资源、容器、指标、模型、有效点、无效点、达标点、准确率、MAE和测试时间。只保留最新一轮，不累积逐点记录。口径与使用说明见[预测准确率](forecast-accuracy.md)。逐点留档和SQLite导入入口已删除，旧证据只读分析不再自动补入新数据。
-
-### 经验预测上界（观察阶段）
-
-新预测图表的 `calibration` 保存与 `x_pred_ms` 对齐的 `upper`，资源和容器详情 API 均保留该字段。`scaling_advice.prediction_upper_bound` 给出指标上界峰值及 `complete`；`mode=observe`、`applied_to_targets=false` 表示仅用于观察，现有规格目标、action、confidence 和执行门控继续使用原策略。上界不等于预测曲线自身的 P95，也不是规则置信分数。
-
-按同一资源、容器、指标、模型、模型版本、配置哈希、规格和单位口径收集预测生成前已经评分的真实残差 `actual-predicted`，目标时间必须不晚于当前数据截止。提前量分组沿用 0–1h、1–6h、6–24h、>24h；同一目标时间仅取最后发布的可比预测。每组取最近最多 500 个目标、至少需要 60 个；使用第 `ceil((n+1)*0.95)` 个有序残差作为余量，下限为 0。预测上界为入选预测加余量，不截断到 100%。这些是代码级固定基线，未新增页面配置。
-
-`status` 为 calibrated、partial、insufficient_samples、missing_provenance 或 failed；样本不足的点 `upper=null`，不能按零解释，也不能把部分时段的峰值当成完整窗口上界。`buckets` 记录样本数、余量、样本时间范围和摘要，基准时间与口径随上界保存。增量合并保留旧指标原上界；当前规格不再匹配时，建议摘要标记 basis_changed 并隐藏峰值。
-
-旧版本曾将上界随原曲线留档；以下仅说明已有证据，当前不再写入或补建表。旧SQLite包含 `calibrations`（参数 JSON）和 `upper_bounds`（逐点原上界），当前不再自动增表。`forecast_realized_report.json.calibration_rows` 按模型、指标、层级、单位和提前量统计 `count`、`empirical_coverage`（actual≤upper 的比例）、`mean_exceedance`（max(actual-upper,0) 的均值）、`mean_margin`（upper-predicted 的均值）。仅核验当时留档的上界，不事后重算；旧预测没有上界时不追补覆盖记录。
-
-95% 是经验校准目标，尚非生产实测覆盖保证；时序相关、业务漂移及 K8S 历史规格证据的限制仍适用。严格分组可能长期样本不足，这是保留原策略的正常状态。当前还不能据此声称降低资源预留或费用。
-
-### 影子建议对照
-
-资源详情与摘要增加 `shadow_comparison`（version=1、mode=shadow、executable=false）。校准完整时 `status=paired`，冻结 `baseline` 和 `candidate` 的 action、target_spec、policy_tier；candidate 复用现有建议算法，把输入换成校准上界。baseline 是跨轮次确认之前的建议快照，`baseline_stage=before_cross_run_confirmation`，不是最终执行授权。正式建议及其门控不读取 candidate。
-
-只有全部指标、K8S 全部已知容器都具有完整且同口径的校准上界才生成对照。缺样本、部分校准、局部重算或缺容器时 `status=unavailable` 并记录 reason。对照保存 source_spec、forecast_windows 和 budgets；当前规格变化时，旧对照不作为当前有效方案展示。旧留档不追补影子结果。
-
-SQLite 增加 `shadow_runs`（每批资源的两套快照）和 `shadow_budgets`（对应曲线的资源量和比例），和原批次一起原子导入、去重、按 archive_retention_days 级联清理。真实报告增加 `shadow_comparison`：
-
-| 字段 | 含义 |
-| --- | --- |
-| run_counts / unavailable_reasons | 有效配对数、不可用及其原因；缺样本不是零误差 |
-| allocation_rows | 按资源类型、指标、单位和 role 统计建议配对数量、两套资源量均值与差值；一条曲线只计一次，不按预测点重复累计 |
-| actual_rows | 在完全相同的已评分观测点上，统计两套方案的超出率和平均超出比例；matched_points 是分母 |
-| budget_skip_reasons | 缺规格、非比值口径、副本数变化等不能评分的原因 |
-| change_rows | 相邻同资源同规格有效建议之间的 action/target_spec/policy_tier 变更次数和比例；不可用轮次切断比较 |
-
-VM 比较目标 CPU/内存/磁盘规格；K8S 在容器粒度分别比较 request 和 limit，建议资源量为每副本规格乘目标副本数。`role=request_budget` 的超出表示预留预算不足，不等同于实际容量故障。只有两套方案副本数都等于观测副本数、且指标为比值口径时，才用真实值评分；副本变化仍展示资源量差异，但标记 replicas_changed。其他成员或口径变化沿用真实误差回填的可比性检查。
-
-这里的超出幅度是相对原规格的归一化值，不是 cores/GiB；allocation_rows 才使用实际资源单位。结果假设资源需求保持观测值不变，不模拟限流、OOM、调度、执行延迟及负载再分配，也不代表 SLA 或费用收益。现有算法的固定余量仍保留，校准方案不保证比原策略省资源；必须等后续真实数据再判断效果。
-
-### 校准策略启用判定（仅供评审）
-
-`forecast_realized_report.json.activation_assessment` 按单个资源评估完整指标集合，`mode=review_only`、`automatic_activation=false`，不修改正式建议或执行授权。`status=no_shadow_evidence` 表示尚无影子轮次；否则 `resources[]` 中每个资源输出 continue_observing（继续观察）或 eligible_for_review（具备启用评审条件）。判定不是已经启用，也不是统计安全保证。
-
-规则版本为 `empirical_review_v1`，阈值存于报告 `rules` 和 `pipeline/activation_assessment.py`，当前没有页面开关：
-
-| 条件 | 默认要求 |
-| --- | --- |
-| 连续可比影子轮次 | 至少 12 轮；不可用轮次、规格/口径、policy tier、模型/版本/配置变化后重新积累 |
-| 建议相邻转换 | 至少 10 次，candidate 的变更率不得高于 baseline |
-| 每个指标真实样本 | 至少 100 个不同目标时间，跨度至少 72 小时 |
-| 已到期点观测完整率 | 至少 95%；先按最新发布预测去重，再判断是否有真实评分 |
-| 新鲜度 | 最新预测发布时间、数据截止时间、各指标最新真实目标均不超过 24 小时 |
-| 每个指标风险 | 超出比例及平均超出幅度不得增加 |
-| 每个指标分配量 | 同一组真实匹配点上的平均分配量不得增加 |
-| 预留收益 | 至少一个维度减少 5%；K8S 只把 request 的减少计为预留收益，limit 单独减少不算 |
-
-K8S 全部容器的 request/limit 必须通过检查；某一指标失败不能由其他容器的改善抵消。缺容量、副本变化或缺来源等无法比较的最新指标会阻止判定，`budget_skip_reasons` 和 `missing_metrics` 提供原因。资源和容器之间不合并样本。
-
-`resources[]` 保存最新/最早连续批次、有效轮数、稳定性统计、逐指标 due_targets/matched_targets、观测完整率、时间范围、两套方案风险与分配量、checks/failed_checks 和资源级 reasons。去重时最新曲线尚无观测的目标仍计入待评分母，不拿旧曲线的已评分结果代替。所有风险和收益检查使用同一组真实配对点；仅对浮点累计采用 `1e-12` 数值容差。
-
-判定带 generated_at_epoch_ms 和每资源 valid_until_epoch_ms。消费旧报告时必须核对截止时间，并重新检查当前规格/配置是否仍匹配；新数据或策略变化需要重新生成报告。原 raw 提交仍只评分，判定随预测结束或评分 CLI 生成报告时计算。阈值是保守工程判据，样本时序相关性、历史规格证据、离线反事实及真实执行影响等限制仍然存在；具备评审条件不意味着已证明生产 SLA 或节省费用。
-
-### 按资源受控采用校准建议
-
-`internal_settings.py` 的 `DecisionConfig` 新增代码级参数（不在页面或 runtime_config.json 暴露）：
-
-| 参数 | 默认值 | 作用 |
-| --- | --- | --- |
-| calibrated_advice_enabled | False | 是否允许受控采用校准建议 |
-| calibrated_advice_resource_ids | () | 明确允许的资源 ID；开关打开但列表为空仍不会采用 |
-
-本版本默认保持观察模式，没有自动选资源或自动启用 API。运维评审后可修改以上代码级配置并重启；本次实现未为任何资源开启配置。ID 必须是具体资源标识，不支持通配符。
-
-只有本轮完整新预测、同规格的 paired 影子结果、成功留档、成功发布的当前批次报告，以及仍有效的 eligible_for_review 判定全部匹配，才采用校准建议。重新计算整套 action、target_spec、confidence 和 K8S 策略，并核对其关键字段与本轮冻结 candidate 一致。不会把影子对象直接当作执行授权。
-
-正式 `scaling_advice.calibration_activation.status=active` 表示已采用；元数据包含报告路径、批次、有效期、规格/口径和策略摘要、目标摘要，以及供回退的完整 baseline_advice。`prediction_upper_bound.applied_to_targets=true`、mode=active 同步标注。失败时 status=baseline 并记录 reason。配置关闭、移出列表、非本轮预测、局部重算、过期/旧报告或策略不匹配均在下一次预测流程回退原建议；期间旧校准建议不能通过新增执行检查。
-
-基线/校准切换或校准策略配置改变时，action_gate 的跨轮次确认从第 1 轮重新计数。确认账本新增 strategy 字段，旧记录按 baseline 读取。原有 action_gate、confidence、data_quality、cooldown、policy_tier 等门控保留；非手工覆盖的 execute 入队、任务开始和首条远程命令之前还会复核校准配置、来源、目标、期限及当前账本判定。raw 已评分但报告未更新时，会从 SQLite 重新评估该资源，失效则拒绝并要求重新预测。
-
-影子留档仍冻结切换之前的 baseline/candidate，保持对照实验定义；实际采用情况保存在当前正式建议元数据，执行任务继续记录实际计划。本功能不创建扩缩容任务，不部署生产策略，不证明资源收益；缺少足够证据时即使开关打开也继续使用基线。
 
 ### `generation_stats.json` 统计内容
 

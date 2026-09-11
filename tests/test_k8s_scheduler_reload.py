@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
@@ -22,6 +23,9 @@ class FakeTime:
         self._clock = clock
 
     def monotonic(self) -> float:
+        return self._clock.now
+
+    def time(self) -> float:
         return self._clock.now
 
     def perf_counter(self) -> float:
@@ -84,6 +88,7 @@ def run_loop(
     stop_at: float = 50000.0,
     upsert_raises: bool = False,
     upsert_seconds: float = 0.0,
+    anchor_age: float = 0.0,
 ) -> Tuple[FakeClock, SimpleNamespace, List[Tuple[float, str]], ScriptedReloadEvent]:
     clock = FakeClock()
     cfg = SimpleNamespace(
@@ -103,7 +108,9 @@ def run_loop(
 
     reload_event = ScriptedReloadEvent(clock, cfg, script)
     stop_event = ClockStopEvent(clock, stop_at)
-    with patch.object(k8s_ingest, "settings", SimpleNamespace(k8s_prometheus=cfg)):
+    with patch.object(k8s_ingest, "settings", SimpleNamespace(k8s_prometheus=cfg)), \
+         patch.object(k8s_ingest, "_load_scheduler_anchor", return_value=clock.now-anchor_age), \
+         patch.object(k8s_ingest, "_save_scheduler_anchor"):
         with patch.object(k8s_ingest, "time", FakeTime(clock)):
             with patch.object(k8s_ingest, "_k8s_stop_event", stop_event):
                 with patch.object(k8s_ingest, "_k8s_reload_event", reload_event):
@@ -113,6 +120,19 @@ def run_loop(
 
 
 class K8SSchedulerReloadTest(unittest.TestCase):
+    def test_restart_waits_only_remaining_interval(self):
+        # 重启前已过4小时，6小时周期只剩2小时。
+        _, _, fetches, event = run_loop(interval_minutes=360, anchor_age=4*3600,
+            script=[(2*3600, False, None), (100000, False, None)])
+        self.assertEqual(fetches, [(8200, "scheduled")])
+        self.assertEqual(event.timeouts, [7200, 21600])
+
+    def test_restart_overdue_runs_once_then_waits_normal_interval(self):
+        _, _, fetches, event = run_loop(interval_minutes=360, anchor_age=8*3600,
+            script=[(100000, False, None)])
+        self.assertEqual(fetches, [(1000, "scheduled")])
+        self.assertEqual(event.timeouts, [21600])
+
     def test_six_hour_schedule_has_no_extra_startup_pull(self):
         _, _, fetches, event = run_loop(
             interval_minutes=360,
@@ -251,6 +271,27 @@ class K8SSchedulerReloadTest(unittest.TestCase):
         self.assertEqual(fetches[:2], [(4600.0, "scheduled"), (11800.0, "scheduled")])
         # 仅首轮定时拉取前等待一个周期。
         self.assertEqual(reload_event.timeouts, [3600.0])
+
+
+def test_scheduler_state_migrates_only_automatic_history_and_survives_restart(tmp_path):
+    history = {"version": 1, "records": [
+        {"task_source": "K8S 后台定时拉取", "started_at": 10000, "finished_at": 11000},
+        {"task_source": "页面手动拉取", "started_at": 20000, "finished_at": 21000},
+    ]}
+    (tmp_path / "update_history.json").write_text(json.dumps(history), encoding="utf-8")
+    with patch.object(k8s_ingest, "settings", SimpleNamespace(app=SimpleNamespace(out_dir=tmp_path))), \
+         patch.object(k8s_ingest.time, "time", return_value=25000):
+        assert k8s_ingest._load_scheduler_anchor() == 10000
+        k8s_ingest._save_scheduler_anchor(22000)
+        assert k8s_ingest._load_scheduler_anchor() == 22000
+        # 状态损坏或时间在未来时，恢复旧自动历史，不能采用更新的手动记录。
+        path = tmp_path / "k8s_scheduler_state.json"
+        path.write_text("broken", encoding="utf-8")
+        assert k8s_ingest._load_scheduler_anchor() == 10000
+        k8s_ingest._save_scheduler_anchor(30000)
+        assert k8s_ingest._load_scheduler_anchor() == 10000
+        (tmp_path / "update_history.json").unlink()
+        assert k8s_ingest._load_scheduler_anchor() == 25000
 
 
 if __name__ == "__main__":

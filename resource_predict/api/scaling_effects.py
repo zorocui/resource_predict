@@ -19,7 +19,7 @@ def register_scaling_effect_routes(app: Flask, out_dirs_provider=None) -> None:
         allowed = {
             "resource_type": {"", "openstack_vm", "k8s_workload"},
             "action": {"", "scale_in", "scale_out", "mixed", "unknown"},
-            "status": {"", "executing", "awaiting_effective", "observing", "insufficient_data", "evaluated", "failed",
+            "status": {"", "executing", "awaiting_effective", "observing", "provisional", "insufficient_data", "evaluated", "failed",
                        "interrupted", "basis_changed", "missing_baseline", "capture_failed", "evidence_conflict", "expired"},
         }
         for key, options in allowed.items():
@@ -82,6 +82,7 @@ def register_scaling_effect_routes(app: Flask, out_dirs_provider=None) -> None:
             "before_coverage", "after_coverage", "before_utilization_pct", "after_utilization_pct",
             "delta_pp", "relative_change_pct", "before_mean_usage", "after_mean_usage",
             "before_mean_capacity", "after_mean_capacity", "reclaimed_capacity", "reclaimed_unit_hours",
+            "evaluation_mode", "before_observation_kind", "after_observation_kind",
         ])
         for event in events:
             for metric in event.get("metrics") or [{}]:
@@ -93,6 +94,8 @@ def register_scaling_effect_routes(app: Flask, out_dirs_provider=None) -> None:
                 row += [before.get("coverage"), after.get("coverage"), before.get("utilization_pct"), after.get("utilization_pct")]
                 row += [metric.get("delta_pp"), metric.get("relative_change_pct"), before.get("mean_usage"), after.get("mean_usage"),
                         before.get("mean_capacity"), after.get("mean_capacity"), metric.get("reclaimed_capacity"), metric.get("reclaimed_unit_hours")]
+                row += [event["policy"].get("evaluation_mode", "window"),
+                        before.get("observation_kind", "window"), after.get("observation_kind", "window")]
                 writer.writerow([_csv_cell(value) for value in row])
         return Response("\ufeff" + output.getvalue(), content_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": 'attachment; filename="scaling-effects.csv"', "Cache-Control": "no-store"})
