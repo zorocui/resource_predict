@@ -286,6 +286,7 @@ def _error_model_metrics(
             "rolling_rmse", "rolling_mae", "rolling_folds",
             "validation_rmse", "validation_mae", "validation_mape",
             "validation_p95_error", "validation_folds",
+            "validation_accuracy", "validation_hit_points", "validation_valid_points", "validation_worst_accuracy",
         )}
         errors.update(
             window=window, evaluation_role=evaluation.get("role", "legacy_holdout"),

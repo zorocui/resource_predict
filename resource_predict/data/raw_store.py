@@ -134,6 +134,7 @@ def write_raw_resource_dataset(
     freq: str,
     changed_resource_ids: Optional[Iterable[str]] = None,
     defer_cleanup: bool = False,
+    ingest_scaling_evidence: bool = True,
 ) -> Dict[str, int]:
     """原子提交一份 raw 资源索引；指定 changed IDs 时复用其他资源引用。"""
     base = Path(out_base)
@@ -223,11 +224,12 @@ def write_raw_resource_dataset(
     else:
         # 常规数据提交继续回收已经超过安全宽限期的孤立分片。
         removed = _remove_orphan_raw_files(base)
-    from resource_predict.services.scaling.effects import try_ingest_evidence
+    if ingest_scaling_evidence:
+        from resource_predict.services.scaling.effects import try_ingest_evidence
 
-    try_ingest_evidence(base, (
-        item for rid, item in prepared_by_id.items() if changed is None or rid in changed
-    ))
+        try_ingest_evidence(base, (
+            item for rid, item in prepared_by_id.items() if changed is None or rid in changed
+        ))
     return {
         "resources": len(new_resources),
         "files_total": len(new_files),

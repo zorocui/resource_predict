@@ -213,7 +213,8 @@ class MergeChartsIntoDetailTest(unittest.TestCase):
             "resource_id": "vm-01",
             "charts_forecast": {
                 "cpu": {
-                    "preds": {"arima": [0.5, 0.6]},
+                    "preds": {"arima": [0.5] * test_size},
+                    "x_test_ms": (cpu_series.index[-test_size:].asi8 // 1_000_000).tolist(),
                     "x_pred_ms": [1, 2],
                     "preds_future": {},
                     "metrics": {},
@@ -272,6 +273,7 @@ class MergeChartsIntoDetailTest(unittest.TestCase):
             "container_charts_forecast": {
                 "app": {
                     "cpu_limit": {
+                        "x_test_ms": (series.index[-test_size:].asi8 // 1_000_000).tolist(),
                         "preds": {"arima": [0.5]},
                         "x_pred_ms": [1],
                         "preds_future": {"arima": [0.6]},

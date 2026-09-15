@@ -170,7 +170,8 @@ class ForecastOptimizationTest(unittest.TestCase):
                 ctx=ctx,
             )
 
-        self.assertEqual(calls, ["rolling_mean"] * 3)
+        # 默认三折验证，加一次独立测试和一次在线预测；Prophet 仍被跳过。
+        self.assertEqual(calls, ["rolling_mean"] * 5)
         self.assertNotIn("prophet", preds)
         self.assertNotIn("prophet", metrics)
         self.assertNotIn("prophet", future)

@@ -18,7 +18,7 @@
         <nav class="top-nav" aria-label="主导航">
           <button class="nav-tab active" type="button" data-view="risk">风险队列</button>
           <button class="nav-tab" type="button" data-view="overview">概览</button>
-          <button class="nav-tab" type="button" data-view="tasks">调配任务</button>
+          <button class="nav-tab" type="button" data-view="tasks">调配记录</button>
           <button class="nav-tab" type="button" data-view="effects">调配成效</button>
           <button class="nav-tab" type="button" data-view="accuracy">预测准确性</button>
           <button class="nav-tab" type="button" data-view="updates">数据更新</button>
@@ -133,19 +133,20 @@
 
           <div id="tasks-view" class="view-panel">
             <section class="empty-state">
-              <h2>调配任务</h2>
-              <p>围绕当前选中资源展示最近调配记录。VM 与 K8S Workload 可在右侧详情里发起预检或调配。</p>
-              <div class="status-board" id="task-status-board">
-                <div class="status-card">
-                  <span>当前资源</span>
-                  <strong id="task-resource">未选择</strong>
-                </div>
-                <div class="status-card">
-                  <span>调配能力</span>
-                  <strong id="task-capability">-</strong>
-                </div>
+              <h2>调配记录</h2>
+              <p>全部资源的调配与预检记录，按提交时间倒序排列。成功表示命令完成，实际生效情况请查看调配成效。</p>
+              <form id="task-history-search" class="history-toolbar">
+                <input id="task-history-query" type="search" aria-label="搜索调配资源" placeholder="搜索资源名称或 ID">
+                <button class="primary-btn" type="submit">查询 / 刷新</button>
+                <span id="task-history-total" aria-live="polite"></span>
+              </form>
+              <div id="task-history" class="task-history" aria-live="polite"></div>
+              <div class="history-toolbar">
+                <button id="task-history-prev" class="secondary-btn" type="button">上一页</button>
+                <span id="task-history-page"></span>
+                <button id="task-history-next" class="secondary-btn" type="button">下一页</button>
               </div>
-              <div id="task-history" class="task-history"></div>
+              <p>展示系统已保留的记录（任务历史最多保留 1000 条）。旧记录缺少的历史规格显示为“未记录”。</p>
             </section>
           </div>
 
@@ -364,6 +365,7 @@
     <script src="{{ url_for('static', filename='js/resource-list.js') }}"></script>
     <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
     <script src="{{ url_for('static', filename='js/scaling.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/scaling-history.js') }}"></script>
     <script src="{{ url_for('static', filename='js/scaling-effects.js') }}"></script>
     <script src="{{ url_for('static', filename='js/accuracy-summary.js') }}"></script>
     <script src="{{ url_for('static', filename='js/index.js') }}"></script>

@@ -94,27 +94,37 @@ def test_scaling_success_updates_sharded_raw_and_prediction_snapshots():
             generation=SimpleNamespace(raw_resource_cache_items=10, freq="h"),
         )
 
+        manifest_path = out_dir / "manifest.json"
+        manifest_before = manifest_path.read_bytes()
+        original_open = Path.open
+
+        def reject_manifest_access(path, *args, **kwargs):
+            assert path != manifest_path, "调配不能读取或重写全量 manifest"
+            return original_open(path, *args, **kwargs)
+
         with patch.object(snapshot, "settings", fake_settings), \
+             patch.object(Path, "open", reject_manifest_access), \
              patch("resource_predict.data.raw_store._schedule_raw_cleanup") as cleanup, \
-             patch("resource_predict.data.raw_store._remove_orphan_raw_files") as scan:
+             patch("resource_predict.data.raw_store._remove_orphan_raw_files") as scan, \
+             patch("resource_predict.services.scaling.effects.try_ingest_evidence") as ingest:
             result = snapshot.apply_scaling_success_snapshot(plan)
             cleanup.assert_called_once_with(out_dir)
             scan.assert_not_called()
+            ingest.assert_not_called()
 
         loaded_raw = RawResourceStore(out_dir).get("vm-1")
         loaded_summary = json.loads((out_dir / "summary_index.json").read_text(encoding="utf-8"))
         loaded_detail = json.loads((out_dir / "details" / "part-00000.json").read_text(encoding="utf-8"))
-        loaded_manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest_path.read_bytes() == manifest_before
 
     assert result["raw_updated"] is True
     assert result["summary_updated"] is True
     assert result["detail_updated"] is True
-    assert result["manifest_updated"] is True
+    assert result["manifest_updated"] is False
     for item in (
         loaded_raw,
         loaded_summary["resources"][0],
         loaded_detail["resources"][0],
-        loaded_manifest["resources"][0],
     ):
         assert item["spec"]["cpu_cores"] == 4
         assert item["spec"]["memory_gb"] == 8

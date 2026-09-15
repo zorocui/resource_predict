@@ -1,5 +1,6 @@
 """独立实验的时间泄漏边界和 raw 只读契约。"""
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,10 @@ def test_raw_container_loading_is_read_only(tmp_path):
     loaded, skipped, source = load_series(tmp_path, "k8s_workload", "cpu_request", "container", 0, 42)
     assert len(loaded) == 1 and loaded[0].container == "app" and not skipped
     assert len(source["sha256"]) == 64
+    unified, _, fingerprint = load_series(tmp_path, "k8s_workload", "all", "container", 0, 42)
+    assert {s.metric for s in unified} == set(metrics)
+    assert len(unified) == 4
+    assert fingerprint["sha256"] != source["sha256"]
     assert before == {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in before}
 
 
@@ -70,22 +75,32 @@ def test_raw_gap_is_not_interpolated(tmp_path):
         load_series(tmp_path, "openstack_vm", "cpu", "resource", 0, 42)
 
 
-def test_training_checkpoint_and_report(tmp_path):
+@pytest.mark.parametrize("metric", ["cpu", "all"])
+def test_training_checkpoint_and_report(tmp_path, metric):
     torch = pytest.importorskip("torch")
     from training.lstm import SharedLSTM, parser, run
 
     raw = tmp_path / "raw-input"
     series = samples()[0].series / 200
     item = {"resource_id": "vm-a", "resource_type": "openstack_vm", "spec": {},
-            "cpu": series, "memory": series, "disk": series}
+            "cpu": series, "memory": series * 2, "disk": series * 3}
     write_raw_resource_dataset(raw, [item], freq="h")
     args = parser().parse_args(["--raw", str(raw), "--out", str(tmp_path / "result"),
-                               "--resource-type", "openstack_vm", "--metric", "cpu",
+                               "--resource-type", "openstack_vm", "--metric", metric,
                                "--epochs", "1", "--hidden-size", "4", "--baselines", "seasonal_naive", "rolling_mean"])
     report = run(args)
     assert report["best_epoch"] == 1
     assert set(report["summary"]) == {"lstm", "seasonal_naive", "rolling_mean"}
     checkpoint = torch.load(args.out / "model.pt", weights_only=True)
+    expected = {"cpu"} if metric == "cpu" else {"cpu", "memory", "disk"}
+    assert set(report["summary_by_metric"]) == expected
+    assert report["series_by_metric"] == {name: 1 for name in expected}
+    assert {s["metric"] for s in checkpoint["scalers"]} == expected
+    assert len(checkpoint["scalers"]) == len(expected)
+    assert len({s["mean"] for s in checkpoint["scalers"]}) == len(expected)
+    records = json.loads((args.out / "forecast_error_report.json").read_text())["records"]
+    assert {r["metric"] for r in records} == expected
+    assert all(report["summary_by_metric"][m]["lstm"]["successful_windows"] == 1 for m in expected)
     model = SharedLSTM(**checkpoint["architecture"])
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
@@ -94,3 +109,10 @@ def test_training_checkpoint_and_report(tmp_path):
     assert (Path(args.out) / "forecast_error_report.json").exists()
     with pytest.raises(ValueError, match="输出目录已存在"):
         run(args)
+
+
+def test_default_is_shared_all_metrics():
+    pytest.importorskip("torch")
+    from training.lstm import parser
+    args = parser().parse_args(["--raw", "input", "--out", "output", "--resource-type", "k8s_workload"])
+    assert args.metric == "all"

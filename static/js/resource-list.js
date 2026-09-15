@@ -320,6 +320,7 @@
     const values = []
       .concat(Array.isArray(chart.y_train) ? chart.y_train : [])
       .concat(Array.isArray(chart.y_test) ? chart.y_test : [])
+      .concat(Array.isArray(chart.y_observed) ? chart.y_observed : [])
       .map((value) => Number(value))
       .filter((value) => Number.isFinite(value));
     if (!values.length) return null;
@@ -945,6 +946,16 @@
       .join("");
   }
 
+  function scalingHistoryBadge(item) {
+    const timestamp = Number(item?.spec?.last_scaled_at_epoch_ms);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) return "";
+    const time = date.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+    const description = `最近成功调配：${time}（北京时间）。此标记仅表示调配历史，不代表当前无需调整。`;
+    return `<span class="scaled-history-badge" title="${escapeHtml(description)}" aria-label="${escapeHtml(description)}">已调配</span>`;
+  }
+
   function renderRows() {
     const root = app.els.rowsRoot;
     const items = currentPageItems();
@@ -969,6 +980,7 @@
           <span class="row-title">
             <strong title="${escapeHtml(item.resource_id)}">${escapeHtml(titleFor(item))}</strong>
             <span class="resource-type-badge">${typeLabel(item)}</span>
+            ${scalingHistoryBadge(item)}
             <span class="action-chip is-${escapeHtml(action)}">${escapeHtml(actionLabel(action))}</span>
           </span>
           <span class="row-subtitle">${escapeHtml(subtitleFor(item))}</span>
@@ -1068,6 +1080,7 @@
     representativeContainerName,
     metricStatsFor,
     renderRows,
+    scalingHistoryBadge,
     resolveDisplayUnit,
     resourceTypeOf,
     selectResource,

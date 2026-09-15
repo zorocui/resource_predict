@@ -319,7 +319,7 @@ sequenceDiagram
 | Rolling Mean | 近期滚动均值作为稳定基线 |
 | Ensemble | RMSE 倒数加权融合（可选启用） |
 
-**模型选择与独立测试**：从外层训练段尾部划出 `rolling_backtest_folds` 个时间验证折（默认 1）；每折长 `test_size`，最初训练段至少 `max(test_size, 24)` 点。路由仅读取最早验证折之前的数据。单折按验证 RMSE 选型；多折按 `0.65 × 最近验证折RMSE + 0.35 × 全部验证残差RMSE` 选型，异常时优先鲁棒候选。外层测试只评分，不参与选型或集成权重。历史不足时按预定义模型优先级降级并记录原因。
+**模型选择与独立测试**：从外层训练段尾部划出 `rolling_backtest_folds` 个时间验证折（默认 3）；每折长 `test_size`，最初训练段至少 `max(test_size, 24)` 点。路由仅读取最早验证折之前的数据。利用率按全部验证有效点的容差达标率优先选型，相同达标率再比较 `selection_rmse`；异常时也不以鲁棒候选覆盖更高的验证达标率。绝对核数/GiB 指标仍按 RMSE 选型并保留异常鲁棒候选规则。`selection_rmse` 单折为验证 RMSE，多折为 `0.65 × 最近验证折RMSE + 0.35 × 全部验证残差RMSE`，集成权重继续使用该分数。外层测试只评分，不参与选型或集成权重。历史不足时使用可用折数，无可用验证时按预定义优先级降级并记录原因。诊断保存各折达标率、汇总及最差折达标率。
 
 **集成与在线更新**：首个验证折等权，后续折只用之前验证折学习权重；误差来自真实集成预测残差。独立测试和未来预测使用全部内部验证确定的固定权重，缺失成员时不静默重分配权重。所有候选未来曲线使用最新完整观测重新拟合，以保留模型对照图。入选模型未来失败时以 Rolling Mean 的真实名称降级。相比原先一次延伸预测，单验证折通常需要验证、测试和未来三次拟合，应在生产规模下度量耗时。
 
@@ -346,14 +346,16 @@ sequenceDiagram
 - **Container 级预测**：K8S Workload 仍是资源主体；provider 同时输出 Workload 聚合 `metrics` 和 `container_metrics.<container>.<metric>`。预测产物保留 Workload 聚合 `charts`，并新增 `container_charts.<container>.<metric>` 供详情页在同一 ECharts 图中绘制多条 container 曲线。
 - **风险队列统计范围**：K8S 指标胶囊展示完整历史观测窗口的 Workload 聚合 P95。百分比按参与容器使用量总和除以对应 Request/Limit 总和计算，并显示参与容器数；这不是容器使用率的算术平均。详情抽屉的统计在容器图表加载后展示当前选中 Container 的范围，两者通过标签和提示明确区分。
 - **未来预测辅助区**：详情图橙色区域只覆盖 `x_pred_ms + preds_future` 中全部可见模型的有效未来预测时间并集，不覆盖 `x_test_ms + preds` 测试/回测阶段。预测线与色带共用有效点规则：`null`、空字符串和非有限数均视为缺失，真实数值 `0` 保留；首尾缺失会收缩色带边界，中间缺失不会把未来区域拆段，有效未来时间不足两个时不显示色带。
+- **测试与新观测的时间对齐**：预测详情保存固定 `x_test_ms`；图表接口按这些时间戳对齐测试真实值，缺样保留 `null`，不从最新 raw 末尾重新划分测试窗口。旧产物可通过 `test_end_ms`、采样间隔及测试预测长度恢复固定时间轴，边界不足时不猜测测试时间。测试结束后新增的 `x_observed_ms/y_observed` 单独绘制绿色“预测后实际观测”，也纳入时间范围与观测统计；可与旧预测区重叠以比较实际结果。VM、Workload 汇总和容器图均适用。
 - **扩容判断**：基于 `cpu_limit` / `memory_limit`，P95 >= 0.8 或峰值 >= 0.9；没有 limit 时不提出扩容建议
 - **缩容判断**：基于 `cpu_request` / `memory_request`，均值 < 0.2 且 P95 < 0.35
 - **数据质量**：`_quality_level()` 评估每个指标的数据质量，poor 质量自动跳过执行建议
 - **Baseline 缺失处理**：缺少 request/limit 时降级为 trend-only 分析
 - **目标利用率分级**：`_target_utilization()` 按策略层级返回差异化利用率目标（0.55~0.78）
 - **requests/limits 建议**：按容器粒度，per-replica target 与副本数独立计算避免双重缩放；小于 `2C/2Gi` 的 Workload 保留小数粒度，避免 `0.5C` 级别 request/limit 被放大到 `2C`
+- **容器缩容下限**：CPU Request 至少 `100m`（0.1 核），内存 Request 至少 `128Mi`（0.125 GiB），所有策略层级均适用。当前 Request 已达到或低于下限时，不再为该指标生成更低的 Request/Limit 建议，也不通过缩容反向抬高已有低规格；其他容器、指标仍独立判断。生成的 Limit 不低于 Request，副本数仍遵守独立的最少2副本规则。
 - **多容器执行目标**：多 container Workload 的 request/limit 建议写入 `target_spec.containers.<container>`；`replicas` 仍保留在 Workload 级 `target_spec.replicas`。
-- **副本数建议**：Deployment / StatefulSet / ReplicaSet 支持；DaemonSet 跳过副本缩放并给出警告
+- **副本数建议**：Deployment / StatefulSet / ReplicaSet 支持；当前副本数大于 1 时，缩容后至少保留 2 个副本（当前为 2 个时不建议减少副本）；单副本不建议减少副本。仍受单次最大缩容比例限制。DaemonSet 跳过副本缩放并给出警告
 - **Namespace 策略**：自动从 spec 中识别 namespace 并匹配 conservative / aggressive 分组
 - **Workload 类型归一化**：`_workload_kind()` 标准化控制器类型字符串
 
@@ -376,7 +378,7 @@ sequenceDiagram
 - **K8S Workload**：`kubectl set resources` 按容器粒度 -> `kubectl scale` 调整副本数
 - **执行前置校验**：`execute` 模式在任务入队前调用 `_execution_gate_failures()`。默认建议执行必须满足 `action_gate=ready`、`confidence=high` 且分数达标、数据质量良好、未处于冷却期、策略层级有效；人工复核建议（`target_source=confirmed`）只跳过 `action_gate`，仍保留其他门控；手动 `target_spec` 不要求建议 `action_gate` / `confidence`，但仍需通过策略层级、数据质量、冷却期和 K8S 目标策略校验
 - **安全**：所有用户可控值使用 `shlex.quote()` 转义
-- **快照**：调配成功后自动更新 `summary_index.json` / `details/*.json` / 目标资源 raw 分片 / `raw_index.json` / `manifest.json` 中的 spec
+- **快照**：调配成功后自动更新 `summary_index.json` / 对应 `details/*.json` 分片 / 目标资源 raw 分片 / `raw_index.json` 中的规格。调配完全不读写 `manifest.json`；它保留预测生成时的规格与建议，由下一次预测产物写出时更新，实时规格以资源 API 为准。
 
 `build_scaling_plan()`（`executor.py`）生成包含 shell 命令的 `ScalingPlan` dataclass。`command_runner.py` 通过 SSH 执行命令。`openstack_flavors.py` 从控制节点查询可用 flavor 以选择调整目标；如无合适 flavor，`allow_create_flavor=True` 启用自动创建。
 

@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict
 
 from flask import Flask, jsonify, request
 
-from resource_predict.services.scaling.tasks import confirm_scaling_task, create_scaling_task, get_history, get_task
+from resource_predict.services.scaling.tasks import confirm_scaling_task, create_scaling_task, get_history, get_task, list_history
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,14 @@ def register_scaling_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) 
         if task is None:
             return jsonify({"error": "task not found"}), 404
         return jsonify({"task": task})
+
+    @app.get("/api/scaling-history")
+    def api_scaling_history():
+        return jsonify(list_history(
+            page=safe_int(request.args.get("page"), 1),
+            page_size=safe_int(request.args.get("page_size"), 20),
+            query=str(request.args.get("q") or ""),
+        ))
 
     @app.post("/api/scaling-tasks/<task_id>/confirm")
     def api_scaling_task_confirm(task_id: str):

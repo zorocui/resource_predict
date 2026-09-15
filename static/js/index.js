@@ -104,10 +104,6 @@
     loadQueue();
   }
 
-  function selectedResource() {
-    return app.state.loadedItems.find((item) => String(item.resource_id || "") === app.state.selectedResourceId) || null;
-  }
-
   function formatDateTime(value) {
     if (!value) return "-";
     let normalized = value;
@@ -126,66 +122,8 @@
     }).format(d);
   }
 
-  const TASK_STATUS_LABELS = {
-    queued: "排队中",
-    running: "执行中",
-    waiting_confirm: "等待确认",
-    confirming: "确认中",
-    success: "成功",
-    failed: "失败",
-  };
-
-  const TASK_MODE_LABELS = {
-    dry_run: "预检",
-    execute: "调配",
-  };
-
-  function renderTaskHistory(tasks) {
-    if (!app.els.taskHistory) return;
-    if (!tasks.length) {
-      app.els.taskHistory.innerHTML = `<div class="empty-list is-compact">当前资源还没有调配记录。</div>`;
-      return;
-    }
-    app.els.taskHistory.innerHTML = tasks.map((task) => {
-      const status = String(task.status || "");
-      const statusLabel = TASK_STATUS_LABELS[status] || status || "-";
-      const modeLabel = TASK_MODE_LABELS[String(task.mode || "")] || task.mode || "调配任务";
-      const plan = task.plan || {};
-      const actionLabel = plan.action ? `（${list.escapeHtml(plan.action)}）` : "";
-      const createdAt = task.created_at_ms || task.updated_at_ms || "";
-      return `
-      <div class="task-item">
-        <div>
-          <strong>${list.escapeHtml(modeLabel)}${actionLabel}</strong>
-          <span>${list.escapeHtml(task.task_id || "")}</span>
-        </div>
-        <div>
-          <span class="task-status is-${list.escapeHtml(status)}">${list.escapeHtml(statusLabel)}</span>
-          <small>${list.escapeHtml(formatDateTime(createdAt))}</small>
-        </div>
-      </div>
-    `;
-    }).join("");
-  }
-
-  async function renderTaskPanel() {
-    if (!app.els.taskResource || !app.els.taskCapability || !app.els.taskHistory) return;
-    const resource = selectedResource();
-    if (!resource) {
-      app.els.taskResource.textContent = "未选择";
-      app.els.taskCapability.textContent = "-";
-      app.els.taskHistory.innerHTML = `<div class="empty-list is-compact">先在风险队列中选择一个资源。</div>`;
-      return;
-    }
-    app.els.taskResource.textContent = resource.resource_id || "-";
-    app.els.taskCapability.textContent = list.isK8s(resource) ? "K8S 可预检 / 可调配" : "可预检 / 可调配";
-    app.els.taskHistory.innerHTML = `<div class="empty-list is-compact">正在读取调配记录...</div>`;
-    try {
-      const payload = await api.requestJson(`/api/resources/${encodeURIComponent(resource.resource_id)}/scaling-history?limit=8`, 1);
-      renderTaskHistory(payload.tasks || []);
-    } catch (e) {
-      app.els.taskHistory.innerHTML = `<div class="empty-list is-compact">调配记录读取失败：${list.escapeHtml(e.message || e)}</div>`;
-    }
+  function renderTaskPanel() {
+    return window.ScalingHistory.load(api.requestJson);
   }
 
   function updateStatusText(status) {
@@ -435,6 +373,8 @@
           { value: "thread", label: "多线程" }, { value: "serial", label: "串行" },
         ])}
         ${configInput("最大并行数（0 自动，最多 256）", "max_workers", prediction.max_workers ?? 0, { type: "number" })}
+        ${configInput("LSTM 模型文件路径", "lstm_model_path", prediction.lstm_model_path || "")}
+        ${configInput("LSTM 最大训练滞后（小时，0 不限）", "lstm_max_age_hours", prediction.lstm_max_age_hours ?? 168, { type: "number" })}
       </div></div>`;
     if (app.els.decisionConfigList) app.els.decisionConfigList.innerHTML = `
       <div class="config-row" data-config-kind="decision"><div class="config-grid">
@@ -677,6 +617,7 @@
         workload_test_duration: rowValue(prediction, "workload_test_duration"), workload_future_duration: rowValue(prediction, "workload_future_duration"),
         enabled_methods: methods, enable_ensemble: rowValue(prediction, "enable_ensemble"),
         parallel_backend: rowValue(prediction, "parallel_backend"), max_workers: rowValue(prediction, "max_workers"),
+        lstm_model_path: rowValue(prediction, "lstm_model_path"), lstm_max_age_hours: rowValue(prediction, "lstm_max_age_hours"),
       },
       decision: {
         default_policy_tier: rowValue(decision, "default_policy_tier"),

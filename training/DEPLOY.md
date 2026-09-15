@@ -3,6 +3,9 @@
 目的：把训练源码和依赖搬到内网，直接读取内网现有的 raw 数据。无需重新采集，也无需把内网数据传到外网。
 本机 RESULTS.md 只是流程验证，不代表内网数据实验结果。
 
+Prophet 批量训练保存、后续零 fit 预测，以及 LSTM 使用冻结 Prophet 对照的命令见 [PROPHET.md](PROPHET.md)。
+LSTM 全量流式训练、磁盘缓存和中断后 `--resume` 命令见 [LSTM_RESUME.md](LSTM_RESUME.md)。
+
 ## 已确认的目标：CentOS 7.6 / glibc 2.17 / x86_64 / Python 3.10.13
 
 用户已确认内网安装 torch 2.6.0。**优先复用安装它的现有 Python 环境，无需重新安装 torch，也不要先创建一个看不到现有依赖的新虚拟环境。**
@@ -159,27 +162,29 @@ cd /opt/lstm-training
 source .venv/bin/activate
 python -u -m training.lstm \
   --raw /opt/resource_predict/outputs/k8s \
-  --out outputs/lstm/k8s-smoke-01 \
-  --resource-type k8s_workload --level container --metric cpu_request \
+  --out outputs/lstm/k8s-all-smoke-01 \
+  --resource-type k8s_workload --level container \
   --max-resources 4 --epochs 2 --baselines seasonal_naive rolling_mean
 ```
 
-正式首轮取最多 100 个 Workload，20 轮上限，默认比较 Seasonal Naive、Rolling Mean、Prophet：
+正式首轮取最多 100 个 Workload，20 轮上限，下面先比较 Seasonal Naive、Rolling Mean；已安装 Prophet 时可在 baselines 列表追加 prophet：
 
 ```bash
 mkdir -p outputs/logs
 nohup python -u -m training.lstm \
   --raw /opt/resource_predict/outputs/k8s \
-  --out outputs/lstm/k8s-cpu-01 \
-  --resource-type k8s_workload --level container --metric cpu_request \
+  --out outputs/lstm/k8s-all-01 \
+  --resource-type k8s_workload --level container \
   --lookback 24h --horizon 24h --validation-duration 24h --test-duration 24h \
   --max-resources 100 --epochs 20 --threads 2 \
-  > outputs/logs/k8s-cpu-01.log 2>&1 &
-tail -f outputs/logs/k8s-cpu-01.log
+  --baselines seasonal_naive rolling_mean \
+  > outputs/logs/k8s-all-01.log 2>&1 &
+tail -f outputs/logs/k8s-all-01.log
 ```
 
-VM 改为 `--raw /opt/resource_predict/outputs/vm --resource-type openstack_vm --level resource --metric cpu`。
-容器内存改为 `--metric memory_request`，并更换输出目录。每次运行独立一个指标，输出目录必须为新目录。
+VM 改为 `--raw /opt/resource_predict/outputs/vm --resource-type openstack_vm --level resource`，统一训练 CPU/内存/磁盘。
+默认 `--metric all`，K8S 四类指标共享一个模型、批量输出各自预测，不再分四次训练。仍可显式 `--metric cpu_request` 做单指标对照。首次使用新输出目录，中断后保持原目录并加 `--resume`。
+统一训练版需要重新训练一个新 model.pt，不能把旧单指标模型直接当作已学习四类指标的模型。
 `--max-resources 0` 是全部资源；先根据首轮内存、训练耗时和可用序列数评估，不建议首次直接跑万级全量。
 
 出现“历史不足”时，根据现有数据长度调整 lookback/验证/测试时长，或选择更长的既有快照；不要为了跑通而让训练、验证和测试标签重叠。
@@ -189,7 +194,7 @@ VM 改为 `--raw /opt/resource_predict/outputs/vm --resource-type openstack_vm -
 
 结果位于本次 `--out`：
 
-- `report.json`：可用序列、跳过原因、时间切分、训练曲线、最佳轮次、基线比较和耗时。
+- `report.json`：可用序列、跳过原因、时间切分、训练曲线、最佳轮次、分指标 `summary_by_metric` 基线比较和耗时。
 - `forecast_error_report.json`：逐资源/容器/指标/模型/窗口误差。
 - `predictions.jsonl`：真实值和预测曲线。
 - `model.pt`：训练权重与配置，用于复现；不会自动替换在线模型。

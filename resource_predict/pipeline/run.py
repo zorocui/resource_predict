@@ -230,11 +230,11 @@ def generate_forecasts(
     forecast_config = read_forecast_config()
     active_methods: List[str] = []
     enabled_methods = set(forecast_config["enabled_methods"])
-    for method_name in ("arima", "sarima", "prophet", "seasonal_naive", "rolling_mean"):
+    for method_name in ("arima", "sarima", "prophet", "seasonal_naive", "rolling_mean", "lstm"):
         if method_name in enabled_methods:
             active_methods.append(method_name)
     if not active_methods:
-        raise ValueError("至少需要启用一个预测模型（ARIMA/SARIMA/Prophet）")
+        raise ValueError("至少需要启用一个预测模型")
 
     ctx = WorkerContext(
         test_size=test_size,

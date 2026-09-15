@@ -9,7 +9,7 @@
 
 **核心能力：**
 
-- 多模型预测（ARIMA / SARIMA / Prophet / Seasonal Naive / Rolling Mean / Ensemble）
+- 多模型预测（ARIMA / SARIMA / Prophet / Seasonal Naive / Rolling Mean / Ensemble / 已训练 LSTM）
 - 自动最优模型选择（基于 RMSE + 滚动回测）
 - 异常检测与鲁棒路由
 - 策略分级（conservative / balanced / aggressive）与 Namespace-aware 差异化阈值
@@ -240,6 +240,7 @@ VM 和 K8S 产物完全物理隔离，API 层透明合并。
 | GET | `/api/scaling-tasks/<id>` | 查询调配任务 |
 | POST | `/api/scaling-tasks/<id>/confirm` | 确认 resize |
 | GET | `/api/resources/<id>/scaling-history` | 资源调配历史 |
+| GET | `/api/scaling-history` | 全部资源调配记录（分页、搜索、前后规格） |
 | GET/PUT | `/api/cluster-configs` | 集群配置读写 |
 | GET/PUT | `/api/system-config` | 统一运行配置读写（含预测模型开关） |
 | POST | `/api/cluster-configs/k8s-diagnose` | 诊断 K8S Prometheus 连通性 |
@@ -282,6 +283,8 @@ python -m pytest -q
 | [docs/api-reference.md](docs/api-reference.md) | API 端点详细参数、请求体格式、curl 使用示例 |
 | [docs/scaling-effects.md](docs/scaling-effects.md) | 调配成效口径、前后实测证据、页面与报告导出 |
 | [docs/forecast-accuracy.md](docs/forecast-accuracy.md) | 预测准确性口径、容差达标率、真实兑现与报告快照 |
+| [docs/model-training-validation.md](docs/model-training-validation.md) | Prophet/LSTM 内网训练、断点续训、时间切分与准确性验证操作指南 |
+| [docs/lstm-online.md](docs/lstm-online.md) | 已训练 LSTM 接入在线候选、配置、时间泄漏保护与失效兜底 |
 | [docs/parallel-prediction.md](docs/parallel-prediction.md) | 万级资源多核配置、任务队列、阶段耗时与吞吐基准 |
 | [docs/sqlite-compatibility.md](docs/sqlite-compatibility.md) | 保留原生SQLite 3.7.17的兼容实现与部署验证 |
 | [docs/development.md](docs/development.md) | 测试策略、代码约定、Provider 接口、安全规范、常见问题 |

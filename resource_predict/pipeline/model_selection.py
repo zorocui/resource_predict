@@ -11,12 +11,17 @@ def choose_best_method(
 ) -> str:
     """从候选方法中选出最优方法。
 
-    正常情况按 selection_rmse 最小；存在异常时优先鲁棒候选
+    利用率按验证达标率优先、验证 RMSE 次之。绝对使用量按 selection_rmse 最小；存在异常时优先鲁棒候选
     (ensemble / seasonal_naive / rolling_mean)。
     """
     candidates = list(metrics_by_method.keys())
     if not candidates:
         raise ValueError("no forecast candidates")
+    if all("validation_accuracy" in metrics_by_method[method] for method in candidates):
+        return min(candidates, key=lambda method: (
+            -metrics_by_method[method]["validation_accuracy"],
+            metrics_by_method[method]["selection_rmse"],
+        ))
     best = min(
         candidates,
         key=lambda k: metrics_by_method[k].get("selection_rmse", metrics_by_method[k].get("rmse", float("inf"))),

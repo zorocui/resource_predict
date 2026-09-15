@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,8 @@ def create_scaling_task(
     task = {
         "task_id": task_id,
         "resource_id": resource_id,
+        "resource_type": resource_type_of(resource),
+        "before_spec": deepcopy(resource.get("spec", {})),
         "mode": mode,
         "operator": operator,
         "allow_create_flavor": bool(allow_create_flavor),
@@ -310,6 +313,31 @@ def get_history(resource_id: str, limit: int = 20) -> List[Dict[str, Any]]:
     rows = [x for x in _read_tasks() if str(x.get("resource_id")) == rid]
     rows.sort(key=lambda x: int(x.get("created_at_ms", 0)), reverse=True)
     return rows[: max(1, min(limit, 100))]
+
+
+def list_history(*, page: int = 1, page_size: int = 20, query: str = "") -> Dict[str, Any]:
+    """分页返回全部资源的已保留记录，不携带命令输出。"""
+    page_size = max(1, min(page_size, 100))
+    query = query.strip().lower()
+    rows = [row for row in _read_tasks() if not query or query in str(row.get("resource_id", "")).lower()]
+    rows.sort(key=lambda row: (int(row.get("created_at_ms", 0)), str(row.get("task_id", ""))), reverse=True)
+    total = len(rows)
+    page = max(1, min(page, max(1, (total + page_size - 1) // page_size)))
+    items = []
+    for row in rows[(page - 1) * page_size:page * page_size]:
+        plan = row.get("plan") or {}
+        local = row.get("local_update") or {}
+        item = {key: row.get(key) for key in (
+            "task_id", "resource_id", "mode", "operator", "status", "phase", "created_at_ms",
+            "updated_at_ms", "finished_at_ms", "before_spec", "error",
+        )}
+        item.update(resource_type=row.get("resource_type") or plan.get("resource_type"),
+                    cluster=plan.get("cluster") or (row.get("before_spec") or {}).get("cluster"),
+                    action=plan.get("action"), target_spec=plan.get("target_spec") or {},
+                    effective_spec=local.get("effective_spec") or {},
+                    snapshot_error=local.get("error") or "")
+        items.append(item)
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 def get_active_task_for_resource(resource_id: str) -> Optional[Dict[str, Any]]:
@@ -723,6 +751,8 @@ def _patch_task(task_id: str, patch: Dict[str, Any]) -> None:
     for task in tasks:
         if str(task.get("task_id")) == str(task_id):
             task.update(patch)
+            if patch.get("status") in {"success", "failed"}:
+                task["finished_at_ms"] = int(patch.get("updated_at_ms") or _now_ms())
             if patch.get("status") in {"success", "failed"} and task.get("mode") == "execute":
                 try:
                     from resource_predict.pipeline.output_paths import scope_for_resource, scoped_out_dir
@@ -782,4 +812,3 @@ def _trim_for_log(value: Any, *, limit: int = 1200) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "...<truncated>"
-

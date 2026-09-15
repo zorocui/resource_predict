@@ -134,8 +134,12 @@ def _recommend_k8s_policy(
         target_util = _target_utilization(tier, action)
         target = float(base) * load / target_util
         if action == "scale_in_candidate":
+            # 容器缩容保底：100m CPU、128Mi 内存（以 GiB 存储）。
+            minimum = 0.1 if metric == "cpu" else 0.125
+            if float(base) <= minimum:
+                continue
             floor_ratio = 0.5 if tier != "aggressive" else 0.35
-            target = max(float(base) * floor_ratio, min(float(base), target))
+            target = max(minimum, float(base) * floor_ratio, min(float(base), target))
         else:
             # Scale-out: per-replica target stays at base. Replicas already
             # absorb the headroom in _recommend_replicas, so increasing
@@ -321,7 +325,7 @@ def _recommend_replicas(
     target = max(1, min(current - 1, target)) if current > 1 else 1
     max_reduction = max(0.0, min(1.0, float(settings.decision.scale_in_max_reduction_ratio)))
     min_step_target = int(np.ceil(float(current) * (1.0 - max_reduction)))
-    target = max(target, min_step_target, 1)
+    target = max(target, min_step_target, 2 if current > 1 else 1)
     if target >= current:
         return None
     return {

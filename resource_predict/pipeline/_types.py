@@ -17,6 +17,7 @@ class WorkerContext:
         "existing_partial_ids",
         "sample_interval_seconds",
         "max_interpolation_gap_steps",
+        "lstm_checkpoint",
     )
 
     def __init__(
@@ -41,3 +42,7 @@ class WorkerContext:
         self.existing_partial_ids = existing_partial_ids
         self.sample_interval_seconds = sample_interval_seconds
         self.max_interpolation_gap_steps = max_interpolation_gap_steps
+        self.lstm_checkpoint = None
+        if "lstm" in active_methods:
+            from resource_predict.core.saved_lstm import pin_checkpoint
+            self.lstm_checkpoint = pin_checkpoint(forecast_config.get("lstm_model_path", ""))

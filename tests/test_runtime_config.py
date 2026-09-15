@@ -22,7 +22,9 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(payload["collection"]["rate_window"], "15m")
         self.assertEqual(payload["collection"]["retention_days"], 30)
         self.assertNotIn("fail_fast", payload["collection"])
-        self.assertEqual(sum(len(v) for v in payload.values()), 29)
+        self.assertEqual(sum(len(v) for v in payload.values()), 31)
+        self.assertEqual(payload["prediction"]["lstm_model_path"], "")
+        self.assertNotIn("lstm", payload["prediction"]["enabled_methods"])
 
     def test_retention_days_must_be_positive_integer(self):
         for invalid in (0, -1, True, 30.5, "30"):

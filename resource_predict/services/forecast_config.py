@@ -13,6 +13,7 @@ SUPPORTED_FORECAST_METHODS: tuple[dict[str, str], ...] = (
     {"key": "prophet", "label": "Prophet"},
     {"key": "seasonal_naive", "label": "Seasonal naive"},
     {"key": "rolling_mean", "label": "Rolling mean"},
+    {"key": "lstm", "label": "LSTM（已训练模型）"},
 )
 DEFAULT_FORECAST_CONFIG_PATH = Path("deploy") / "forecast_config.json"
 
@@ -29,6 +30,8 @@ def default_forecast_config_payload() -> Dict[str, Any]:
     return {
         "enabled_methods": list(settings.forecast.enabled_methods),
         "enable_ensemble": bool(settings.forecast.enable_ensemble),
+        "lstm_model_path": settings.forecast.lstm_model_path,
+        "lstm_max_age_hours": settings.forecast.lstm_max_age_hours,
         "reuse_backtest_model_for_future": False,
         "prophet_routing_enabled": bool(settings.forecast.prophet_routing_enabled),
         "prophet_routing_mode": settings.forecast.prophet_routing_mode,
@@ -69,6 +72,8 @@ def normalize_forecast_config_payload(payload: Any) -> Dict[str, Any]:
     return {
         "enabled_methods": enabled_methods,
         "enable_ensemble": bool(payload.get("enable_ensemble", settings.forecast.enable_ensemble)),
+        "lstm_model_path": payload.get("lstm_model_path", settings.forecast.lstm_model_path),
+        "lstm_max_age_hours": payload.get("lstm_max_age_hours", settings.forecast.lstm_max_age_hours),
         "reuse_backtest_model_for_future": False,
         "prophet_routing_enabled": bool(
             payload.get("prophet_routing_enabled", settings.forecast.prophet_routing_enabled)

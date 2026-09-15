@@ -14,6 +14,7 @@
 | `test_scaling_executor.py` | 调配计划构建、flavor 选择、命令生成 |
 | `test_scaling_api.py` | 调配 API 端点 |
 | `test_scaling_tasks.py` | 任务生命周期管理 |
+| `test_scaling_history.py` | 全局记录分页、搜索、历史规格冻结与完成时间 |
 | `test_scaling_security.py` | 命令注入防护、安全校验 |
 | `test_output_health.py` | 产物健康检查逻辑 |
 | `test_output_isolation.py` | VM / K8S 产物隔离 |
@@ -37,6 +38,18 @@ python -m pytest tests/test_forecasting.py -q
 # 单个用例
 python -m pytest tests/test_forecasting.py::test_function_name -q
 ```
+
+## 导出单个 Workload 的准确率诊断数据
+
+在项目根目录运行（脚本仅依赖 Python 标准库，可单独复制到服务器）：
+
+```bash
+python tools/export_workload_diagnostics.py
+# 或直接指定名称、产物目录
+python tools/export_workload_diagnostics.py my-workload --out-dir outputs/k8s --dest diagnostics
+```
+
+省略名称时交互输入；重名时列出完整资源 ID，使用完整 ID 重试。ZIP 只包含选中资源的摘要、预测详情、raw、raw 索引引用、准确率汇总和导出说明，不读取全量 manifest 或集群连接配置，不触发采集/预测。缺失准确率汇总会提示；源文件在导出期间变化会中止。原始观测与准确率独立测试可能来自不同次运行或预处理流程，包内保留时间及校验信息，不能仅凭导出时间认定它们属于同次预测。复制脚本到项目根目录时，命令改为 `python export_workload_diagnostics.py`。
 
 ## 回归检查
 
@@ -80,7 +93,10 @@ python -m benchmarks.resource_detail_benchmark --resources 1000 --points 2016 --
 - 时间戳：API/payload 层使用毫秒级 Unix int；内部使用 pandas `DatetimeIndex`
 - `predict_only=True` 模式绝不修改 `raw_index.json` 或 `raw/` 资源分片
 - 不提交 `outputs/`、日志、缓存、`__pycache__`、本地凭据文件
+- 风险队列根据 `spec.last_scaled_at_epoch_ms` 显示“已调配”标记，悬停显示北京时间的最近成功调配时间。预检、失败任务不会设置该时间；标记不随冷却期结束消失，也不代表当前建议可以忽略。缺少历史时间的旧资源不会推断为已调配。
+- “调配记录”页展示全部资源已保留的任务（包括预检，任务文件仍最多1000条），不依赖风险队列选中资源。新任务创建时冻结 `before_spec`，终态记录 `finished_at_ms`；历史字段缺失显示“未记录”。`GET /api/scaling-history` 返回分页 `items/total/page/page_size`，只传规格、时间、结果等展示字段，不传 SSH 命令和输出。失败、预检和执行中的记录显示目标规格，成功后的规格仅代表命令结果，监控确认仍以调配成效为准。
 - 调配快照写入 raw 时使用 `defer_cleanup=True`，不在调配线程扫描或删除旧分片。同目录请求合并，距最后一次提交约300秒后由后台守护线程清理；常规采集提交仍可回收过期分片。扫描不持有写锁，删除前在锁内核对最新索引，保留当前引用和300秒宽限期内的文件。进程退出可中止待清理任务，后续数据提交继续回收，不影响已提交数据。
+- 调配快照仅回写详情分片、摘要和目标资源 raw 数据，使用 `ingest_scaling_evidence=False`，不重复处理旧采集证据；常规采集仍默认更新成效证据。调配不读取或重写 `manifest.json`，返回的 `manifest_updated` 为 `false`。manifest 保留预测生成时的规格与建议，由下一次预测产物写出时更新，不代表实时规格；实时规格应通过资源 API 获取。排查“正在同步本地快照”时，检查 `[scaling] snapshot stage` 日志中的 `waiting_lock`、`detail`、`summary`、`raw` 及各阶段 `elapsed_seconds`。
 
 ## 资源类型系统
 

@@ -28,6 +28,9 @@ def _resource(resource_id, base):
 
 def _forecast_item(resource_id):
     block = {
+        "x_test_ms": (pd.date_range("2026-01-01 06:00", periods=2, freq="h").asi8 // 1_000_000).tolist(),
+        "test_end_ms": int(pd.Timestamp("2026-01-01 07:00").value // 1_000_000),
+        "sample_interval_seconds": 3600,
         "preds": {"rolling_mean": [0.2, 0.2]},
         "x_pred_ms": [1, 2],
         "preds_future": {"rolling_mean": [0.2]},

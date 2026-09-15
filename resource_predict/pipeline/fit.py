@@ -21,7 +21,7 @@ from resource_predict.pipeline.series_utils import compute_metrics
 from resource_predict.settings import settings
 
 logger = logging.getLogger(__name__)
-MODEL_VERSION = "forecast-baseline-v2"
+MODEL_VERSION = "forecast-baseline-v3"
 
 
 def canonical_future_index(
@@ -45,6 +45,7 @@ def fit_one_metric(
     y_full: pd.Series,
     *,
     ctx: WorkerContext,
+    identity: Optional[Dict[str, str]] = None,
 ) -> tuple[Dict[str, pd.Series], Dict[str, Dict[str, float]], str, Dict[str, pd.Series], Dict[str, float], Dict[str, Any]]:
     """Select on training-only validation, test once, refit on current data.
 
@@ -57,12 +58,20 @@ def fit_one_metric(
     phase_failures: Dict[str, Dict[str, str]] = {}
     started_ms = int(time.time() * 1000)
     future_index = canonical_future_index(y_full.index, ctx.future_steps, ctx.sample_interval_seconds)
+    identity = identity or y_full.attrs.get("forecast_identity")
+    lstm_metadata = {}
 
     def predict(method, history, index, phase):
         started = time.perf_counter()
         try:
-            result = forecast_by_method(method, history, len(index))
-            pred = result.yhat.copy()
+            if method == "lstm":
+                from resource_predict.core.saved_lstm import forecast_saved_lstm
+                pred, metadata = forecast_saved_lstm(history, index, identity, ctx.lstm_checkpoint,
+                                                     ctx.forecast_config.get("lstm_max_age_hours", 168))
+                lstm_metadata.update(metadata)
+            else:
+                result = forecast_by_method(method, history, len(index))
+                pred = result.yhat.copy()
             if len(pred) != len(index) or not np.isfinite(pred.to_numpy(dtype=float)).all():
                 raise ValueError("forecast length mismatch or non-finite prediction")
             pred.index = index
@@ -92,12 +101,15 @@ def fit_one_metric(
     validation, evaluation = validation_backtest_metrics(
         y_train, methods, test_size=ctx.test_size, folds=int(cfg.rolling_backtest_folds),
         enable_ensemble=enable_ensemble, predict=predict,
+        accuracy_ratio=bool(y_full.attrs.get("accuracy_ratio", True)),
     )
     if validation:
         selected = choose_best_method(metrics_by_method=validation, anomaly=anom)
         selection_status = "validated"
     else:
-        selected = next((m for m in ("seasonal_naive", "rolling_mean") if m in methods), methods[0])
+        eligible = [m for m in methods if m != "lstm"]
+        selected = next((m for m in ("seasonal_naive", "rolling_mean") if m in eligible),
+                        eligible[0] if eligible else "rolling_mean")
         selection_status = "insufficient_validation_history" if not fold_count else "validation_failed"
 
     weights = {m: validation[m] for m in methods if m in validation}
@@ -144,6 +156,8 @@ def fit_one_metric(
     configuration = {"algorithm": asdict(cfg), "runtime": ctx.forecast_config,
                      "active_methods": ctx.active_methods, "test_size": ctx.test_size,
                      "future_steps": ctx.future_steps, "sample_interval_seconds": ctx.sample_interval_seconds}
+    if "lstm" in methods:
+        configuration["lstm_checkpoint"] = ctx.lstm_checkpoint
     config_hash = hashlib.sha256(json.dumps(configuration, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     evaluation.update(
         role="independent_test", selection_status=selection_status,
@@ -153,8 +167,11 @@ def fit_one_metric(
         routing_train_end_ms=int(route_history.index[-1].value // 1_000_000),
         ensemble_weight_scores={m: weights[m]["selection_rmse"] for m in ensemble_members},
         validation_metrics=validation,
+        selection_criterion="validation_accuracy_then_rmse" if y_full.attrs.get("accuracy_ratio", True) else "validation_rmse",
     )
     diagnostics = {
+        "saved_lstm": {**lstm_metadata, "eligible_for_selection": "lstm" in validation,
+                       "checkpoint": ctx.lstm_checkpoint} if "lstm" in methods else {},
         "anomaly_profile": anom,
         "routing": {"selected_method": selected, "actual_future_method": best,
                     "route": anom.get("route", "normal"), "reason": selection_status},
@@ -173,4 +190,10 @@ def fit_one_metric(
             "ensemble_members": ensemble_members if "ensemble" in future else [],
         },
     }
+    if lstm_metadata:
+        diagnostics["provenance"]["model_training"] = {"lstm": lstm_metadata}
+        if best == "lstm":
+            diagnostics["provenance"]["model_version"] = lstm_metadata["model_version"]
+            diagnostics["provenance"]["train_end_ms"] = lstm_metadata["train_end_exclusive_ms"] - 1
+            diagnostics["provenance"]["train_end_is_upper_bound"] = True
     return preds, metrics, best, future, timing, diagnostics

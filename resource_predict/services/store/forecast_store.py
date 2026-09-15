@@ -342,7 +342,7 @@ def _chart_payload_stats(detail: Dict[str, Any]) -> tuple[int, int]:
             if isinstance(block, dict):
                 points += sum(
                     len(block.get(key, []))
-                    for key in ("y_train", "y_test")
+                    for key in ("y_train", "y_test", "y_observed")
                     if isinstance(block.get(key), list)
                 )
     containers = detail.get("container_charts", {})
@@ -354,7 +354,7 @@ def _chart_payload_stats(detail: Dict[str, Any]) -> tuple[int, int]:
                 if isinstance(block, dict):
                     points += sum(
                         len(block.get(key, []))
-                        for key in ("y_train", "y_test")
+                        for key in ("y_train", "y_test", "y_observed")
                         if isinstance(block.get(key), list)
                     )
     payload = {

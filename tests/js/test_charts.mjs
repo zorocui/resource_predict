@@ -42,7 +42,52 @@ const {
 
 const T0 = 1_800_000_000_000;
 const HOUR = 60 * 60 * 1000;
+
+test("post-forecast observations use a separate line without moving test predictions", () => {
+  const option = buildChartOption({best_method:"rolling_mean", x_train_ms:[T0], y_train:[.2],
+    x_test_ms:[T0+HOUR], y_test:[.3], test_end_ms:T0+HOUR,
+    preds:{rolling_mean:[.31]}, x_pred_ms:[T0+2*HOUR], preds_future:{rolling_mean:[.4]},
+    x_observed_ms:[T0+2*HOUR,T0+3*HOUR], y_observed:[.42,.43], sample_interval_seconds:3600}, "cpu");
+  const observed = option.series.find(s => s.name === "预测后实际观测");
+  assert.ok(observed);
+  assert.deepEqual(observed.data.map(p => p[0]), [T0+2*HOUR,T0+3*HOUR]);
+  assert.ok(option.series.find(s => s.name === "测试").data.every(p => p[0] <= T0+HOUR));
+  assert.ok(option.legend.data.includes("预测后实际观测"));
+});
 const times = Array.from({ length: 9 }, (_, index) => T0 + index * HOUR);
+
+test("VM and Workload apply every time range and keep future predictions", () => {
+  const app = window.ResourcePredictApp;
+  const previousRange = app.chartRangeKey;
+  const previousIsK8s = window.ResourceList.isK8s;
+  window.ResourceList.isK8s = (resource) => resource.resource_type === "k8s_workload";
+  const history = Array.from({ length: 10 * 24 }, (_, index) => T0 + index * HOUR);
+  const boundary = T0 + 10 * 24 * HOUR;
+  const data = {
+    x_train_ms: history, y_train: history.map(() => 0.2),
+    x_test_ms: [boundary], y_test: [0.3],
+    preds: { rolling_mean: [0.31] },
+    x_pred_ms: [boundary + HOUR, boundary + 2 * HOUR],
+    preds_future: { rolling_mean: [0.32, 0.33] },
+    best_method: "rolling_mean",
+  };
+  try {
+    for (const [range, hours] of [["24h", 24], ["3d", 72], ["7d", 168], ["all", null]]) {
+      app.chartRangeKey = range;
+      const vmOption = buildChartOption(data, "cpu", "percent", { resource_type: "openstack_vm" });
+      const workloadOption = buildChartOption(data, "cpu", "percent", { resource_type: "k8s_workload" });
+      assert.equal(vmOption.xAxis.min, workloadOption.xAxis.min, range);
+      assert.equal(vmOption.xAxis.max, workloadOption.xAxis.max, range);
+      const visibleHistory = vmOption.series.find((series) => series.name === "历史").data;
+      const expectedStart = hours === null ? T0 : boundary + HOUR - hours * HOUR;
+      assert.equal(visibleHistory[0][0], expectedStart, range);
+      assert.ok(vmOption.series.some((series) => series.data?.some((point) => point[0] === boundary + 2 * HOUR)), range);
+    }
+  } finally {
+    app.chartRangeKey = previousRange;
+    window.ResourceList.isK8s = previousIsK8s;
+  }
+});
 
 test("detail advice renders backend scores, real zero, unknown and legacy without inferred formulas", () => {
   const app = {

@@ -342,6 +342,45 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
         self.assertEqual(advice["target_spec"]["memory_request_gb"], 0.5)
         self.assertGreater(advice["target_spec"]["replicas"], 2)
 
+    def test_container_scale_in_stops_at_minimum(self):
+        from resource_predict.core.k8s_workload_decision import _recommend_k8s_policy
+
+        for tier in ("conservative", "balanced", "aggressive"):
+            for cpu, memory, expected in ((0.15, 0.2, True), (0.1, 0.125, False), (0.05, 0.0625, False)):
+                with self.subTest(tier=tier, cpu=cpu, memory=memory):
+                    policy = _recommend_k8s_policy(
+                        spec=_containers(cpu_request=cpu, memory_request=memory, cpu_limit=cpu * 2, memory_limit=memory * 2),
+                        by_metric={metric: {"p95": 0.0, "peak": 0.0} for metric in ("cpu", "memory")},
+                        metric_actions={metric: "scale_in_candidate" for metric in ("cpu", "memory")},
+                        tier=tier,
+                    )
+                    recs = policy["recommendations"]
+                    if expected:
+                        self.assertEqual(recs["cpu"]["request_cores"], 0.1)
+                        self.assertEqual(recs["memory"]["request_gb"], 0.125)
+                        self.assertGreaterEqual(recs["cpu"]["limit_cores"], 0.1)
+                        self.assertGreaterEqual(recs["memory"]["limit_gb"], 0.125)
+                    else:
+                        self.assertNotIn("cpu", recs)
+                        self.assertNotIn("memory", recs)
+
+    def test_scale_in_minimum_is_applied_per_container(self):
+        futures = {metric: np.zeros(4) for metric in ("cpu_request", "memory_request")}
+        resource = {"resource_type": "k8s_workload", "spec": {
+            "workload_kind": "Deployment", "replicas": 2,
+            "containers": {
+                "app": {"cpu_request_cores": 0.15, "memory_request_gb": 0.2},
+                "sidecar": {"cpu_request_cores": 0.1, "memory_request_gb": 0.125},
+            },
+        }, "data_quality": _quality("good")}
+        advice = build_k8s_workload_advice(futures, resource=resource,
+                                          container_future_values={"app": futures, "sidecar": futures})
+        targets = advice["target_spec"]["containers"]
+        self.assertEqual(targets["app"]["cpu_request_cores"], 0.1)
+        self.assertEqual(targets["app"]["memory_request_gb"], 0.125)
+        self.assertNotIn("sidecar", targets)
+        self.assertNotIn("replicas", advice["target_spec"])
+
     def test_scale_in_preserves_small_spec_granularity(self):
         resource = {
             "resource_id": "k8s:cluster:ns:deployment:api",
@@ -568,6 +607,33 @@ class K8SWorkloadDecisionTest(unittest.TestCase):
 
         self.assertEqual(advice["action"], "scale_in_candidate")
         self.assertEqual(advice["target_spec"]["replicas"], 3)
+
+    def test_replica_scale_in_preserves_two_replicas(self):
+        for kind in ("Deployment", "StatefulSet", "ReplicaSet"):
+            for current, expected in ((1, None), (2, None), (3, 2), (4, 2), (6, 3)):
+                with self.subTest(kind=kind, current=current):
+                    advice = build_k8s_workload_advice(
+                        {
+                            "cpu_request": np.array([0.01, 0.01, 0.01]),
+                            "memory_request": np.array([0.01, 0.01, 0.01]),
+                        },
+                        resource={
+                            "resource_type": "k8s_workload",
+                            "spec": {
+                                "workload_kind": kind,
+                                "replicas": current,
+                                **_containers(cpu_request=4.0, memory_request=4.0),
+                            },
+                            "data_quality": _quality("good"),
+                        },
+                    )
+                    self.assertEqual(advice["action"], "scale_in_candidate")
+                    self.assertEqual(advice["target_spec"].get("replicas"), expected)
+                    recommendation = advice["target_k8s_policy"]["recommendations"].get("replicas")
+                    if expected is None:
+                        self.assertIsNone(recommendation)
+                    else:
+                        self.assertEqual(recommendation["target_replicas"], expected)
 
     def test_daemonset_policy_does_not_recommend_replica_scaling(self):
         resource = {

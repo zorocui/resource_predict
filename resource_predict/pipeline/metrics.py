@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional
 
 import pandas as pd
+from resource_predict.core.accuracy import tolerance_hit
 
 from resource_predict.pipeline.forecasting import ensemble_series
 from resource_predict.pipeline.series_utils import compute_metrics
@@ -17,6 +18,7 @@ def validation_backtest_metrics(
     folds: int,
     enable_ensemble: bool,
     predict: Callable[[str, pd.Series, pd.DatetimeIndex, str], Optional[pd.Series]],
+    accuracy_ratio: bool = True,
 ) -> tuple[Dict[str, Dict[str, float]], Dict[str, object]]:
     """Score expanding folds, with ensemble weights learned on earlier folds.
 
@@ -29,6 +31,7 @@ def validation_backtest_metrics(
     predictions: Dict[str, List[pd.Series]] = {}
     scores: Dict[str, Dict[str, float]] = {}
     windows = []
+    fold_accuracies: Dict[str, List[float]] = {}
     for fold in reversed(range(count)):
         end = len(history) - fold * test_size
         start = end - test_size
@@ -58,6 +61,15 @@ def validation_backtest_metrics(
                 "selection_rmse": (0.65 * latest["rmse"] + 0.35 * pooled["rmse"])
                 if n > 1 else pooled["rmse"],
             }
+            if accuracy_ratio:
+                hits = sum(tolerance_hit(float(actual), float(predicted)) for actual, predicted in zip(valid, pred))
+                fold_accuracies.setdefault(method, []).append(hits / len(valid))
+                pooled_hits = sum(tolerance_hit(float(actual), float(predicted))
+                                  for actual, predicted in zip(pd.concat(truths[method]), pd.concat(predictions[method])))
+                points = sum(len(truth) for truth in truths[method])
+                scores[method].update(validation_accuracy=pooled_hits / points,
+                                      validation_hit_points=float(pooled_hits), validation_valid_points=float(points),
+                                      validation_worst_accuracy=min(fold_accuracies[method]))
             if n > 1:
                 scores[method].update(rolling_rmse=pooled["rmse"], rolling_mae=pooled["mae"],
                                       rolling_folds=float(n))
@@ -66,4 +78,5 @@ def validation_backtest_metrics(
                 if values["validation_folds"] == count}
     return complete, {"validation_windows": windows, "validation_folds_requested": max(1, folds),
                       "validation_folds_available": count,
+                      "validation_fold_accuracies": fold_accuracies,
                       "incomplete_validation_methods": sorted(set(scores) - set(complete))}

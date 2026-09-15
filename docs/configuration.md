@@ -127,7 +127,9 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 
 | 字段 | 作用 |
 | --- | --- |
-| `enabled_methods` | 参与竞选的候选模型，取值 `arima` / `sarima` / `prophet` / `seasonal_naive` / `rolling_mean`，至少一个。 |
+| `enabled_methods` | 参与竞选的候选模型，取值 `arima` / `sarima` / `prophet` / `seasonal_naive` / `rolling_mean` / `lstm`，至少一个。 |
+| `lstm_model_path` | 离线 model.pt 路径；默认空，启用 lstm 时必填。在线只加载推理，支持训练产物 v2/v3。 |
+| `lstm_max_age_hours` | 最大训练滞后小时数，默认 168，0 不限制；过期使该候选失败，不触发在线训练。 |
 | `enable_ensemble` | `true` 表示在至少两个模型完成验证时生成集成候选。独立测试和未来预测的权重只来自训练段内验证分数；首个验证折等权，后续验证折使用此前折的分数。 |
 | `parallel_backend` | 默认 `auto`，可选 `process`/`thread`/`serial`；auto对重模型选择多进程，轻量模型选择线程。 |
 | `max_workers` | 默认 `0` 自动按可用CPU规划；1–256为显式上限，实际受CPU配额和任务数约束。 |
@@ -142,7 +144,7 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 | `reuse_backtest_model_for_future` | `False` | 已停用的兼容读取字段，旧输入 `True` 也不会启用延伸预测。未来预测始终用最新完整历史重新拟合。 |
 | `prophet_routing_enabled` | `True` | `True` 表示仅在轻量统计特征显示存在明显趋势或季节性时运行 Prophet。若 Prophet 是唯一启用模型，则仍会运行。 |
 | `prophet_routing_mode` | `auto` | `auto` 使用自动路由规则，`always` 表示启用 Prophet 时总是运行，`never` 表示存在其他兜底模型时跳过 Prophet。 |
-| `rolling_backtest_folds` | `1` | 训练段内的时间验证折数；每折长度等于 `test_size`，外层独立测试另计。多折时选型分数为 `0.65 × 最近验证折RMSE + 0.35 × 全部验证残差RMSE`。不足折数时记录实际折数；候选须完成全部可用折。 |
+| `rolling_backtest_folds` | `3` | 训练段内的时间验证折数；每折长度等于 `test_size`，外层独立测试另计。利用率按汇总容差达标率优先，相同时比较 RMSE；绝对使用量继续按 RMSE。多折 RMSE 分数为 `0.65 × 最近验证折RMSE + 0.35 × 全部验证残差RMSE`。不足折数时记录实际折数；候选须完成全部可用折。增加折数会增加验证计算量。 |
 | `anomaly_route_zscore_threshold` | `3.5` | 近期鲁棒 z-score 超过该值时，最优选择收窄到 `ensemble` / `seasonal_naive` / `rolling_mean`。 |
 
 旧版 `deploy/forecast_config.json` 已从仓库和工作区移除，预测流程也不再读取它。
@@ -151,6 +153,8 @@ export K8S_PROMETHEUS_CLUSTERS='{"cluster-k8s-a":"http://127.0.0.1:9090"}'
 和 `enable_ensemble` 作为初始值。部署包不会打包该文件，因此全新部署不会触发迁移。
 
 ## 全局默认配置（`resource_predict/settings.py`）
+
+已训练 LSTM 的身份匹配、离线验证标签隔离、模型缓存和兜底规则见 [lstm-online.md](lstm-online.md)。
 
 `settings.py` 已精简为启动设置，只保留静态/模板/输出目录、日志和 Flask host/port/debug。
 业务运行配置请在 Web 的“系统配置”页面修改，保存到 `deploy/runtime_config.json` 后立即对新任务生效。
@@ -233,7 +237,7 @@ HTTP 层重试之外还有一层整轮重试：某个集群查询成功但聚合
 | --- | --- | --- |
 | `AppConfig` | `host` / `port` / `out_dir` / `log_file` / `debug` | `0.0.0.0` / `5000` / `outputs` / `resource_predict.log` / `False` |
 | `GenerationConfig` | `default_test_size` / `default_future_steps` / `freq` / `detail_chunk_size` / `detail_history_points_default` / `detail_history_points_max` / `raw_resource_cache_items` | `72` / `24` / `h` / `25` / `1000` / `10000` / `100` |
-| `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `1` / `False` / `True` / `auto` / `3.5` |
+| `ForecastConfig` | `enabled_methods` / `enable_ensemble` / `rolling_backtest_folds` / `reuse_backtest_model_for_future` / `prophet_routing_enabled` / `prophet_routing_mode` / `anomaly_route_zscore_threshold` | `("seasonal_naive", "prophet")` / `False` / `3` / `False` / `True` / `auto` / `3.5` |
 | `DecisionConfig` | `scale_out_threshold` / `scale_in_threshold` / `scale_in_max_reduction_ratio` / `scale_out_confirmations` / `scale_in_confirmations` / `action_gate_state_retention_days` | `0.8` / `0.2` / `0.5` / `2` / `3` / `30` |
 | `UpdateConfig` | `enabled` / `interval_minutes` / `sliding_window` | `False` / `60` / `False` |
 | `K8SPrometheusConfig` | `history_days` / `incremental_overlap_minutes` / `step_seconds` / `rate_window` / `scheduled_update_enabled` / `scheduled_update_interval_minutes` / `range_query_chunk_hours` / `request_max_attempts` / `retry_backoff_seconds` / `max_interpolation_gap_steps` | `7` / `60` / `600` / `15m` / `True` / `360` / `24` / `3` / `1.0` / `3` |

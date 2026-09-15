@@ -146,13 +146,11 @@
     return bucket;
   }
 
-  function resolveChartWindow(xTrain, xTest, xPredFuture, isVm) {
+  function resolveChartWindow(xTrain, xTest, xPredFuture) {
     const allTimes = collectTimes([xTrain, xTest, xPredFuture]);
     if (!allTimes.length) return { min: undefined, max: undefined, spanMs: 0 };
     const fullMin = allTimes[0];
     const fullMax = allTimes[allTimes.length - 1];
-    // VM 资源始终显示全部原始数据
-    if (isVm) return { min: fullMin, max: fullMax, spanMs: fullMax - fullMin };
     const selectedRange = chartRange();
     if (!selectedRange.durationMs) {
       return { min: fullMin, max: fullMax, spanMs: fullMax - fullMin };
@@ -474,6 +472,8 @@
     const yTrain = Array.isArray(chartData.y_train) ? chartData.y_train : [];
     const xTest = Array.isArray(chartData.x_test_ms) ? chartData.x_test_ms : [];
     const yTest = Array.isArray(chartData.y_test) ? chartData.y_test : [];
+    const xObserved = Array.isArray(chartData.x_observed_ms) ? chartData.x_observed_ms : [];
+    const yObserved = Array.isArray(chartData.y_observed) ? chartData.y_observed : [];
     const xPredFuture = Array.isArray(chartData.x_pred_ms) ? chartData.x_pred_ms : [];
     const emittedTestEnd = normalizeTsMs(chartData.test_end_ms);
     const testEndMs = Number.isFinite(emittedTestEnd) ? emittedTestEnd : lastValidTimestamp(xTest);
@@ -487,7 +487,7 @@
     const anchorVal = yTrain.length ? yTrain[yTrain.length - 1] : null;
     const rawTrainPairs = toPairs(xTrain, yTrain);
     const rawTestPairs = toPairs(anchorTs == null ? xTest : [anchorTs].concat(xTest), anchorVal == null ? yTest : [anchorVal].concat(yTest));
-    const windowInfo = resolveChartWindow(xTrain, xTest, xPredFuture, isVm);
+    const windowInfo = resolveChartWindow(xTrain, xTest.concat(xObserved), xPredFuture);
     const activeMode = chartMode();
     // VM 资源强制显示原始数据模式标题
     const modeLabel = isVm ? "原始" : activeMode.label;
@@ -554,6 +554,15 @@
     });
 
     const legendData = ["历史", "测试"];
+    if (xObserved.length) {
+      legendData.push("预测后实际观测");
+      series.push({
+        name: "预测后实际观测", type: "line",
+        data: prepareSeriesData(toPairs(xObserved, yObserved), windowInfo, isVm, gapConfig),
+        showSymbol: false, sampling: "lttb", connectNulls: false,
+        lineStyle: { color: "#0f766e", width: 2.1 }, itemStyle: { color: "#0f766e" }, z: 3,
+      });
+    }
     const modelNames = new Set([
       ...Object.keys(chartData.preds || {}),
       ...Object.keys(chartData.preds_future || {}),
@@ -564,7 +573,7 @@
       const futurePred = chartData.preds_future?.[m];
       let testPredX = [];
       let testPredY = [];
-      if (anchorTs != null && anchorVal != null) {
+      if (xTest.length && anchorTs != null && anchorVal != null) {
         testPredX.push(anchorTs);
         testPredY.push(anchorVal);
       }
@@ -736,7 +745,7 @@
     const fallback = app.chartDataByKey.get(`${rid}:${metricKey}`);
     const data = activeChartData(resource, metricKey, fallback);
     const observed = [];
-    for (const values of [data?.x_test_ms, data?.x_train_ms]) {
+    for (const values of [data?.x_observed_ms, data?.x_test_ms, data?.x_train_ms]) {
       if (!Array.isArray(values) || !values.length) continue;
       const value = normalizeTsMs(values[values.length - 1]);
       if (Number.isFinite(value)) observed.push(value);
@@ -844,15 +853,13 @@
   }
 
   function chartControlsMarkup(resource) {
-    // VM 资源不显示时间范围和显示模式选择器
-    if (resource && !list.isK8s(resource)) return "";
     return `
       <div class="chart-control-group" aria-label="图表时间范围">
         ${CHART_RANGES.map((option) => chartButton(option, "range")).join("")}
       </div>
-      <div class="chart-control-group" aria-label="图表显示模式">
+      ${resource && !list.isK8s(resource) ? "" : `<div class="chart-control-group" aria-label="图表显示模式">
         ${CHART_MODES.map((option) => chartButton(option, "mode")).join("")}
-      </div>
+      </div>`}
       ${containerSelectorMarkup(resource)}
     `;
   }
@@ -1004,14 +1011,19 @@
           const st = observed || {};
           const metricTitle = `${metricTitleForChart(resource, key, containerName)}${containerName ? ` · ${containerName}` : ""}`;
           const statScope = list.isK8s(resource) ? (containerName ? "Container" : "Workload") : "Resource";
+          const rawUsage = list.isK8s(resource) && isRawMetricMode(key, metricModeForChart(resource, key, containerName));
+          const scopeNote = rawUsage
+            ? `${containerName ? "同名容器跨副本" : "Workload 各副本、各容器"}的使用量先求和，再计算统计时段内的平均、P95 和峰值；不是单副本平均使用量。`
+            : "时间平均：统计时段内各有效采样值的算术平均；P95 和峰值也按同一时段计算。";
           return `<div class="reason-item">
             <span class="reason-metric">${list.escapeHtml(metricTitle)}</span>
             <strong class="reason-action is-${list.escapeHtml(mAction)}">${list.escapeHtml(list.actionLabel(mAction))}</strong>
             <small class="reason-stats">
-              <span><b>平均</b><em>${list.formatStatValue(st.avg, unit)}</em></span>
+              <span title="${list.escapeHtml(scopeNote)}"><b>${rawUsage ? "副本合计·时间平均" : "时间平均"}</b><em>${list.formatStatValue(st.avg, unit)}</em></span>
               <span><b>P95 · ${list.escapeHtml(statScope)}</b><em>${list.formatStatValue(st.p95, unit)}</em></span>
               <span><b>峰值</b><em>${list.formatStatValue(st.peak, unit)}</em></span>
             </small>
+            ${rawUsage ? `<small style="grid-column: 1 / -1">${list.escapeHtml(scopeNote)}</small>` : ""}
           </div>`;
         }).join("")}
       </div>`;

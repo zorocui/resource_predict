@@ -5,11 +5,10 @@ import time
 from pathlib import Path
 
 from resource_predict.data.io import atomic_write_json
+from resource_predict.core.accuracy import RATIO_MODES, tolerance_hit
 from resource_predict.resource_types import resource_type_of
 
 FILENAME = "forecast_accuracy_summary.json"
-RATIO_MODES = {"cpu_usage/cpu_limit", "cpu_usage/cpu_request",
-               "memory_working_set/memory_limit", "memory_working_set/memory_request"}
 
 
 def write_accuracy_summary(directory, items):
@@ -45,9 +44,7 @@ def write_accuracy_summary(directory, items):
                     continue
                 error = abs(predicted-actual)
                 valid += 1
-                tolerance = max(0.05, abs(actual) * 0.05)
-                hits += int(ratio and (error <= tolerance or math.isclose(
-                    error, tolerance, rel_tol=1e-12, abs_tol=1e-15)))
+                hits += int(ratio and tolerance_hit(actual, predicted))
                 error_sum += error * (100 if ratio else 1)
             rows.append(dict(resource_id=item["resource_id"], resource_type=kind,
                              container=container, metric=metric, model=curve["model"],

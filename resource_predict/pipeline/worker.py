@@ -50,8 +50,22 @@ def _iter_container_inputs(
 def iter_metric_inputs(source: dict, ctx: WorkerContext) -> Iterator[tuple[str, str, pd.Series]]:
     """Yield aggregate and eligible container series in the worker's fitting order."""
     for metric in _selected_metrics(source, ctx):
-        yield "", metric, source[metric]
-    yield from _iter_container_inputs(source, metric_names_for_resource(source), ctx)
+        yield "", metric, _with_identity(source[metric], source, "", metric, ctx)
+    for container, metric, series in _iter_container_inputs(source, metric_names_for_resource(source), ctx):
+        yield container, metric, _with_identity(series, source, container, metric, ctx)
+
+
+def _with_identity(series, source, container, metric, ctx):
+    from resource_predict.core.accuracy import RATIO_MODES
+
+    result = series.copy(deep=False)
+    mode = (source.get("container_metric_modes", {}).get(container, {}).get(metric) if container
+            else source.get("spec", {}).get(f"{metric}_metric_mode"))
+    result.attrs = {**series.attrs, "forecast_identity": {
+        "resource_id": str(source["resource_id"]), "resource_type": resource_type_of(source),
+        "container": container, "metric": metric},
+        "accuracy_ratio": resource_type_of(source) == "openstack_vm" or mode in RATIO_MODES}
+    return result
 
 
 def worker(
@@ -74,10 +88,10 @@ def worker(
 
     timing_by_model = {m: 0.0 for m in active_methods}
 
-    metric_sources = {
-        name: (source[name].iloc[:-ctx.test_size], source[name].iloc[-ctx.test_size:], source[name])
-        for name in metric_names
-    }
+    metric_sources = {}
+    for name in metric_names:
+        sequence = _with_identity(source[name], source, "", name, ctx)
+        metric_sources[name] = (sequence.iloc[:-ctx.test_size], sequence.iloc[-ctx.test_size:], sequence)
     metrics_to_fit = _selected_metrics(source, ctx)
 
     if precomputed is not None:
@@ -119,6 +133,7 @@ def worker(
         accuracy_holdout.extend(_holdout_curves(source, "", metric_name,
                                                metric_sources[metric_name][1], pred, diagnostics))
         charts_forecast[metric_name] = {
+            "x_test_ms": to_ms(metric_sources[metric_name][1].index),
             "preds": {m: series_to_lists(pred[m]) for m in pred.keys()},
             "x_pred_ms": to_ms(next(iter(future_pred.values())).index),
             "preds_future": {m: series_to_lists(future_pred[m]) for m in future_pred.keys()},
@@ -248,6 +263,7 @@ def _fit_container_metrics(
     charts: Dict[str, Dict[str, Dict[str, Any]]] = {}
     futures: Dict[str, Dict[str, np.ndarray]] = {}
     for name, metric_name, series in _iter_container_inputs(source, metric_names, ctx):
+        series = _with_identity(series, source, name, metric_name, ctx)
         y_train = series.iloc[:-ctx.test_size]
         y_test = series.iloc[-ctx.test_size:]
         result = (precomputed[(name, metric_name)] if precomputed is not None
@@ -257,6 +273,7 @@ def _fit_container_metrics(
         for method, seconds in timing_part.items():
             timing_by_model[method] = timing_by_model.get(method, 0.0) + float(seconds)
         charts.setdefault(name, {})[metric_name] = {
+            "x_test_ms": to_ms(y_test.index),
             "preds": {m: series_to_lists(pred[m]) for m in pred.keys()},
             "x_pred_ms": to_ms(next(iter(future_pred.values())).index),
             "preds_future": {m: series_to_lists(future_pred[m]) for m in future_pred.keys()},

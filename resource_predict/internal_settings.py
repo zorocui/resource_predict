@@ -77,7 +77,9 @@ class GenerationConfig:
 
 @dataclass(frozen=True)
 class ForecastConfig:
-    # 启用的预测模型集合；可包含 arima、sarima、prophet、seasonal_naive、rolling_mean。
+    lstm_model_path: str = ""
+    lstm_max_age_hours: int = 168
+    # 启用的预测模型集合；lstm 只加载离线 model.pt，不进行在线训练。
     enabled_methods: Tuple[str, ...] = ("seasonal_naive", "prophet")
     # 预测使用率上限裁剪模式：auto_train_max 会参考训练集最大值自动放宽。
     usage_clip_upper_mode: str = "auto_train_max"
@@ -98,7 +100,7 @@ class ForecastConfig:
     # Prophet 季节性强度先验；越大季节性曲线越灵活。
     prophet_seasonality_prior_scale: float = 10.0
     # 训练段内的验证折数；外层独立测试窗口不参与选型。
-    rolling_backtest_folds: int = 1
+    rolling_backtest_folds: int = 3
     # 是否加入按误差倒数加权的集成候选模型。
     enable_ensemble: bool = False
     # 旧字段仅用于兼容配置读取；在线预测始终使用最新完整历史重新拟合。
@@ -313,6 +315,8 @@ class SettingsProxy:
             _internal_settings.forecast,
             enabled_methods=cfg.enabled_methods,
             enable_ensemble=cfg.enable_ensemble,
+            lstm_model_path=cfg.lstm_model_path,
+            lstm_max_age_hours=cfg.lstm_max_age_hours,
         )
 
     @property

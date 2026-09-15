@@ -15,7 +15,7 @@ import pandas as pd
 
 RUNTIME_CONFIG_PATH = Path("deploy") / "runtime_config.json"
 LEGACY_FORECAST_CONFIG_PATH = Path("deploy") / "forecast_config.json"
-SUPPORTED_FORECAST_METHODS = ("arima", "sarima", "prophet", "seasonal_naive", "rolling_mean")
+SUPPORTED_FORECAST_METHODS = ("arima", "sarima", "prophet", "seasonal_naive", "rolling_mean", "lstm")
 SUPPORTED_POLICY_TIERS = ("conservative", "balanced", "aggressive")
 
 
@@ -50,6 +50,8 @@ class PredictionConfig:
     workload_future_duration: str = "24h"
     enabled_methods: tuple[str, ...] = ("seasonal_naive", "prophet")
     enable_ensemble: bool = False
+    lstm_model_path: str = ""
+    lstm_max_age_hours: int = 168
 
 
 @dataclass(frozen=True)
@@ -195,6 +197,14 @@ def normalize_runtime_config(payload: Any) -> RuntimeConfig:
     workers = p["max_workers"]
     if isinstance(workers, bool) or not isinstance(workers, int) or not 0 <= workers <= 256:
         raise _error("runtime.prediction.max_workers", "max_workers 必须为 0 到 256 的整数（0 表示自动）")
+    model_path = p["lstm_model_path"]
+    age = p["lstm_max_age_hours"]
+    if not isinstance(model_path, str) or "\x00" in model_path:
+        raise _error("runtime.prediction.lstm_model_path", "必须是模型文件路径字符串")
+    if "lstm" in methods and not model_path.strip():
+        raise _error("runtime.prediction.lstm_model_path", "启用 LSTM 时必须指定 model.pt 路径")
+    if isinstance(age, bool) or not isinstance(age, int) or age < 0:
+        raise _error("runtime.prediction.lstm_max_age_hours", "必须为非负整数小时，0 表示不限制")
     prediction = PredictionConfig(
         parallel_backend=backend,
         max_workers=workers,
@@ -204,6 +214,8 @@ def normalize_runtime_config(payload: Any) -> RuntimeConfig:
         workload_future_duration=_duration(p["workload_future_duration"], "runtime.prediction.workload_future_duration"),
         enabled_methods=methods,
         enable_ensemble=_bool(p["enable_ensemble"], "runtime.prediction.enable_ensemble"),
+        lstm_model_path=model_path.strip(),
+        lstm_max_age_hours=age,
     )
 
     tier = str(d["default_policy_tier"] or "").strip().lower()

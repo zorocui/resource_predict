@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import copy
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -11,44 +11,16 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
+from resource_predict.core.lstm_model import SharedLSTM
 from resource_predict.core.forecasting import clip_usage_range, usage_forecast_upper_bound
 from resource_predict.data.io import atomic_write_json
 from resource_predict.pipeline.forecasting import forecast_by_method
 from resource_predict.pipeline.series_utils import compute_metrics
-from training.data import load_series, split_windows
-
-
-class Windows(Dataset):
-    """仅存每条原序列和窗口位置，按批次生成输入。"""
-
-    def __init__(self, values, positions, lookback, horizon):
-        self.values = values
-        self.positions = positions
-        self.lookback, self.horizon = lookback, horizon
-
-    def __len__(self):
-        return len(self.positions)
-
-    def __getitem__(self, index):
-        series, origin = self.positions[index]
-        values = self.values[series]
-        return (torch.from_numpy(values[origin-self.lookback:origin, None]),
-                torch.from_numpy(values[origin:origin+self.horizon]))
-
-
-class SharedLSTM(nn.Module):
-    def __init__(self, hidden_size, layers, dropout, horizon):
-        super().__init__()
-        self.encoder = nn.LSTM(1, hidden_size, num_layers=layers, batch_first=True,
-                               dropout=dropout if layers > 1 else 0.0)
-        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(hidden_size, horizon))
-
-    def forward(self, values):
-        _, (hidden, _) = self.encoder(values)
-        return self.head(hidden[-1])
+from training.lstm_data import DiskValues, Positions, Windows, file_hash, prepare
+from training.lstm_checkpoint import atomic_save, train_epochs
+from training.prophet_training import training_lock
 
 
 def evaluate(model, loader, device):
@@ -63,8 +35,41 @@ def evaluate(model, loader, device):
 
 
 def run(args):
-    if args.out.exists():
-        raise ValueError("输出目录已存在，请指定新的 --out，避免覆盖实验")
+    if args.out.exists() and not args.resume:
+        raise ValueError("输出目录已存在；续训请添加 --resume，新实验请指定新 --out")
+    if args.resume and not (args.out / "run.json").is_file():
+        raise ValueError("缺少 run.json，旧版 model.pt 不能作为续训检查点")
+    if args.prophet_models:
+        args.baselines = [m for m in args.baselines if m not in {"prophet", "prophet_saved"}] + ["prophet_saved"]
+    config = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()
+              if k not in {"out", "resume", "epochs", "checkpoint_every"}}
+    config.update(stream_version=1, torch_version=str(torch.__version__))
+    if args.prophet_models:
+        config["prophet_manifest_sha256"] = file_hash(args.prophet_models / "manifest.json")
+    config_hash = hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()
+    raw_hash = file_hash(args.raw / "raw_index.json")
+    args.out.mkdir(parents=True, exist_ok=args.resume)
+    with training_lock(args.out):
+        if args.resume:
+            previous = json.loads((args.out / "run.json").read_text(encoding="utf-8"))
+            if previous["config_hash"] != config_hash:
+                raise ValueError("LSTM 续训参数或运行环境不匹配，请使用原参数或新的输出目录")
+            if previous["raw_index_sha256"] != raw_hash:
+                raise ValueError("raw 数据索引已变化，不能续训同一个 LSTM；请使用原快照或新输出目录")
+        else:
+            atomic_write_json(args.out / "run.json", {"config_hash": config_hash, "configuration": config,
+                                                       "raw_index_sha256": raw_hash}, indent=2)
+        atomic_write_json(args.out / "status.json", {"status": "running"})
+        try:
+            result = _run(args, config_hash)
+        except BaseException:
+            atomic_write_json(args.out / "status.json", {"status": "interrupted"})
+            raise
+        atomic_write_json(args.out / "status.json", {"status": "complete"})
+        return result
+
+
+def _run(args, config_hash):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -73,71 +78,42 @@ def run(args):
     if args.device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA 不可用，请使用 --device cpu")
     started = time.perf_counter()
-    items, skipped, source = load_series(args.raw, args.resource_type, args.metric,
-                                         args.level, args.max_resources, args.seed)
-    step = (items[0].series.index[1] - items[0].series.index[0]).total_seconds()
-    sizes = []
-    for duration in (args.lookback, args.horizon):
-        count = pd.Timedelta(duration).total_seconds() / step
-        if count < 1 or not count.is_integer():
-            raise ValueError("lookback/horizon 必须是采样间隔的正整数倍")
-        sizes.append(int(count))
-    lookback, horizon = sizes
-    items, positions, short, boundaries = split_windows(
-        items, lookback, horizon, args.stride, args.validation_duration, args.test_duration,
-        args.train_end, args.validation_end)
-    skipped.extend(short)
-    normalized = [((item.series.to_numpy(dtype=np.float64) - item.mean) / item.scale)
-                  .astype(np.float32) for item in items]
-    loaders = {phase: DataLoader(Windows(normalized, pos, lookback, horizon),
-                                 batch_size=args.batch_size, shuffle=phase == "train")
-               for phase, pos in positions.items()}
+    prepared = prepare(args)
+    items, skipped, source = prepared["series"], prepared["skipped"], prepared["source"]
+    lookback, horizon, boundaries = prepared["lookback"], prepared["horizon"], prepared["boundaries"]
+    positions = {phase: Positions(items, phase) for phase in ("train", "validation", "test")}
+    disk_values = DiskValues(args.out / "data-cache", items)
+    prophet_bank = None
+    if args.prophet_models:
+        from training.prophet import SavedProphetModels
+        prophet_bank = SavedProphetModels(args.prophet_models, args.resource_type, args.level)
+        for item in items:
+            entry = prophet_bank.entry(item["resource_id"], item["container"], item["metric"])
+            if pd.Timestamp(entry["train_end"]) >= pd.Timestamp(boundaries["train_end_exclusive"]):
+                raise ValueError("已保存 Prophet 超过 LSTM 训练截止点；请用相同 --train-end 重新训练基线")
+        args.baselines = [m for m in args.baselines if m not in {"prophet", "prophet_saved"}] + ["prophet_saved"]
+    datasets = {phase: Windows(disk_values, pos, lookback, horizon) for phase, pos in positions.items()}
+    loaders = {phase: DataLoader(dataset, batch_size=args.batch_size,
+                                 generator=torch.Generator().manual_seed(args.seed))
+               for phase, dataset in datasets.items() if phase != "train"}
     architecture = {"hidden_size": args.hidden_size, "layers": args.layers,
                     "dropout": args.dropout, "horizon": horizon}
     model = SharedLSTM(**architecture).to(args.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    best, best_state, best_epoch, stale, history = float("inf"), None, 0, 0, []
-    args.out.mkdir(parents=True)
     print(json.dumps({"series": len(items), "windows": {p: len(v) for p, v in positions.items()},
                       "boundaries": boundaries}, ensure_ascii=False), flush=True)
-    training_started = time.perf_counter()
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        total, count = 0.0, 0
-        for inputs, targets in loaders["train"]:
-            optimizer.zero_grad()
-            loss = nn.functional.mse_loss(model(inputs.to(args.device)), targets.to(args.device))
-            if not torch.isfinite(loss):
-                raise ValueError("训练损失非有限值，请检查输入和学习率")
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total += float(loss.detach().cpu()) * len(inputs)
-            count += len(inputs)
-        validation = evaluate(model, loaders["validation"], args.device)
-        history.append({"epoch": epoch, "train_normalized_mse": total / count,
-                        "validation_normalized_mse": validation})
-        print(json.dumps(history[-1]), flush=True)
-        if np.isfinite(validation) and validation < best:
-            best, best_epoch, stale = validation, epoch, 0
-            best_state = copy.deepcopy(model.state_dict())
-        else:
-            stale += 1
-        if stale >= args.patience:
-            break
-    training_seconds = time.perf_counter() - training_started
-    if best_state is None:
-        raise ValueError("没有有效验证结果，未保存模型")
+    best_state, best_epoch, history, training_seconds = train_epochs(
+        args, model, datasets["train"], loaders["validation"], evaluate, config_hash,
+        file_hash(args.out / "data-cache" / "index.json"))
     model.load_state_dict(best_state)
     model.eval()
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    scalers = [{"resource_id": item.resource_id, "container": item.container,
-                "mean": item.mean, "scale": item.scale} for item in items]
-    checkpoint = {"model_version": "shared-lstm-experiment-v1", "architecture": architecture,
+    scalers = [{"resource_id": item["resource_id"], "container": item["container"], "metric": item["metric"],
+                "mean": item["mean"], "scale": item["scale"]} for item in items]
+    checkpoint = {"model_version": "shared-lstm-experiment-v3", "architecture": architecture,
                   "lookback": lookback, "state_dict": {k: v.cpu() for k, v in best_state.items()},
                   "scalers": scalers, "boundaries": boundaries, "config": config,
                   "source": source, "best_epoch": best_epoch}
-    torch.save(checkpoint, args.out / "model.pt")
+    atomic_save(checkpoint, args.out / "model.pt")
     # 测试阶段每个预测起点只读取此前观测；所有模型使用相同测试标签。
     rows, inference_seconds = [], 0.0
     offset = 0
@@ -151,20 +127,24 @@ def run(args):
                     series_index, origin = positions["test"][offset]
                     offset += 1
                     item = items[series_index]
-                    observed = item.series.iloc[:origin]
-                    actual = item.series.iloc[origin:origin+horizon]
-                    predicted = clip_usage_range(pd.Series(values * item.scale + item.mean,
+                    series = disk_values.series(series_index, boundaries["step_seconds"])
+                    observed = series.iloc[:origin]
+                    actual = series.iloc[origin:origin+horizon]
+                    predicted = clip_usage_range(pd.Series(values * item["scale"] + item["mean"],
                                                            index=actual.index),
                                                   upper=usage_forecast_upper_bound(observed))
-                    identity = {"resource_id": item.resource_id, "container": item.container,
-                                "metric": args.metric, "window_start": actual.index[0].isoformat(),
+                    identity = {"resource_id": item["resource_id"], "container": item["container"],
+                                "metric": item["metric"], "window_start": actual.index[0].isoformat(),
                                 "window_end": actual.index[-1].isoformat()}
                     methods = {"lstm": predicted}
                     timings = {}
                     for method in args.baselines:
                         tick = time.perf_counter()
                         try:
-                            result = forecast_by_method(method, observed, horizon).yhat
+                            if method == "prophet_saved":
+                                result = prophet_bank.predict(item["resource_id"], item["container"], item["metric"], actual.index)
+                            else:
+                                result = forecast_by_method(method, observed, horizon).yhat
                             if len(result) != horizon or not np.isfinite(result.to_numpy()).all():
                                 raise ValueError("基线预测非有限值或长度不匹配")
                             methods[method] = result.set_axis(actual.index)
@@ -177,28 +157,40 @@ def run(args):
                                      **compute_metrics(actual, predicted),
                                      "mean_underprediction": float(np.maximum(errors, 0).mean()),
                                      "peak_underprediction": max(0.0, float(actual.max()-predicted.max())),
-                                     "wall_seconds": timings.get(method)})
+                                     "wall_seconds": timings.get(method),
+                                     **({"model_train_end": prophet_bank.entry(item["resource_id"], item["container"], item["metric"])["train_end"]}
+                                        if method == "prophet_saved" else {})})
                     curves.write(json.dumps({**identity, "actual": actual.tolist(),
                                              "predictions": {m: p.tolist() for m, p in methods.items()}},
                                             ensure_ascii=False, allow_nan=False) + "\n")
+    summary = summarize(rows, ["lstm", *args.baselines])
+    metrics = sorted({item["metric"] for item in items})
+    summary_by_metric = {metric: summarize([r for r in rows if r["metric"] == metric],
+                                            ["lstm", *args.baselines]) for metric in metrics}
+    report = {"config": config, "source": source, "boundaries": boundaries, "series": len(items),
+              "series_by_metric": {metric: sum(item["metric"] == metric for item in items) for metric in metrics},
+              "window_counts": {p: len(v) for p, v in positions.items()}, "skipped": skipped,
+              "torch_version": str(torch.__version__), "best_epoch": best_epoch, "history": history,
+              "selection_metric": "validation_normalized_mse", "summary": summary,
+              "summary_by_metric": summary_by_metric,
+              "training_seconds": training_seconds, "lstm_batch_inference_seconds": inference_seconds,
+              "total_seconds": time.perf_counter()-started,
+              "evaluation": "共同截止点；所有指标共享网络，逐序列归一化；测试滚动起点使用此前观测，网络权重和归一化固定；窗口误差等权均值，跨指标总均值仅供诊断"}
+    atomic_write_json(args.out / "report.json", report, indent=2)
+    atomic_write_json(args.out / "forecast_error_report.json", {"window_role": "independent_test", "records": rows}, indent=2)
+    print(json.dumps(summary_by_metric, ensure_ascii=False, indent=2), flush=True)
+    return report
+
+
+def summarize(rows, methods):
     summary = {}
-    for method in ["lstm", *args.baselines]:
+    for method in methods:
         valid = [r for r in rows if r["model"] == method and r["status"] == "ok"]
         summary[method] = {"successful_windows": len(valid),
                            "failed_windows": sum(r["model"] == method and r["status"] == "failed" for r in rows)}
         for key in ("rmse", "mae", "mape", "p95_error", "mean_underprediction", "peak_underprediction"):
             summary[method]["mean_window_" + key] = float(np.mean([r[key] for r in valid])) if valid else None
-    report = {"config": config, "source": source, "boundaries": boundaries, "series": len(items),
-              "window_counts": {p: len(v) for p, v in positions.items()}, "skipped": skipped,
-              "torch_version": str(torch.__version__), "best_epoch": best_epoch, "history": history,
-              "selection_metric": "validation_normalized_mse", "summary": summary,
-              "training_seconds": training_seconds, "lstm_batch_inference_seconds": inference_seconds,
-              "total_seconds": time.perf_counter()-started,
-              "evaluation": "共同截止点；测试滚动起点使用此前观测，网络权重和归一化固定；窗口误差等权均值"}
-    atomic_write_json(args.out / "report.json", report, indent=2)
-    atomic_write_json(args.out / "forecast_error_report.json", {"window_role": "independent_test", "records": rows}, indent=2)
-    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
-    return report
+    return summary
 
 
 def parser():
@@ -206,7 +198,7 @@ def parser():
     command.add_argument("--raw", type=Path, required=True, help="包含 raw_index.json 和 raw/ 的本地目录")
     command.add_argument("--out", type=Path, required=True, help="新的实验输出目录")
     command.add_argument("--resource-type", choices=["openstack_vm", "k8s_workload"], required=True)
-    command.add_argument("--metric", required=True)
+    command.add_argument("--metric", default="all", help="默认 all：所有指标共享一个 LSTM；也可指定单一指标")
     command.add_argument("--level", choices=["resource", "container"], default="resource")
     command.add_argument("--lookback", default="24h")
     command.add_argument("--horizon", default="24h")
@@ -223,11 +215,15 @@ def parser():
     command.add_argument("--batch-size", type=int, default=64)
     command.add_argument("--epochs", type=int, default=20)
     command.add_argument("--patience", type=int, default=3)
+    command.add_argument("--resume", action="store_true", help="同一输出目录恢复训练状态；数据及关键参数必须一致")
+    command.add_argument("--checkpoint-every", type=int, default=1000, help="每多少个训练批次原子保存续训状态；每轮结束也保存")
     command.add_argument("--threads", type=int, default=2)
     command.add_argument("--seed", type=int, default=42)
     command.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     command.add_argument("--baselines", nargs="+", choices=["seasonal_naive", "rolling_mean", "prophet"],
                          default=["seasonal_naive", "rolling_mean", "prophet"])
+    command.add_argument("--prophet-models", type=Path,
+                         help="加载已保存 Prophet 作为 prophet_saved 基线，替换即时拟合的 prophet；不自动重训")
     return command
 
 
@@ -235,7 +231,7 @@ def main():
     command = parser()
     args = command.parse_args()
     if (any(getattr(args, key) <= 0 for key in ("stride", "hidden_size", "layers", "batch_size",
-                                               "epochs", "patience", "threads"))
+                                               "epochs", "patience", "threads", "checkpoint_every"))
             or args.max_resources < 0 or not 0 <= args.dropout < 1
             or not np.isfinite(args.learning_rate) or args.learning_rate <= 0):
         command.error("整数训练参数必须为正；max-resources >= 0；0 <= dropout < 1；learning-rate > 0")

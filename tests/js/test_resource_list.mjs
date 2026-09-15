@@ -28,6 +28,19 @@ vm.runInThisContext(source, { filename: "static/js/resource-list.js" });
 
 const list = window.ResourceList;
 
+test("queue marks past successful scaling independently of current recommendation", () => {
+  for (const action of ["hold", "scale_in_candidate", "scale_out_candidate"]) {
+    const markup = list.scalingHistoryBadge({spec:{last_scaled_at_epoch_ms:Date.UTC(2026, 8, 14, 8, 0, 0)}, scaling_advice:{action}});
+    assert.match(markup, /已调配/);
+    assert.match(markup, /2026\/9\/14 16:00:00/);
+    assert.match(markup, /最近成功调配/);
+  }
+  for (const timestamp of [undefined, null, 0, -1, "invalid", Infinity]) {
+    assert.equal(list.scalingHistoryBadge({spec:{last_scaled_at_epoch_ms:timestamp}}), "");
+  }
+  assert.equal(list.scalingHistoryBadge({}), "");
+});
+
 function k8sItem() {
   return {
     resource_type: "k8s_workload",

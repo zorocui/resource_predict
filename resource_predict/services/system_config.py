@@ -30,6 +30,7 @@ from resource_predict.services.runtime_config import (
 METHOD_LABELS = {
     "arima": "ARIMA", "sarima": "SARIMA", "prophet": "Prophet",
     "seasonal_naive": "Seasonal naive", "rolling_mean": "Rolling mean",
+    "lstm": "LSTM（已训练模型）",
 }
 
 

@@ -14,7 +14,7 @@
   let host, chart, items = [], sequence = 0, ready = false, saving = false, searchTimer;
   let modelOptions = new Set();
   const metricLabels = { cpu: "CPU", memory: "内存", disk: "磁盘", cpu_request: "CPU · Request", cpu_limit: "CPU · Limit", memory_request: "内存 · Request", memory_limit: "内存 · Limit" };
-  const modelLabels = { arima: "ARIMA", sarima: "SARIMA", prophet: "Prophet", seasonal_naive: "季节基线", rolling_mean: "滚动均值", ensemble: "集成模型" };
+  const modelLabels = { arima: "ARIMA", sarima: "SARIMA", prophet: "Prophet", seasonal_naive: "季节基线", rolling_mean: "滚动均值", ensemble: "集成模型", lstm: "LSTM" };
   const localTime = value => {
     if (!value) return null;
     const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);

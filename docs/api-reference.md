@@ -22,6 +22,7 @@
 | GET | `/api/resources/details?ids=a,b` | 批量详情（最多 100 个） |
 | GET | `/api/resources/advice-summary` | 建议统计（action/confidence 计数） |
 | GET | `/api/resources/<id>/scaling-history` | 资源调配历史 |
+| GET | `/api/scaling-history` | 全部资源调配记录，支持 `page`、`page_size`（默认20，最大100）、`q`（资源 ID 搜索） |
 
 ### 列表参数
 
@@ -66,6 +67,8 @@
 弹窗应先请求 `include_charts=false` 并立即展示规格、建议和门控状态，再按可见指标异步请求 `/charts`。每个图表请求只会读取该资源对应的一个 raw 分片，不扫描其他资源。
 
 图表块除 `x_train_ms`、`x_test_ms`、`x_pred_ms` 及对应值外，还包含以下时间与缺口元数据：
+
+`x_test_ms/y_test` 固定对应当次预测的测试时间轴，缺失实际采样返回 `null`；测试之后的新采样通过 `x_observed_ms/y_observed` 返回，页面单独显示为“预测后实际观测”。不会因采集更新而移动旧 `preds` 的时间位置。新预测保存精确测试时间戳；旧预测按测试终点、采样间隔和预测长度恢复，缺少必要边界时不显示无法定位的测试线。
 
 | 字段 | 说明 |
 | --- | --- |

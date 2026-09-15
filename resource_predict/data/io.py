@@ -237,6 +237,24 @@ def _coerce_container_metric_series(value: Any, metric_names: Tuple[str, ...]) -
     return out
 
 
+def _split_chart_observations(series: pd.Series, block: dict, test_size: int):
+    """按预测产物的固定时间轴拆分；缺失测试采样保留空值，不能移动预测点。"""
+    timestamps = block.get("x_test_ms")
+    if isinstance(timestamps, list) and timestamps:
+        index = pd.to_datetime(timestamps, unit="ms", utc=True)
+    elif block.get("test_end_ms") is not None and block.get("sample_interval_seconds"):
+        predictions = block.get("preds", {})
+        selected = predictions.get(block.get("best_method"))
+        count = len(selected) if isinstance(selected, list) and selected else test_size
+        index = pd.date_range(end=pd.to_datetime(block["test_end_ms"], unit="ms", utc=True),
+                              periods=count, freq=pd.Timedelta(seconds=float(block["sample_interval_seconds"])))
+    else:
+        # 无法证明旧产物测试时间时，只显示历史，不把新观测伪装成旧测试。
+        return series, series.iloc[:0], series.iloc[:0]
+    index = index.tz_convert(series.index.tz) if series.index.tz is not None else index.tz_localize(None)
+    return series[series.index < index[0]], series.reindex(index), series[series.index > index[-1]]
+
+
 def merge_charts_into_detail(
     detail: Dict[str, Any],
     raw_by_id: Dict[str, Dict[str, Any]],
@@ -272,21 +290,22 @@ def merge_charts_into_detail(
         y_full = raw.get(kind)
         if not isinstance(y_full, pd.Series) or y_full.empty:
             continue
-        if len(y_full) <= test_size:
+        block = cf.get(kind)
+        if not isinstance(block, dict):
             continue
-        y_train, y_test = y_full.iloc[:-test_size], y_full.iloc[-test_size:]
+        y_train, y_test, y_observed = _split_chart_observations(y_full, block, test_size)
+        y_observed = _filter_series_time_range(y_observed, start_ms=start_ms, end_ms=end_ms)
         y_train = _filter_series_time_range(y_train, start_ms=start_ms, end_ms=end_ms)
         if history_points is not None:
             points = max(0, int(history_points))
             y_train = y_train.iloc[-points:] if points else y_train.iloc[0:0]
-        block = cf.get(kind)
-        if not isinstance(block, dict):
-            continue
         merged_charts[kind] = {
             "x_train_ms": _timestamps_ms_from_index(y_train.index),
             "y_train": _series_to_lists(y_train),
             "x_test_ms": _timestamps_ms_from_index(y_test.index),
-            "y_test": _series_to_lists(y_test),
+            "y_test": [float(value) if pd.notna(value) else None for value in y_test],
+            "x_observed_ms": _timestamps_ms_from_index(y_observed.index),
+            "y_observed": _series_to_lists(y_observed),
             "preds": block.get("preds", {}),
             "x_pred_ms": block.get("x_pred_ms", []),
             "preds_future": block.get("preds_future", {}),
@@ -346,12 +365,13 @@ def _merge_container_charts(
         for metric, y_full in metrics.items():
             if metric_filter and str(metric) != metric_filter:
                 continue
-            if not isinstance(y_full, pd.Series) or y_full.empty or len(y_full) <= test_size:
+            if not isinstance(y_full, pd.Series) or y_full.empty:
                 continue
             block = forecast_metrics.get(metric, {})
             if not isinstance(block, dict):
                 continue
-            y_train, y_test = y_full.iloc[:-test_size], y_full.iloc[-test_size:]
+            y_train, y_test, y_observed = _split_chart_observations(y_full, block, test_size)
+            y_observed = _filter_series_time_range(y_observed, start_ms=start_ms, end_ms=end_ms)
             y_train = _filter_series_time_range(y_train, start_ms=start_ms, end_ms=end_ms)
             if history_points is not None:
                 points = max(0, int(history_points))
@@ -360,7 +380,9 @@ def _merge_container_charts(
                 "x_train_ms": _timestamps_ms_from_index(y_train.index),
                 "y_train": _series_to_lists(y_train),
                 "x_test_ms": _timestamps_ms_from_index(y_test.index),
-                "y_test": _series_to_lists(y_test),
+                "y_test": [float(value) if pd.notna(value) else None for value in y_test],
+                "x_observed_ms": _timestamps_ms_from_index(y_observed.index),
+                "y_observed": _series_to_lists(y_observed),
                 "preds": block.get("preds", {}),
                 "x_pred_ms": block.get("x_pred_ms", []),
                 "preds_future": block.get("preds_future", {}),
@@ -387,4 +409,3 @@ def _filter_series_time_range(
     if end_ms is not None:
         result = result[result.index <= pd.Timestamp(int(end_ms), unit="ms")]
     return result
-

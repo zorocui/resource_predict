@@ -14,7 +14,6 @@ from resource_predict.data.io import atomic_write_json
 from resource_predict.data.raw_store import RawResourceStore, write_raw_resource_dataset
 from resource_predict.pipeline.constants import (
     DETAILS_DIRNAME,
-    MANIFEST_FILENAME,
     SUMMARY_INDEX_FILENAME,
 )
 from resource_predict.pipeline.output_paths import scoped_out_dir
@@ -37,7 +36,6 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
     out_dir = scoped_out_dir("k8s" if resource_type.startswith("k8s") else "vm", settings.app.out_dir)
     summary_path = out_dir / SUMMARY_INDEX_FILENAME
     details_dir = out_dir / DETAILS_DIRNAME
-    manifest_path = out_dir / MANIFEST_FILENAME
 
     updated: Dict[str, Any] = {
         "resource_id": resource_id,
@@ -49,11 +47,24 @@ def apply_scaling_success_snapshot(plan: Any) -> Dict[str, Any]:
         "advice_recomputed": False,
     }
 
+    started = time.perf_counter()
+    logger.info("[scaling] snapshot stage started: resource_id=%s stage=waiting_lock", resource_id)
     with _LOCK:
-        detail_item = _update_detail(details_dir, summary_path, resource_id, effective_spec, updated)
-        _update_summary(summary_path, resource_id, effective_spec, detail_item, updated)
-        _update_raw(out_dir, resource_id, effective_spec, updated)
-        _update_manifest(manifest_path, resource_id, effective_spec, detail_item, updated)
+        logger.info("[scaling] snapshot lock acquired: resource_id=%s elapsed_seconds=%.3f",
+                    resource_id, time.perf_counter() - started)
+        detail_item = None
+        # manifest 是预测运行时的完整快照，调配只更新在线使用的数据。
+        for stage in ("detail", "summary", "raw"):
+            stage_started = time.perf_counter()
+            logger.info("[scaling] snapshot stage started: resource_id=%s stage=%s", resource_id, stage)
+            if stage == "detail":
+                detail_item = _update_detail(details_dir, summary_path, resource_id, effective_spec, updated)
+            elif stage == "summary":
+                _update_summary(summary_path, resource_id, effective_spec, detail_item, updated)
+            else:
+                _update_raw(out_dir, resource_id, effective_spec, updated)
+            logger.info("[scaling] snapshot stage completed: resource_id=%s stage=%s elapsed_seconds=%.3f",
+                        resource_id, stage, time.perf_counter() - stage_started)
 
     logger.info(
         "[scaling] local snapshot updated: resource_id=%s summary=%s detail=%s raw=%s manifest=%s advice_recomputed=%s",
@@ -284,30 +295,7 @@ def _update_raw(
         freq=freq,
         changed_resource_ids={resource_id},
         defer_cleanup=True,
+        # 这里只回写规格，没有新观测；不要重复入库旧证据或等待成效库写锁。
+        ingest_scaling_evidence=False,
     )
     updated["raw_updated"] = True
-
-
-def _update_manifest(
-    manifest_path: Path,
-    resource_id: str,
-    effective_spec: Dict[str, Any],
-    detail_item: Dict[str, Any] | None,
-    updated: Dict[str, Any],
-) -> None:
-    if not manifest_path.exists():
-        return
-    manifest = _read_json(manifest_path)
-    resources = manifest.get("resources", []) if isinstance(manifest, dict) else []
-    if not isinstance(resources, list):
-        return
-    for row in resources:
-        if not isinstance(row, dict) or str(row.get("resource_id")) != resource_id:
-            continue
-        row["spec"] = _merge_spec(row.get("spec", {}), effective_spec)
-        if isinstance(detail_item, dict) and isinstance(detail_item.get("scaling_advice"), dict):
-            row["scaling_advice"] = detail_item["scaling_advice"]
-        updated["manifest_updated"] = True
-        break
-    if updated["manifest_updated"]:
-        atomic_write_json(manifest_path, manifest, ensure_ascii=False, indent=2)
