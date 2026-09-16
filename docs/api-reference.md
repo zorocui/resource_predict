@@ -22,6 +22,7 @@
 | GET | `/api/resources/details?ids=a,b` | 批量详情（最多 100 个） |
 | GET | `/api/resources/advice-summary` | 建议统计（action/confidence 计数） |
 | GET | `/api/resources/<id>/scaling-history` | 资源调配历史 |
+| POST | `/api/resources/<id>/refresh-forecast` | 当前 Workload 重新拉取完整配置历史并预测，异步返回202；进度查询 `/api/update-status`，任务忙时返回409 |
 | GET | `/api/scaling-history` | 全部资源调配记录，支持 `page`、`page_size`（默认20，最大100）、`q`（资源 ID 搜索） |
 
 ### 列表参数
@@ -68,7 +69,9 @@
 
 图表块除 `x_train_ms`、`x_test_ms`、`x_pred_ms` 及对应值外，还包含以下时间与缺口元数据：
 
-`x_test_ms/y_test` 固定对应当次预测的测试时间轴，缺失实际采样返回 `null`；测试之后的新采样通过 `x_observed_ms/y_observed` 返回，页面单独显示为“预测后实际观测”。不会因采集更新而移动旧 `preds` 的时间位置。新预测保存精确测试时间戳；旧预测按测试终点、采样间隔和预测长度恢复，缺少必要边界时不显示无法定位的测试线。
+`latest_observation_ms` 为未受页面时间筛选裁切的最新观测时间，避免旧数据范围让未来阴影倒退；`prediction_skipped` 标明本轮是否沿用旧预测；`last_scaled_at_epoch_ms` 用于绘制“最近调配”圆点，放在离调配时间最近的实际采样点上，悬停分别显示调配时间和采样时间（调配时间为本地成功规格回写时间，不等于监控确认生效时间）。沿用旧预测或旧预测已被实际观测覆盖时，旧测试实际值并入蓝色历史线，不再单列红色测试线和图例，同时提示旧预测状态；正常新预测仍显示测试段。单资源重拉因连续数据不足跳过时，更新历史显示 `partial_success` 和具体跳过指标，不冒充预测全部成功。
+
+`x_test_ms/y_test` 固定对应当次预测的测试时间轴，缺失实际采样返回 `null`；测试之后的新采样通过 `x_observed_ms/y_observed` 返回，页面并入蓝色历史实际线，不单列绿线。橙色“未来预测区”从测试终点与最新有效实际采样时间的较晚者开始，到预测末尾结束；实际采样已覆盖整个预测时段时不再显示阴影。不会因采集更新而移动旧 `preds` 的时间位置。新预测保存精确测试时间戳；旧预测按测试终点、采样间隔和预测长度恢复，缺少必要边界时不显示无法定位的测试线。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -78,7 +81,9 @@
 
 后端保证 `x_pred_ms` 的首点为 `test_end_ms + sample_interval_seconds`，其余未来点保持相同间隔。前端会再次过滤所有不晚于 `test_end_ms` 的未来点；黄色预测区域从 `test_end_ms` 开始，到最后一个有效未来预测点结束。若没有严格晚于测试终点的未来点，则不显示黄色区域。历史和测试曲线遇到超过允许步数的大缺口会断开。
 
-K8S 指标的 `data_quality` 会附带 `recent_contiguous_points`、`recent_contiguous_span_hours`、`data_end_ms` 和 `prediction_skipped`。当最近连续段的点数不足测试窗口时，该指标记为跳过；若 Workload 因指标过短无法重算，接口继续提供其已有预测产物。可在 `manifest.json` 与 `forecast_error_report.json` 的 `meta.prediction_skips`、以及 `generation_stats.json` 顶层的 `prediction_skips` 中查看 `resource_id`、`metric` 与原因 `recent_contiguous_segment_too_short`。
+K8S 汇总指标与容器指标分别判断最近连续段，点数必须大于 `test_size` 才参与本轮预测。单个指标不足不会阻止其他指标更新；只有全部待算指标不足时才跳过该资源的预测计算。`data_quality` / `container_data_quality` 包含 `recent_contiguous_points`、`recent_contiguous_span_hours`、`data_end_ms` 和 `prediction_skipped`。跳过的指标通过 `forecast_status=retained` 表示沿用旧曲线及其原始诊断/误差，`unavailable` 表示没有旧预测、只显示历史。详情图表还返回 `forecast_generated_at_epoch_ms`，沿用时保持原生成时间。
+
+详情与摘要的 `prediction_status` 为 `success`、`partial_success` 或 `skipped`；`generation_stats.predicted_resources` 只统计本轮至少重算一个指标的资源。数据写入成功但存在跳过指标时，更新任务记为 `partial_success`。存在跳过指标的 Workload 不生成可执行调配建议，旧预测仅作展示。`forecast_error_report.json` 逐模型误差记录新增 `forecast_status`（`updated` / `retained`），沿用记录的 `window.source=retained_forecast`，使用旧预测的测试边界和点数，不冒用本轮窗口。可在 `manifest.json` 与 `forecast_error_report.json` 的 `meta.prediction_skips`、以及 `generation_stats.json` 顶层的 `prediction_skips` 中查看 `resource_id`、`metric` 与原因 `recent_contiguous_segment_too_short`。
 
 ## 数据更新
 
@@ -91,6 +96,8 @@ K8S 指标的 `data_quality` 会附带 `recent_contiguous_points`、`recent_cont
 | POST | `/api/upsert-data` | 推送数据，更新或新增资源（异步） |
 
 更新任务成功、部分成功或失败后都会写入 `outputs/update_history.json`，应用重启后仍可查询。系统按完成时间从新到旧保留最近 100 条；历史文件读取或写入异常只记录日志，不影响数据更新主流程。历史记录包含任务来源、拉取窗口、开始/结束时间、耗时、资源和数据点统计以及错误信息。整体 `status` 可为 `success`、`partial_success` 或 `failed`；K8S Prometheus 更新还通过 `cluster_results` 记录每个集群的 `success` / `failed`、Workload 数、耗时和错误。
+
+K8S 拉取、单 Workload 重新拉取预测和 API 推送共用更新排他锁。K8S 定时任务到点时若已有任务执行，会等待该任务完成后再采集，等待期间不覆盖当前任务状态；忙碌拒绝也不改写当前任务或历史。锁覆盖采集、合并、预测及历史写入，定时任务始终保留“K8S 后台定时拉取”来源，每轮只记录一次终态。新任务开始时清空上一轮结束时间。
 
 历史总耗时优先按有效的 `finished_at-started_at` 计算，包含采集、合并和预测；旧记录即使误存了仅处理阶段的 `elapsed_seconds`，读取时也会校正，无需重新拉取或重写历史文件。缺少时间边界时才回退到原耗时。K8S更新结果的 `elapsed_seconds` 为整轮采集和处理耗时，另保留 `fetch_elapsed_seconds` 与 `upsert_elapsed_seconds`；逐集群耗时仍仅表示对应集群拉取耗时。
 

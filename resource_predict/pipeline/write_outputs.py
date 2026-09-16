@@ -35,6 +35,7 @@ def write_prediction_outputs(
     raw_stats: Dict[str, int],
     prediction_skips: Optional[List[Dict[str, str]]] = None,
     execution_stats: Optional[Dict[str, Any]] = None,
+    write_manifest: bool = True,
 ) -> List[Dict[str, Any]]:
     output_started = time.perf_counter()
     prediction_skips = list(prediction_skips or [])
@@ -77,8 +78,13 @@ def write_prediction_outputs(
         row = {
                 "resource_id": rid,
                 "resource_type": resource_type_of(item),
+                "prediction_status": item.get("prediction_status", "success"),
                 "spec": item.get("spec", {}),
                 "best_methods": item.get("best_methods", {}),
+                "container_best_methods": {
+                    container: {metric: chart.get("best_method") for metric, chart in charts.items() if isinstance(chart, dict)}
+                    for container, charts in item.get("container_charts_forecast", {}).items() if isinstance(charts, dict)
+                },
                 "anomaly_score": anomaly_score,
                 "scaling_advice": item.get("scaling_advice", {}),
                 "observed_stats": item.get("observed_stats", {}),
@@ -121,12 +127,13 @@ def write_prediction_outputs(
     )
 
     manifest_items = [dict(item) for item in resources_items]
-    atomic_write_json(
-        out_base / MANIFEST_FILENAME,
-        {"meta": {"prediction_skips": prediction_skips}, "resources": manifest_items},
-        ensure_ascii=False,
-        indent=2,
-    )
+    if write_manifest:
+        atomic_write_json(
+            out_base / MANIFEST_FILENAME,
+            {"meta": {"prediction_skips": prediction_skips}, "resources": manifest_items},
+            ensure_ascii=False,
+            indent=2,
+        )
     error_report = _build_forecast_error_report(
         resources_items=resources_items,
         active_methods=active_methods,
@@ -227,6 +234,18 @@ def _build_forecast_error_report(
                     continue
                 diagnostics = diagnostics_group.get(metric, {})
                 model_metrics = _error_model_metrics(kind_metrics, diagnostics, active_methods, window_info)
+                quality = (item.get("container_data_quality", {}).get(container, {}) if container
+                           else item.get("data_quality", {})).get(metric, {})
+                chart = (item.get("container_charts_forecast", {}).get(container, {}) if container
+                         else item.get("charts_forecast", {})).get(metric, {})
+                for errors in model_metrics.values():
+                    errors["forecast_status"] = quality.get("forecast_status", "updated")
+                    if quality.get("prediction_skipped"):
+                        errors["window"] = {**errors["window"], "source": "retained_forecast",
+                            "test_size": len(chart.get("x_test_ms", [])) or None,
+                            "future_steps": len(chart.get("x_pred_ms", [])) or None,
+                            "sample_interval_seconds": chart.get("sample_interval_seconds"),
+                            "test_duration": None, "future_duration": None}
                 if not model_metrics:
                     continue
                 evaluation = {key: value for key, value in diagnostics.get("evaluation", {}).items()

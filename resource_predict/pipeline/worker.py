@@ -24,11 +24,14 @@ logger = logging.getLogger(__name__)
 def _selected_metrics(source: dict, ctx: WorkerContext) -> list[str]:
     metric_names = metric_names_for_resource(source)
     resource_id = str(source["resource_id"])
+    selected = list(metric_names)
     if ctx.metric_partial_enabled and resource_id in ctx.existing_partial_ids:
         selected = [metric for metric in metric_names
                     if metric in ctx.metric_filter_by_id.get(resource_id, set(metric_names))]
-        return selected or list(metric_names)
-    return list(metric_names)
+        selected = selected or list(metric_names)
+    if resource_type_of(source) == "k8s_workload":
+        selected = [metric for metric in selected if len(source[metric]) > ctx.test_size]
+    return selected
 
 
 def _iter_container_inputs(
@@ -163,7 +166,7 @@ def worker(
             resource={**source, "history_coverage": history_coverage},
             container_future_values=container_futures_for_advice,
         )
-    elif len(futures_for_advice) == len(METRIC_NAMES):
+    elif resource_type != "k8s_workload" and len(futures_for_advice) == len(METRIC_NAMES):
         advice = build_scaling_advice(
             futures_for_advice,
             current_spec=spec,
@@ -179,6 +182,7 @@ def worker(
     item = {
         "resource_id": resource_tag,
         "resource_type": resource_type,
+        "prediction_status": "success",
         "spec": spec if isinstance(spec, dict) else {},
         "best_methods": best_methods,
         "metrics": metrics_out,

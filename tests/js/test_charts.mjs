@@ -43,16 +43,78 @@ const {
 const T0 = 1_800_000_000_000;
 const HOUR = 60 * 60 * 1000;
 
-test("post-forecast observations use a separate line without moving test predictions", () => {
+test("unavailable prediction displays history without claiming an old forecast", () => {
+  const option = buildChartOption({x_train_ms:[T0], y_train:[.2],
+    prediction_skipped:true, forecast_status:"unavailable", preds:{}, preds_future:{}}, "cpu");
+  assert.match(option.title.subtext, /暂无预测/);
+  assert.doesNotMatch(option.title.subtext, /沿用旧预测/);
+  assert.ok(option.series.some(series => series.name === "历史"));
+});
+
+test("per-metric generation time is visible", () => {
+  const option = buildChartOption({x_train_ms:[T0], y_train:[.2],
+    forecast_generated_at_epoch_ms:T0, preds:{}, preds_future:{}}, "cpu");
+  assert.match(option.title.subtext, /预测生成/);
+});
+
+test("stale chart states missing future explicitly and marks scaling without auxiliary lines", () => {
+  const previous = window.ResourcePredictApp.chartAuxiliaryVisible;
+  window.ResourcePredictApp.chartAuxiliaryVisible = false;
+  try {
+    const option = buildChartOption({best_method:"rolling_mean", x_train_ms:[T0], y_train:[.2],
+      x_test_ms:[T0+HOUR], y_test:[.3], test_end_ms:T0+HOUR, prediction_skipped:true,
+      preds:{rolling_mean:[.31]}, x_pred_ms:[T0+2*HOUR], preds_future:{rolling_mean:[.4]},
+      latest_observation_ms:T0+3*HOUR,last_scaled_at_epoch_ms:T0+1.5*HOUR,
+      x_observed_ms:[T0+3*HOUR], y_observed:[.42]},"cpu");
+    assert.match(option.title.subtext,/沿用旧预测/);
+    assert.ok(!option.legend.data.includes("旧预测测试"));
+    assert.ok(!option.series.some(s=>s.name==="旧预测测试" || s.name==="测试"));
+    assert.deepEqual(option.series.find(s=>s.name==="历史").data.filter(p=>p[1]!=null).map(p=>p[0]),[T0,T0+HOUR,T0+3*HOUR]);
+    assert.ok(!option.series.some(s=>s.markArea));
+    const marker = option.series.find(s=>s.name==="最近调配");
+    assert.equal(marker.type,"scatter");
+    assert.equal(marker.symbol,"circle");
+    assert.deepEqual(marker.data,[[T0+HOUR,.3]]);
+    assert.equal(marker.markLine,undefined);
+    assert.match(marker.tooltip.formatter(),/最近调配.*定位至最近实际采样/);
+  } finally { window.ResourcePredictApp.chartAuxiliaryVisible = previous; }
+});
+
+test("only the best model is initially visible and other legends remain selectable", () => {
+  const option = buildChartOption({best_method:"arima", x_train_ms:[T0], y_train:[.2],
+    x_test_ms:[T0+HOUR], y_test:[.3], test_end_ms:T0+HOUR,
+    preds:{rolling_mean:[.25], arima:[.31]}, x_pred_ms:[T0+2*HOUR],
+    preds_future:{rolling_mean:[.25], arima:[.4]}}, "cpu");
+  assert.equal(option.legend.selected.ARIMA, true);
+  assert.equal(option.legend.selected["Rolling Mean"], false);
+  assert.equal(option.legend.selected["历史"], true);
+  assert.equal(option.legend.selected["测试"], true);
+  assert.equal(option.legend.selectedMode, "multiple");
+  assert.ok(option.legend.data.includes("Rolling Mean"));
+  assert.ok(option.series.some(series => series.name === "Rolling Mean" && series.data.length));
+});
+
+test("new observations join blue history and remove elapsed forecast shading", () => {
   const option = buildChartOption({best_method:"rolling_mean", x_train_ms:[T0], y_train:[.2],
     x_test_ms:[T0+HOUR], y_test:[.3], test_end_ms:T0+HOUR,
     preds:{rolling_mean:[.31]}, x_pred_ms:[T0+2*HOUR], preds_future:{rolling_mean:[.4]},
     x_observed_ms:[T0+2*HOUR,T0+3*HOUR], y_observed:[.42,.43], sample_interval_seconds:3600}, "cpu");
-  const observed = option.series.find(s => s.name === "预测后实际观测");
-  assert.ok(observed);
-  assert.deepEqual(observed.data.map(p => p[0]), [T0+2*HOUR,T0+3*HOUR]);
-  assert.ok(option.series.find(s => s.name === "测试").data.every(p => p[0] <= T0+HOUR));
-  assert.ok(option.legend.data.includes("预测后实际观测"));
+  const observed = option.series.find(s => s.name === "历史");
+  assert.deepEqual(observed.data.filter(p => p[1] != null).map(p => p[0]), [T0,T0+HOUR,T0+2*HOUR,T0+3*HOUR]);
+  assert.ok(!option.series.some(s => s.name === "旧预测测试"));
+  assert.ok(!option.legend.data.includes("预测后实际观测"));
+  assert.ok(!option.series.some(s => s.markArea));
+});
+
+test("future shading starts at the latest actual value while test predictions stay fixed", () => {
+  const option = buildChartOption({best_method:"rolling_mean", x_train_ms:[T0], y_train:[.2],
+    x_test_ms:[T0+HOUR], y_test:[.3], test_end_ms:T0+HOUR,
+    preds:{rolling_mean:[.31]}, x_pred_ms:[T0+2*HOUR,T0+4*HOUR], preds_future:{rolling_mean:[.4,.5]},
+    x_observed_ms:[T0+2*HOUR,T0+3*HOUR], y_observed:[.42,null], sample_interval_seconds:3600}, "cpu");
+  const area = option.series.find(s => s.markArea).markArea.data[0];
+  assert.equal(area[0].xAxis,T0+2*HOUR);
+  assert.equal(area[0].name,"未来预测区");
+  assert.equal(area[1].xAxis,T0+4*HOUR);
 });
 const times = Array.from({ length: 9 }, (_, index) => T0 + index * HOUR);
 
@@ -118,6 +180,13 @@ test("detail advice renders backend scores, real zero, unknown and legacy withou
   assert.doesNotMatch(app.els.detailConfidence.innerHTML, /0\/100|默认中等置信度/);
   assert.doesNotMatch(app.els.detailAdvice.innerHTML, /紧急度|旧版排序分/);
   assert.doesNotMatch(app.els.detailAdvice.innerHTML, /182\/100/);
+  assert.doesNotMatch(app.els.detailActions.innerHTML, /重新拉取预测/);
+  app.viewMetricMap.k8s_workload = [];
+  resource.resource_type = "k8s_workload";
+  resource.resource_id = "k8s:c:ns:deployment:api";
+  context.window.ResourceCharts.renderAdvice(resource);
+  assert.match(app.els.detailActions.innerHTML, /data-workload-refresh="k8s:c:ns:deployment:api"/);
+  assert.match(app.els.detailActions.innerHTML, /重新拉取预测/);
 });
 
 test("chart axis labels use Asia/Shanghai time", () => {
@@ -220,7 +289,7 @@ test("markArea starts at test end and model future data excludes overlaps", () =
 
   assert.ok(auxiliary);
   assert.deepEqual(auxiliary.markArea.data, [[
-    { xAxis: testEnd },
+    { name: "未来预测区", xAxis: testEnd },
     { xAxis: testEnd + 2 * HOUR },
   ]]);
   const model = option.series.find((series) => series.name === "Rolling Mean");
@@ -248,7 +317,7 @@ test("explicit test end metadata overrides an older x_test fallback", () => {
   const option = buildChartOption(chartData, "cpu", "percent", { resource_type: "openstack_vm" });
   const auxiliary = option.series.find((series) => series.markArea);
   assert.deepEqual(auxiliary.markArea.data, [[
-    { xAxis: times[3] },
+    { name: "未来预测区", xAxis: times[3] },
     { xAxis: times[4] },
   ]]);
 });

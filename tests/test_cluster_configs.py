@@ -149,6 +149,8 @@ class ClusterConfigsTest(unittest.TestCase):
             fail_if_busy=True,
             out_dir=Path(tmp) / "k8s",
             freq_hint="600s",
+            task_source="页面手动拉取",
+            _exclusive_already_acquired=True,
         )
 
     def test_k8s_ingest_uses_full_window_without_raw_baseline(self):

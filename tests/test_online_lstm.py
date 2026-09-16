@@ -152,3 +152,25 @@ def test_complete_artifacts_contain_lstm(tmp_path):
     assert "lstm" in items[0]["container_charts_forecast"]["app"]["cpu_request"]["preds_future"]
     errors = json.loads((tmp_path / "out" / "forecast_error_report.json").read_text(encoding="utf-8"))
     assert any(row["model"] == "lstm" and row["container"] == "app" for row in errors["rows"])
+    assert not any(row["model"] == "lstm" and not row["container"] for row in errors["rows"])
+
+
+@pytest.mark.parametrize("identity,reason", [
+    ({**IDENTITY, "container": ""}, "resource_level_mismatch"),
+    ({**IDENTITY, "resource_type": "openstack_vm", "container": ""}, "resource_type_mismatch"),
+])
+@pytest.mark.parametrize("only_lstm", [False, True])
+def test_inapplicable_lstm_is_skipped_before_forecasting(tmp_path, monkeypatch, identity, reason, only_lstm):
+    from resource_predict.core import saved_lstm
+    path = tmp_path / "model.pt"
+    checkpoint(path)
+    full = sequence()
+    ctx = context(path, ["lstm"] if only_lstm else ["lstm", "rolling_mean"])
+    monkeypatch.setattr(saved_lstm, "forecast_saved_lstm", lambda *_args, **_kwargs: pytest.fail("不应调用不适用模型"))
+    result = fit_one_metric(full.iloc[:-4], full.iloc[-4:], full, ctx=ctx, identity=identity)
+    assert result[2] == "rolling_mean"
+    assert "lstm" not in result[0] and "lstm" not in result[3]
+    assert result[5]["phase_failures"] == {}
+    route = result[5]["saved_lstm"]["routing"]
+    assert route["decision"] == "skipped" and route["reason"] == reason
+    assert not result[5]["saved_lstm"]["eligible_for_selection"]

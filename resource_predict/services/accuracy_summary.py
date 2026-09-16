@@ -11,7 +11,7 @@ from resource_predict.resource_types import resource_type_of
 FILENAME = "forecast_accuracy_summary.json"
 
 
-def write_accuracy_summary(directory, items):
+def write_accuracy_summary(directory, items, *, replace_resource_ids=None):
     rows = []
     for item in items:
         kind = resource_type_of(item)
@@ -55,6 +55,16 @@ def write_accuracy_summary(directory, items):
                              test_start_ms=min(timestamps) if timestamps else None,
                              test_end_ms=max(timestamps) if timestamps else None))
     payload = dict(version=2, generated_at_ms=int(time.time()*1000), rows=rows)
+    if replace_resource_ids is not None:
+        for row in rows:
+            row["generated_at_ms"] = payload["generated_at_ms"]
+        path = Path(directory) / FILENAME
+        if path.exists():
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if previous.get("version") == 2:
+                payload["rows"] = [row for row in previous["rows"] if row.get("resource_id") not in replace_resource_ids] + rows
+                payload["mixed_prediction_runs"] = True
+                payload["full_run_generated_at_ms"] = previous.get("full_run_generated_at_ms", previous.get("generated_at_ms"))
     atomic_write_json(Path(directory)/FILENAME, payload, ensure_ascii=False, separators=(",", ":"))
     return payload
 
@@ -71,7 +81,8 @@ def read_accuracy_summary(directories):
         if payload["version"] == 1:
             needs_regeneration.append(Path(directory).name)
             continue
-        runs.append(dict(scope=Path(directory).name, generated_at_ms=payload["generated_at_ms"]))
+        runs.append(dict(scope=Path(directory).name, generated_at_ms=payload["generated_at_ms"],
+                         mixed_prediction_runs=bool(payload.get("mixed_prediction_runs"))))
         rows.extend(payload["rows"])
     eligible = [row for row in rows if row["hit_points"] is not None]
     valid = sum(row["valid_points"] for row in eligible)

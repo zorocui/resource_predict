@@ -15,7 +15,7 @@ from resource_predict.resource_types import METRIC_NAMES, metric_names_for_resou
 logger = logging.getLogger(__name__)
 
 
-def load_existing_forecast_items(out_base: Path) -> List[Dict[str, Any]]:
+def load_existing_forecast_items(out_base: Path, resource_ids: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
     summary_path = out_base / SUMMARY_INDEX_FILENAME
     details_dir = out_base / DETAILS_DIRNAME
     if not summary_path.exists():
@@ -35,6 +35,8 @@ def load_existing_forecast_items(out_base: Path) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for row in resources:
         if not isinstance(row, dict):
+            continue
+        if resource_ids is not None and str(row.get("resource_id")) not in resource_ids:
             continue
         ref = row.get("detail_ref", {})
         if not isinstance(ref, dict):
@@ -75,6 +77,9 @@ def merge_partial_forecast_items(
     updated_by_id = {str(item.get("resource_id")): item for item in updated_items}
 
     def _rebuild_advice(item: Dict[str, Any]) -> None:
+        if any(block.get("prediction_skipped") for block in item.get("data_quality", {}).values()):
+            item.pop("scaling_advice", None)
+            return
         charts = item.get("charts_forecast", {})
         if not isinstance(charts, dict):
             return
@@ -106,6 +111,7 @@ def merge_partial_forecast_items(
         if not metrics:
             return new
         merged = dict(old)
+        merged["prediction_status"] = new.get("prediction_status", "success")
         if isinstance(new.get("spec"), dict):
             merged["spec"] = new.get("spec", {})
         for field in ("best_methods", "metrics", "charts_forecast", "observed_stats", "forecast_diagnostics", "data_quality"):
@@ -118,7 +124,8 @@ def merge_partial_forecast_items(
                 if metric in new_obj:
                     field_out[metric] = new_obj[metric]
             merged[field] = field_out
-        for field in ("container_charts_forecast", "container_data_quality", "container_metric_modes"):
+        for field in ("data_quality", "container_charts_forecast", "container_data_quality", "container_metric_modes",
+                      "history_coverage", "resource_profile"):
             if isinstance(new.get(field), dict):
                 merged[field] = new[field]
         _rebuild_advice(merged)

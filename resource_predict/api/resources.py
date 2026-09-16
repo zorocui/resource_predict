@@ -128,7 +128,12 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
         }
         confidence_counts = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
         resource_type_counts: Dict[str, int] = {}
-        best_method_counts: Dict[str, int] = {}
+        enabled_methods = list(settings.forecast.enabled_methods)
+        if settings.forecast.enable_ensemble and "ensemble" not in enabled_methods:
+            enabled_methods.append("ensemble")
+        from resource_predict.services.forecast_config import SUPPORTED_FORECAST_METHODS
+        best_method_counts: Dict[str, int] = dict.fromkeys(
+            [entry["key"] for entry in SUPPORTED_FORECAST_METHODS] + enabled_methods, 0)
         for item in rows:
             advice = item.get("scaling_advice", {})
             confidence = _confidence_of(item)
@@ -143,6 +148,11 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
             rtype = resource_type_of(item)
             resource_type_counts[rtype] = resource_type_counts.get(rtype, 0) + 1
             best_methods = item.get("best_methods", {})
+            container_methods = item.get("container_best_methods", {})
+            if rtype == "k8s_workload" and isinstance(container_methods, dict) and container_methods:
+                best_methods = {f"{container}/{metric}": method
+                                for container, methods in container_methods.items() if isinstance(methods, dict)
+                                for metric, method in methods.items()}
             if isinstance(best_methods, dict):
                 for method in best_methods.values():
                     key = str(method or "").strip()
@@ -156,6 +166,7 @@ def register_resource_routes(app: Flask, helpers: Dict[str, Callable[..., Any]])
                 "confidence_counts": confidence_counts,
                 "resource_type_counts": resource_type_counts,
                 "best_method_counts": best_method_counts,
+                "enabled_methods": enabled_methods,
             }
         )
     @app.get("/api/resources/<resource_id>")

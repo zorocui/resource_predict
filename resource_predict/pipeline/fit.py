@@ -60,6 +60,20 @@ def fit_one_metric(
     future_index = canonical_future_index(y_full.index, ctx.future_steps, ctx.sample_interval_seconds)
     identity = identity or y_full.attrs.get("forecast_identity")
     lstm_metadata = {}
+    candidates = list(ctx.active_methods)
+    lstm_routing = {}
+    if "lstm" in candidates:
+        routing_started = time.perf_counter()
+        from resource_predict.core.saved_lstm import lstm_applicability
+        try:
+            lstm_routing = lstm_applicability(identity, ctx.lstm_checkpoint)
+            if lstm_routing["decision"] == "skipped":
+                candidates.remove("lstm")
+        except Exception as exc:
+            # 缺文件/损坏/缺身份仍由原有逐阶段错误和兜底路径报告，不伪装成正常跳过。
+            lstm_routing = {"decision": "unavailable", "reason": str(exc)}
+        finally:
+            timing["lstm"] += time.perf_counter() - routing_started
 
     def predict(method, history, index, phase):
         started = time.perf_counter()
@@ -91,12 +105,12 @@ def fit_one_metric(
     route_history = y_train.iloc[:len(y_train) - fold_count * ctx.test_size] if fold_count else y_train
     anom = anomaly_profile(route_history, zscore_threshold=float(cfg.anomaly_route_zscore_threshold))
     routing = prophet_routing_decision(
-        route_history, active_methods=ctx.active_methods, anomaly=anom,
+        route_history, active_methods=candidates, anomaly=anom,
         enabled=bool(ctx.forecast_config.get("prophet_routing_enabled", False)),
         mode=str(ctx.forecast_config.get("prophet_routing_mode", "auto")),
     )
-    methods = [m for m in ctx.active_methods if not (m == "prophet" and routing.get("decision") == "skipped")]
-    methods = methods or list(ctx.active_methods) or ["rolling_mean"]
+    methods = [m for m in candidates if not (m == "prophet" and routing.get("decision") == "skipped")]
+    methods = methods or ["rolling_mean"]
     enable_ensemble = bool(ctx.forecast_config.get("enable_ensemble", False))
     validation, evaluation = validation_backtest_metrics(
         y_train, methods, test_size=ctx.test_size, folds=int(cfg.rolling_backtest_folds),
@@ -156,7 +170,7 @@ def fit_one_metric(
     configuration = {"algorithm": asdict(cfg), "runtime": ctx.forecast_config,
                      "active_methods": ctx.active_methods, "test_size": ctx.test_size,
                      "future_steps": ctx.future_steps, "sample_interval_seconds": ctx.sample_interval_seconds}
-    if "lstm" in methods:
+    if "lstm" in ctx.active_methods:
         configuration["lstm_checkpoint"] = ctx.lstm_checkpoint
     config_hash = hashlib.sha256(json.dumps(configuration, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     evaluation.update(
@@ -171,7 +185,7 @@ def fit_one_metric(
     )
     diagnostics = {
         "saved_lstm": {**lstm_metadata, "eligible_for_selection": "lstm" in validation,
-                       "checkpoint": ctx.lstm_checkpoint} if "lstm" in methods else {},
+                       "checkpoint": ctx.lstm_checkpoint, "routing": lstm_routing} if "lstm" in ctx.active_methods else {},
         "anomaly_profile": anom,
         "routing": {"selected_method": selected, "actual_future_method": best,
                     "route": anom.get("route", "normal"), "reason": selection_status},

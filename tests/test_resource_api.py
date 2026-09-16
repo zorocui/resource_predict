@@ -97,6 +97,23 @@ def test_advice_summary_counts_full_filtered_scope_not_current_page():
     assert payload["best_method_counts"]["rolling_mean"] == 1
 
 
+def test_overview_includes_enabled_zero_lstm_and_container_selections(monkeypatch):
+    from resource_predict.api import resources as routes
+    monkeypatch.setattr(routes, "settings", SimpleNamespace(forecast=SimpleNamespace(
+        enabled_methods=["prophet", "lstm"], enable_ensemble=False)))
+    resource = _resource("workload", "hold", best_methods={"cpu_limit":"prophet"})
+    app = _app([resource])
+    payload = app.test_client().get("/api/resources/advice-summary").get_json()
+    assert payload["best_method_counts"]["lstm"] == 0
+    assert "lstm" in payload["enabled_methods"]
+    resource["container_best_methods"] = {"app":{"cpu_limit":"lstm","memory_limit":"lstm"},
+                                           "sidecar":{"cpu_limit":"rolling_mean"}}
+    payload = app.test_client().get("/api/resources/advice-summary").get_json()
+    assert payload["best_method_counts"]["lstm"] == 2
+    assert payload["best_method_counts"]["prophet"] == 0
+    assert payload["best_method_counts"]["rolling_mean"] == 1
+
+
 def test_resources_endpoint_returns_observed_stats_from_summary_item():
     app = _app(
         [

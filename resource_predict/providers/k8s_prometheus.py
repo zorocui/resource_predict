@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
@@ -586,11 +587,31 @@ def _ensure_aggregatable(
         )
 
 
+def fetch_single_k8s_workload(resource: Dict[str, Any]) -> Dict[str, Any]:
+    spec = resource.get("spec", {})
+    cluster = str(spec.get("cluster") or "")
+    if not all(spec.get(key) for key in ("namespace", "workload_kind", "workload_name")):
+        raise ValueError("Workload 缺少命名空间、类型或名称，无法定向拉取")
+    targets = [target for target in _resolve_targets() if target.cluster == cluster]
+    if len(targets) != 1:
+        raise ValueError(f"未找到唯一的集群采集配置：{cluster}")
+    namespace = str(spec["namespace"])
+    if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", namespace):
+        raise ValueError("Workload 命名空间格式无效")
+    target = replace(targets[0], namespace_regex=namespace)
+    items = _fetch_target(target, 0, workload=spec)
+    selected = [item for item in items if item["resource_id"] == resource["resource_id"]]
+    if len(selected) != 1:
+        raise ValueError("未拉取到当前 Workload 的有效指标，请检查历史归属和采集数据")
+    return selected[0]
+
+
 def _fetch_target(
     target: PrometheusTarget,
     limit: int,
     *,
     history_hours: Optional[float] = None,
+    workload: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     client = PrometheusClient(
         base_url=target.prometheus_url,
@@ -618,6 +639,18 @@ def _fetch_target(
     if target.namespace_regex:
         owner_selector += f',namespace=~"{target.namespace_regex}"'
         replicaset_owner_selector = f'namespace=~"{target.namespace_regex}"'
+
+    if workload is not None:
+        current_pods = _pod_owner_values(client, owner_selector)
+        current_rs = _replicaset_owner_values(client, replicaset_owner_selector)
+        historical = _historical_workload_owners(client, owner_selector, replicaset_owner_selector,
+                                                start, end, step, current_pods, current_rs)
+        pods = sorted(pod for (namespace, pod), (kind, name) in historical.items()
+                      if namespace == workload["namespace"] and kind.lower() == str(workload["workload_kind"]).lower()
+                      and name == workload["workload_name"])
+        if not pods:
+            raise ValueError("历史与当前归属中均未找到该 Workload 的 Pod")
+        selector += ",pod=~" + json.dumps("|".join(re.escape(pod) for pod in pods))
 
     cpu_usage = _range_by_key(
         client.query_range(
@@ -662,6 +695,13 @@ def _fetch_target(
     replica_values = _replica_values_by_workload(client, replicaset_owner_selector)
 
     container_keys = set(cpu_usage) | set(mem_usage)
+    current_pod_owners = dict(pod_owners)
+    pod_owners = _historical_workload_owners(
+        client, owner_selector, replicaset_owner_selector, start, end, step,
+        pod_owners_raw, replicaset_owners,
+    )
+    logger.info("[k8s_prometheus] 历史归属恢复: cluster=%s current_pods=%d historical_pods=%d recovered_pods=%d",
+                target.cluster, len(current_pod_owners), len(pod_owners), len(set(pod_owners) - set(current_pod_owners)))
     owner_by_container = {key: _workload_key(key, pod_owners) for key in container_keys}
     orphan_keys = [key for key, workload_key in owner_by_container.items() if workload_key is None]
     workload_keys = sorted(
@@ -696,18 +736,11 @@ def _fetch_target(
     mem_usage_by_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners)
     cpu_usage_by_container = _sum_series_by_workload_container(cpu_usage, pod_owners)
     mem_usage_by_container = _sum_series_by_workload_container(mem_usage, pod_owners)
-    cpu_request_by_workload, _ = _sum_values_by_workload(cpu_request, target.cluster, pod_owners)
-    cpu_limit_by_workload, _ = _sum_values_by_workload(cpu_limit, target.cluster, pod_owners)
-    mem_request_by_workload, _ = _sum_values_by_workload(mem_request, target.cluster, pod_owners)
-    mem_limit_by_workload, _ = _sum_values_by_workload(mem_limit, target.cluster, pod_owners)
     cpu_request_by_container = _values_by_workload_container(cpu_request, pod_owners)
     cpu_limit_by_container = _values_by_workload_container(cpu_limit, pod_owners)
     mem_request_by_container = _values_by_workload_container(mem_request, pod_owners)
     mem_limit_by_container = _values_by_workload_container(mem_limit, pod_owners)
-    cpu_usage_by_limit_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners, include_keys=set(cpu_limit))
-    cpu_usage_by_request_workload = _sum_series_by_workload(cpu_usage, target.cluster, pod_owners, include_keys=set(cpu_request))
-    mem_usage_by_limit_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners, include_keys=set(mem_limit))
-    mem_usage_by_request_workload = _sum_series_by_workload(mem_usage, target.cluster, pod_owners, include_keys=set(mem_request))
+    current_metadata = _workload_metadata(target.cluster, container_keys, current_pod_owners, cpu_usage, mem_usage)
     metadata_by_workload = _workload_metadata(
         target.cluster,
         container_keys,
@@ -716,6 +749,16 @@ def _fetch_target(
         mem_usage,
     )
     capacity_history, evidence_errors = _scaling_capacity_history(client, selector, start, end, step)
+    normalized = {}
+    current_capacities = {("cpu", "request"): cpu_request, ("cpu", "limit"): cpu_limit,
+                          ("memory", "request"): mem_request, ("memory", "limit"): mem_limit}
+    for metric, usage in (("cpu", cpu_usage), ("memory", mem_usage)):
+        for basis in ("request", "limit"):
+            if current_capacities[(metric, basis)] and not capacity_history.get((metric, basis)):
+                raise RuntimeError(f"{metric}/{basis} 当前存在配置，但历史容量查询无结果；停止本轮写入，避免使用新规格重算旧利用率")
+            normalized[(metric, basis)] = _historical_normalized_series(
+                usage, capacity_history.get((metric, basis), {}), pod_owners, metric, basis,
+            )
     scaling_series = _scaling_series_by_workload(cpu_usage, mem_usage, capacity_history, pod_owners)
     evidence_collected_at_ms = int(time.time() * 1000)
 
@@ -725,34 +768,10 @@ def _fetch_target(
         mem_s = mem_usage_by_workload.get(key)
         if cpu_s is None or mem_s is None:
             continue
-        cpu_limit_metric, cpu_limit_norm = _normalize_scoped_series(
-            (cpu_usage_by_limit_workload.get(key), cpu_limit_by_workload.get(key), "cpu_usage/cpu_limit"),
-            raw_series=cpu_s,
-            raw_name="cpu_usage_cores",
-        )
-        cpu_request_metric, cpu_request_norm = _normalize_scoped_series(
-            (cpu_usage_by_request_workload.get(key), cpu_request_by_workload.get(key), "cpu_usage/cpu_request"),
-            raw_series=cpu_s,
-            raw_name="cpu_usage_cores",
-        )
-        mem_limit_metric, mem_limit_norm = _normalize_scoped_series(
-            (
-                _series_bytes_to_gb(mem_usage_by_limit_workload.get(key)),
-                _bytes_to_gb(mem_limit_by_workload.get(key)),
-                "memory_working_set/memory_limit",
-            ),
-            raw_series=mem_s / BYTES_PER_GIB,
-            raw_name="memory_working_set_gb",
-        )
-        mem_request_metric, mem_request_norm = _normalize_scoped_series(
-            (
-                _series_bytes_to_gb(mem_usage_by_request_workload.get(key)),
-                _bytes_to_gb(mem_request_by_workload.get(key)),
-                "memory_working_set/memory_request",
-            ),
-            raw_series=mem_s / BYTES_PER_GIB,
-            raw_name="memory_working_set_gb",
-        )
+        cpu_limit_metric, cpu_limit_norm = normalized[('cpu', 'limit')][(key, None)]
+        cpu_request_metric, cpu_request_norm = normalized[('cpu', 'request')][(key, None)]
+        mem_limit_metric, mem_limit_norm = normalized[('memory', 'limit')][(key, None)]
+        mem_request_metric, mem_request_norm = normalized[('memory', 'request')][(key, None)]
         cpu_limit_quality = _data_quality(cpu_limit_norm, step)
         cpu_request_quality = _data_quality(cpu_request_norm, step)
         mem_limit_quality = _data_quality(mem_limit_norm, step)
@@ -768,50 +787,10 @@ def _fetch_target(
             mem_container_s = mem_usage_by_container.get(key, {}).get(container)
             if cpu_container_s is None or mem_container_s is None:
                 continue
-            cpu_limit_total = _container_total_value(cpu_limit_by_container.get(key, {}), container)
-            cpu_request_total = _container_total_value(cpu_request_by_container.get(key, {}), container)
-            mem_limit_total = _container_total_value(mem_limit_by_container.get(key, {}), container)
-            mem_request_total = _container_total_value(mem_request_by_container.get(key, {}), container)
-            cpu_limit_container_metric, cpu_limit_container_norm = _normalize_scoped_series(
-                (
-                    cpu_container_s if cpu_limit_total else None,
-                    cpu_limit_total,
-                    "cpu_usage/cpu_limit",
-                ),
-                raw_series=cpu_container_s,
-                raw_name="cpu_usage_cores",
-            )
-            cpu_request_container_metric, cpu_request_container_norm = _normalize_scoped_series(
-                (
-                    cpu_container_s if cpu_request_total else None,
-                    cpu_request_total,
-                    "cpu_usage/cpu_request",
-                ),
-                raw_series=cpu_container_s,
-                raw_name="cpu_usage_cores",
-            )
-            mem_limit_container_metric, mem_limit_container_norm = _normalize_scoped_series(
-                (
-                    _series_bytes_to_gb(mem_container_s)
-                    if mem_limit_total
-                    else None,
-                    _bytes_to_gb(mem_limit_total),
-                    "memory_working_set/memory_limit",
-                ),
-                raw_series=mem_container_s / BYTES_PER_GIB,
-                raw_name="memory_working_set_gb",
-            )
-            mem_request_container_metric, mem_request_container_norm = _normalize_scoped_series(
-                (
-                    _series_bytes_to_gb(mem_container_s)
-                    if mem_request_total
-                    else None,
-                    _bytes_to_gb(mem_request_total),
-                    "memory_working_set/memory_request",
-                ),
-                raw_series=mem_container_s / BYTES_PER_GIB,
-                raw_name="memory_working_set_gb",
-            )
+            cpu_limit_container_metric, cpu_limit_container_norm = normalized[('cpu', 'limit')][(key, container)]
+            cpu_request_container_metric, cpu_request_container_norm = normalized[('cpu', 'request')][(key, container)]
+            mem_limit_container_metric, mem_limit_container_norm = normalized[('memory', 'limit')][(key, container)]
+            mem_request_container_metric, mem_request_container_norm = normalized[('memory', 'request')][(key, container)]
             container_quality[container] = {
                 "cpu_limit": _data_quality(cpu_limit_container_norm, step),
                 "cpu_request": _data_quality(cpu_request_container_norm, step),
@@ -867,7 +846,7 @@ def _fetch_target(
             mem_request_norm, step, max_interpolation_gap_steps
         )
         namespace, owner_kind, owner_name = key
-        meta = metadata_by_workload.get(key, {})
+        meta = current_metadata.get(key, {})
         # 优先使用 kube-state-metrics 上报的控制器副本数（spec/status replicas），
         # 它来自 K8s API 是权威值；仅当 kube-state-metrics 无数据时才回退到
         # Prometheus 中有容器指标的 pod 数，避免某个 pod 未上报指标时低估副本数。
@@ -941,13 +920,13 @@ def _fetch_target(
             "series": scaling_series.get(key, []),
             "query_errors": evidence_errors,
             "provenance": {
-                "owner_mapping": "current_instant_snapshot",
+                "owner_mapping": "historical_range_unique_owner_with_current_fallback",
                 "aggregation": "same_observed_members_at_exact_timestamp",
                 "cpu_rate_window": target.rate_window,
                 "orphan_container_series": len(orphan_keys),
             },
             "limitations": [
-                "Historical membership cannot be proven for departed or reassigned containers using current owner mappings.",
+                "Historical ownership requires retained owner metrics; ambiguous ownership is excluded.",
                 "Containers absent from all queried metrics at a timestamp cannot be detected; this is observed mapped capacity, not physical cluster utilization.",
             ],
         }
@@ -959,6 +938,81 @@ def _fetch_target(
             f"集群 {target.cluster} 解析出 {len(workload_keys)} 个 Workload，"
             "但没有一个同时具备 CPU 与内存使用率序列，无法聚合"
         )
+    return out
+
+
+def _historical_workload_owners(client, pod_selector, rs_selector, start, end, step, current_pods, current_rs):
+    """恢复已退出 Pod 的历史归属；同名对象归属有冲突时不猜测。"""
+    def collect(metric_name, selector, name_label, current):
+        candidates = {key: {value} for key, value in current.items()}
+        prefix = selector + "," if selector else ""
+        history_found = False
+        for query in (f'{metric_name}{{{prefix}owner_is_controller="true"}}', f"{metric_name}{{{selector}}}"):
+            try:
+                rows = client.query_range(query, start=start, end=end, step=step)
+            except Exception as exc:
+                logger.warning("[k8s_prometheus] 历史归属查询失败: metric=%s error=%s", metric_name, exc)
+                continue
+            if not rows:
+                continue
+            history_found = True
+            for row in rows:
+                labels = row.get("metric", {})
+                key = (labels.get("namespace"), labels.get(name_label))
+                owner = (labels.get("owner_kind"), labels.get("owner_name"))
+                if all(key) and all(owner) and any(float(value) > 0 for _, value in row.get("values", [])):
+                    candidates.setdefault(key, set()).add(owner)
+            break
+        if not history_found:
+            logger.warning("[k8s_prometheus] 无历史归属数据，仅可使用当前归属: metric=%s", metric_name)
+        conflicts = {key for key, owners in candidates.items() if len(owners) != 1}
+        if conflicts:
+            logger.warning("[k8s_prometheus] 排除历史归属冲突: metric=%s objects=%d", metric_name, len(conflicts))
+        return {key: next(iter(owners)) for key, owners in candidates.items() if key not in conflicts}, conflicts
+
+    pods, _ = collect("kube_pod_owner", pod_selector, "pod", current_pods)
+    replica_sets, conflicts = collect("kube_replicaset_owner", rs_selector, "replicaset", current_rs)
+    result = {}
+    for key, owner in pods.items():
+        if owner[0].lower() == "replicaset":
+            rs_key = (key[0], owner[1])
+            if rs_key in conflicts:
+                continue
+            owner = replica_sets.get(rs_key, owner)
+        result[key] = owner
+    return result
+
+
+def _historical_normalized_series(usage, capacity, owners, metric, basis):
+    """用同一时间、同一组容器的使用量和历史容量计算比例，不套用当前规格。"""
+    groups = {}
+    for member in usage.keys() | capacity.keys():
+        workload = _workload_key(member, owners)
+        if workload is not None:
+            for container in (None, member[2]):
+                groups.setdefault((workload, container), set()).add(member)
+    out = {}
+    ratio_name = f"cpu_usage/cpu_{basis}" if metric == "cpu" else f"memory_working_set/memory_{basis}"
+    raw_name = "cpu_usage_cores" if metric == "cpu" else "memory_working_set_gb"
+    for group, members in groups.items():
+        used = pd.DataFrame({key: usage[key] for key in members if key in usage}).sort_index()
+        caps = pd.DataFrame({key: capacity[key] for key in members if key in capacity}).sort_index()
+        if used.empty:
+            continue
+        if caps.empty or not caps.gt(0).any().any():
+            out[group] = (raw_name, used.sum(axis=1, min_count=1) / (1 if metric == "cpu" else BYTES_PER_GIB))
+            continue
+        columns = sorted(members)
+        index = used.index.union(caps.index)
+        used = used.reindex(index=index, columns=columns)
+        caps = caps.reindex(index=index, columns=columns)
+        positive = caps.gt(0) & np.isfinite(caps)
+        valid_usage = used.ge(0) & np.isfinite(used)
+        # 有基线的成员缺失历史容量或使用量时留缺口，不能变成单副本假低谷。
+        unknown_capacity = valid_usage & caps.isna() & positive.any(axis=0)
+        valid = positive.any(axis=1) & ~(positive & ~valid_usage).any(axis=1) & ~unknown_capacity.any(axis=1)
+        ratio = used.where(positive).sum(axis=1, min_count=1) / caps.where(positive).sum(axis=1, min_count=1)
+        out[group] = (ratio_name, ratio.where(valid).dropna())
     return out
 
 
@@ -1361,27 +1415,6 @@ def _sum_series_by_workload_container(
     return out
 
 
-def _sum_values_by_workload(
-    values_by_container: Dict[ContainerKey, float],
-    cluster: str,
-    pod_owners: Dict[Tuple[str, str], Tuple[str, str]],
-) -> Tuple[Dict[WorkloadKey, float], Dict[WorkloadKey, int]]:
-    out: Dict[WorkloadKey, float] = {}
-    pod_counts: Dict[WorkloadKey, set] = {}
-    for key, value in values_by_container.items():
-        wk = _workload_key(key, pod_owners)
-        if wk is None:
-            continue
-        out[wk] = out.get(wk, 0.0) + float(value)
-        # 记录有该指标的 pod（namespace + pod_name），用于后续按 pod 数求均值
-        namespace, pod, _container = key
-        pod_counts.setdefault(wk, set()).add((namespace, pod))
-    pod_counts_int: Dict[WorkloadKey, int] = {
-        wk: len(pods) for wk, pods in pod_counts.items()
-    }
-    return out, pod_counts_int
-
-
 def _values_by_workload_container(
     values_by_container: Dict[ContainerKey, float],
     pod_owners: Dict[Tuple[str, str], Tuple[str, str]],
@@ -1409,17 +1442,6 @@ def _container_value(container_values: Dict[str, Dict[str, Any]], container: str
     if total is None or not isinstance(pods, set) or not pods:
         return None
     return float(total) / max(1, len(pods))
-
-
-def _container_total_value(container_values: Dict[str, Dict[str, Any]], container: str) -> Optional[float]:
-    item = container_values.get(container)
-    if not isinstance(item, dict):
-        return None
-    total = item.get("total")
-    pods = item.get("pods")
-    if total is None or not isinstance(pods, set) or not pods:
-        return None
-    return float(total)
 
 
 def _container_specs(
@@ -1462,23 +1484,6 @@ def _workload_metadata(
         if node:
             meta["nodes"].add(node)
     return out
-
-
-def _normalize_scoped_series(
-    *candidates: Tuple[Optional[pd.Series], Optional[float], str],
-    raw_series: pd.Series,
-    raw_name: str,
-) -> Tuple[str, pd.Series]:
-    for series, denominator, ratio_name in candidates:
-        if series is not None and denominator and denominator > 0:
-            return ratio_name, series.astype(float) / float(denominator)
-    return raw_name, raw_series.astype(float)
-
-
-def _series_bytes_to_gb(series: Optional[pd.Series]) -> Optional[pd.Series]:
-    if series is None:
-        return None
-    return series / BYTES_PER_GIB
 
 
 def _regularize_series(

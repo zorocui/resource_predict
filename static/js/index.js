@@ -71,7 +71,7 @@
     app.state.adviceSummary = summaryPayload;
     app.state.overviewSummary = overviewPayload;
     app.state.forecastConfigPayload = {
-      enabled_methods: Object.keys(summaryPayload?.best_method_counts || {}),
+      enabled_methods: summaryPayload?.enabled_methods || Object.keys(summaryPayload?.best_method_counts || {}),
       enable_ensemble: false,
     };
     const items = payload.items || [];
@@ -265,6 +265,12 @@
       const status = await refreshUpdateStatus();
       if (!status) return;
       const running = Boolean(status.running);
+      const refreshButton = document.querySelector("[data-workload-refresh]:disabled");
+      if (refreshButton) {
+        const message = document.getElementById("workload-refresh-message");
+        if (message) message.textContent = running ? `重新拉取预测中：${status.phase || "处理中"}` : (status.last_error || status.last_result?.message || "重新拉取预测已完成");
+        if (!running) refreshButton.disabled = false;
+      }
       if (running) {
         updatePollWasRunning = true;
         updatePollTimer = window.setTimeout(poll, 1500);
@@ -835,6 +841,18 @@
       if (app.state.activeView === "tasks") renderTaskPanel();
     });
     app.els.detailPanel.addEventListener("click", (event) => {
+      const refreshBtn = event.target.closest("[data-workload-refresh]");
+      if (refreshBtn) {
+        event.preventDefault();
+        if (refreshBtn.disabled) return;
+        refreshBtn.disabled = true;
+        const message = document.getElementById("workload-refresh-message");
+        if (message) message.textContent = "正在提交重新拉取预测…";
+        api.postJson(`/api/resources/${encodeURIComponent(refreshBtn.dataset.workloadRefresh)}/refresh-forecast`, {})
+          .then(() => { if (message) message.textContent = "已提交，可在数据更新页查看进度。"; startUpdatePolling(); })
+          .catch(error => { refreshBtn.disabled = false; if (message) message.textContent = String(error.message || error); });
+        return;
+      }
       const scaleBtn = event.target.closest("[data-scaling-mode]");
       if (!scaleBtn) return;
       event.preventDefault();

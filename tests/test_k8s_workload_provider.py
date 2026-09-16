@@ -74,6 +74,9 @@ class FakePrometheusClient:
             if self._includes_pod_container(query):
                 rows.append(self._range_row("ns", "api-rs-a", "POD", "node-1", [5.0 * GIB, 5.0 * GIB]))
             return rows
+        if "kube_pod_container_resource_" in query:
+            return [{"metric": row["metric"], "values": [[BASE_TS, row["value"][1]], [BASE_TS + 300, row["value"][1]]]}
+                    for row in self.query(query)]
         return []
 
     def query(self, query: str, *, ts=None):
@@ -164,6 +167,9 @@ class AsymmetricResourcePrometheusClient:
         pass
 
     def query_range(self, query: str, *, start: float, end: float, step: int):
+        if "kube_pod_container_resource_" in query:
+            return [{"metric": row["metric"], "values": [[BASE_TS, row["value"][1]], [BASE_TS + 300, row["value"][1]]]}
+                    for row in self.query(query)]
         if "container_cpu_usage_seconds_total" in query:
             return [
                 FakePrometheusClient._range_row("monitoring", "alertmanager-main-0", "alertmanager", "node-1", [0.01, 0.02]),

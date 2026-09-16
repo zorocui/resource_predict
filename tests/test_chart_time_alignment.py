@@ -15,9 +15,10 @@ def test_new_observations_do_not_move_test_predictions(explicit):
              "x_pred_ms": ms[6:8], "preds_future": {"rolling_mean": [6, 7]}}
     if explicit:
         block["x_test_ms"] = ms[3:6]
-    detail = {"resource_id": "k8s:c:ns:deployment:app", "charts_forecast": {"cpu_request": block},
+    detail = {"resource_id": "k8s:c:ns:deployment:app", "data_quality":{"cpu_request":{"prediction_skipped":True}},
+              "container_data_quality":{"app":{"cpu_request":{"prediction_skipped":True}}}, "charts_forecast": {"cpu_request": block},
               "container_charts_forecast": {"app": {"cpu_request": block}}}
-    raw = {"resource_id": detail["resource_id"], "resource_type": "k8s_workload", "cpu_request": raw_series,
+    raw = {"resource_id": detail["resource_id"], "resource_type": "k8s_workload", "spec":{"last_scaled_at_epoch_ms":ms[6]}, "cpu_request": raw_series,
            "container_metrics": {"app": {"cpu_request": raw_series}}}
     merged = merge_charts_into_detail(detail, {detail["resource_id"]: raw}, test_size=99)
     for chart in [merged["charts"]["cpu_request"], merged["container_charts"]["app"]["cpu_request"]]:
@@ -27,6 +28,9 @@ def test_new_observations_do_not_move_test_predictions(explicit):
         assert chart["x_observed_ms"] == ms[6:]
         assert chart["y_observed"] == [6, 7, 8, 9]
         assert chart["x_train_ms"] == ms[:3]
+        assert chart["latest_observation_ms"] == ms[-1]
+        assert chart["last_scaled_at_epoch_ms"] == ms[6]
+        assert chart["prediction_skipped"] is True
 
 
 def test_no_known_test_boundary_does_not_guess_from_latest_raw():

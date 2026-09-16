@@ -886,11 +886,11 @@
   }
 
   function bestMethodCounts(summaryItems, summaryPayload = null) {
-    const methods = activeForecastMethods();
+    const methods = [...new Set([...activeForecastMethods(), ...Object.keys(summaryPayload?.best_method_counts || {})])];
     const backendCounts = summaryPayload?.best_method_counts;
     if (backendCounts && typeof backendCounts === "object") {
       return methods.map((method) => [
-        `${app.labelMap[method] || method} 最优`,
+        `${app.labelMap[method] || method} 最优${activeForecastMethods().includes(method) ? "" : "（未启用）"}`,
         Number(backendCounts[method] || 0),
       ]);
     }

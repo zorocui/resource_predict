@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from resource_predict.data.updater import (
+    _update_exclusive,
+    UpdateBusyError,
     mark_external_update_failed,
     mark_external_update_finished,
     mark_external_update_started,
@@ -109,6 +111,11 @@ def run_k8s_prometheus_upsert(
     """Fetch K8S Workload metrics from Prometheus and merge them into outputs."""
     cluster_list = list(clusters) if clusters is not None else None
     cluster_results: List[Dict[str, Any]] = []
+    # Own the complete fetch/update/history lifecycle before touching shared status.
+    if not _update_exclusive.acquire(blocking=not fail_if_busy):
+        raise UpdateBusyError("已有更新任务正在运行中")
+    started = False
+    source_label = _trigger_source_label(trigger_source)
     try:
         out_dir = scoped_out_dir("k8s", settings.app.out_dir)
         history_hours = _history_hours_for_fetch(
@@ -117,7 +124,6 @@ def run_k8s_prometheus_upsert(
             full_refresh=full_refresh,
         )
         window_label = _fetch_window_label(history_hours)
-        source_label = _trigger_source_label(trigger_source)
         mark_external_update_started(
             "fetching_k8s_prometheus",
             f"{source_label}：正在从 K8S Prometheus 拉取 Workload 指标（{window_label}）",
@@ -126,6 +132,7 @@ def run_k8s_prometheus_upsert(
                 "fetch_window_label": window_label,
             },
         )
+        started = True
         fetch_started_at = _utc_timestamp()
         fetch_started_perf = time.perf_counter()
         logger.info(
@@ -169,6 +176,8 @@ def run_k8s_prometheus_upsert(
                 fail_if_busy=fail_if_busy,
                 out_dir=out_dir,
                 freq_hint=f"{step_seconds}s",
+                task_source=source_label,
+                _exclusive_already_acquired=True,
             )
         )
         result["cluster_results"] = cluster_results
@@ -182,12 +191,19 @@ def run_k8s_prometheus_upsert(
                 cluster_results=cluster_results,
             )
         else:
-            result["status"] = cluster_status
+            result["status"] = "partial_success" if result.get("status") == "partial_success" else cluster_status
             mark_external_update_finished(result)
         return result
     except Exception as exc:
+        if not started:
+            mark_external_update_started(
+                "fetching_k8s_prometheus", source_label,
+                metadata={"task_source": source_label},
+            )
         mark_external_update_failed(str(exc), cluster_results=cluster_results)
         raise
+    finally:
+        _update_exclusive.release()
 
 
 def _history_hours_for_fetch(

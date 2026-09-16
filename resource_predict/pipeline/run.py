@@ -64,6 +64,7 @@ def generate_forecasts(
     save_raw: Optional[bool] = None,
     resource_ids: Optional[List[str]] = None,
     metric_names_by_resource: Optional[Dict[str, Any]] = None,
+    local_update: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     生成云资源预测结果（并行）。
@@ -87,6 +88,8 @@ def generate_forecasts(
 
     prepared_data: List[Dict[str, Any]]
     partial_resource_ids: Set[str] = {str(x) for x in (resource_ids or []) if str(x)}
+    if local_update and (not predict_only or not partial_resource_ids):
+        raise ValueError("局部产物更新必须指定 predict_only 和 resource_ids")
     metric_filter_by_id = normalize_metric_filter(metric_names_by_resource)
     existing_items_for_partial: List[Dict[str, Any]] = []
     existing_partial_ids: Set[str] = set()
@@ -119,7 +122,7 @@ def generate_forecasts(
         freq = freq or str(raw_meta.get("freq") or cfg.freq)
         resources_ct = len(prepared_data)
         if partial_resource_ids:
-            existing_items_for_partial = load_existing_forecast_items(out_base)
+            existing_items_for_partial = load_existing_forecast_items(out_base, partial_resource_ids if local_update else None)
             existing_partial_ids = {
                 str(x.get("resource_id"))
                 for x in existing_items_for_partial
@@ -190,7 +193,18 @@ def generate_forecasts(
         rid = p["resource_id"]
         metric_names = metric_names_for_resource(p)
         min_len = min(len(p[m]) for m in metric_names)
-        if min_len <= test_size:
+        if resource_family == "workload":
+            selected = list(metric_names)
+            if metric_partial_enabled and rid in existing_partial_ids:
+                selected = [m for m in metric_names if m in metric_filter_by_id.get(rid, set(metric_names))] or selected
+            eligible = any(len(p[m]) > test_size for m in selected) or any(
+                len(series) > test_size
+                for metrics in p.get("container_metrics", {}).values()
+                for metric, series in metrics.items() if metric in metric_names
+            )
+        else:
+            eligible = min_len > test_size
+        if not eligible:
             skipped_short.append(rid)
     retained_skip_items = _load_retained_skipped_items(
         out_base,
@@ -201,7 +215,7 @@ def generate_forecasts(
         for rid in skipped_short:
             logger.warning(
                 "[progress] 跳过最近连续段有效点数不足的资源：%s"
-                "（最近连续段长度 ≤ test_size=%d）",
+                "（最近连续段长度 ≤ test_size=%d；Workload具体指标、缺口时刻及点数见指标预测跳过日志）",
                 rid, test_size,
             )
         prepared_data = [
@@ -316,7 +330,8 @@ def generate_forecasts(
         item.pop("_slot", None)
 
     from resource_predict.services.accuracy_summary import write_accuracy_summary
-    write_accuracy_summary(out_base, resources_items)
+    write_accuracy_summary(out_base, resources_items,
+                           **({"replace_resource_ids": {str(item["resource_id"]) for item in resources_items}} if local_update else {}))
     for item in resources_items:
         item.pop("_accuracy_holdout", None)
     predicted_count = len(resources_items)
@@ -325,11 +340,6 @@ def generate_forecasts(
         for item in resources_items
         if item.get("resource_id") is not None
     }
-    resources_items = _restore_skipped_container_forecasts(
-        out_base,
-        resources_items=resources_items,
-        prediction_skips=prediction_skips,
-    )
     if retained_skip_items:
         resources_items = merge_partial_forecast_items(
             retained_skip_items,
@@ -340,7 +350,7 @@ def generate_forecasts(
             len(retained_skip_items),
         )
     if predict_only and partial_resource_ids:
-        existing_items = existing_items_for_partial or load_existing_forecast_items(out_base)
+        existing_items = existing_items_for_partial or load_existing_forecast_items(out_base, partial_resource_ids if local_update else None)
         if existing_items:
             resources_items = merge_partial_forecast_items(
                 existing_items,
@@ -355,6 +365,10 @@ def generate_forecasts(
         else:
             logger.warning("[progress] 未找到既有预测产物，本次仅输出已重算资源")
 
+    resources_items = _restore_skipped_forecasts(
+        out_base, resources_items=resources_items, prediction_skips=prediction_skips,
+        predicted_resource_ids=predicted_resource_ids,
+    )
     action_gate_state = apply_action_gate_confirmations(
         resources_items,
         eligible_resource_ids=predicted_resource_ids,
@@ -371,7 +385,11 @@ def generate_forecasts(
     logger.info("[parallel] fit_phase=%.2fs postprocess=%.2fs preparation=%.2fs completed=%d/%d worker_processes=%d",
                 execution_stats["fit_seconds"], execution_stats["postprocess_seconds"], execution_stats["preparation_seconds"],
                 execution_stats.get("completed", 0), sum(metric_counts), len(execution_stats.get("pids", [])))
-    manifest_items = write_prediction_outputs(
+    output_writer = write_prediction_outputs
+    if local_update:
+        from resource_predict.pipeline.partial_outputs import write_partial_prediction_outputs
+        output_writer = write_partial_prediction_outputs
+    manifest_items = output_writer(
         out_base=out_base,
         resources_items=resources_items,
         active_methods=active_methods,
@@ -435,7 +453,10 @@ def _load_retained_skipped_items(
         if item.get("resource_id") is not None
     }
     retained: List[Dict[str, Any]] = []
-    for old in load_existing_forecast_items(out_base):
+    previous = {str(item["resource_id"]): item for item in load_existing_forecast_items(out_base, skipped_resource_ids)}
+    for rid in sorted(skipped_resource_ids):
+        old = previous.get(rid, {"resource_id": rid, "resource_type": current_by_id.get(rid, {}).get("resource_type"),
+                                 "charts_forecast": {}, "container_charts_forecast": {}, "metrics": {}})
         rid = str(old.get("resource_id") or "")
         if rid not in skipped_resource_ids:
             continue
@@ -453,44 +474,57 @@ def _load_retained_skipped_items(
     return retained
 
 
-def _restore_skipped_container_forecasts(
+def _restore_skipped_forecasts(
     out_base: Path,
     *,
     resources_items: List[Dict[str, Any]],
     prediction_skips: List[Dict[str, str]],
+    predicted_resource_ids: Set[str],
 ) -> List[Dict[str, Any]]:
     skipped: Dict[str, List[tuple[str, str]]] = {}
     for entry in prediction_skips:
         metric_path = str(entry.get("metric") or "")
         parts = metric_path.split("/", 2)
-        if len(parts) != 3 or parts[0] != "container":
-            continue
         skipped.setdefault(str(entry.get("resource_id") or ""), []).append(
-            (parts[1], parts[2])
+            (parts[1], parts[2]) if len(parts) == 3 and parts[0] == "container" else ("", metric_path)
         )
     if not skipped:
         return resources_items
     previous_by_id = {
         str(item.get("resource_id") or ""): item
-        for item in load_existing_forecast_items(out_base)
+        for item in load_existing_forecast_items(out_base, set(skipped))
     }
     restored: List[Dict[str, Any]] = []
     for source in resources_items:
         rid = str(source.get("resource_id") or "")
-        old = previous_by_id.get(rid)
-        if not isinstance(old, dict) or rid not in skipped:
+        old = previous_by_id.get(rid, {})
+        if rid not in skipped:
             restored.append(source)
             continue
         item = dict(source)
         charts = _copy_nested_mapping(item.get("container_charts_forecast"))
-        old_charts = old.get("container_charts_forecast")
-        if isinstance(old_charts, dict):
-            for container, metric in skipped[rid]:
-                old_container = old_charts.get(container)
-                if isinstance(old_container, dict) and isinstance(old_container.get(metric), dict):
-                    charts.setdefault(container, {})[metric] = old_container[metric]
-        if charts:
-            item["container_charts_forecast"] = charts
+        for container, metric in skipped[rid]:
+            if container:
+                old_chart = old.get("container_charts_forecast", {}).get(container, {}).get(metric)
+                charts.setdefault(container, {})[metric] = old_chart if isinstance(old_chart, dict) else {}
+                quality = item.setdefault("container_data_quality", {}).setdefault(container, {}).setdefault(metric, {})
+            else:
+                old_chart = old.get("charts_forecast", {}).get(metric)
+                for field in ("charts_forecast", "best_methods", "metrics", "observed_stats", "forecast_diagnostics"):
+                    item[field] = dict(item.get(field, {}))
+                    if metric in old.get(field, {}):
+                        item[field][metric] = old[field][metric]
+                item.setdefault("charts_forecast", {}).setdefault(metric, {})
+                quality = item.setdefault("data_quality", {}).setdefault(metric, {})
+            quality["prediction_skipped"] = True
+            quality["forecast_status"] = "retained" if old_chart else "unavailable"
+        item["container_charts_forecast"] = charts
+        item["prediction_status"] = "partial_success" if rid in predicted_resource_ids else "skipped"
+        # Retained charts are display evidence, never fresh executable advice.
+        item["scaling_advice"] = {"action": "insufficient_data", "metric_actions": {},
+                                  "action_gate": {"state": "blocked", "reason": "部分指标连续数据不足，预测未全部更新"},
+                                  "target_k8s_policy": {"ready_for_execution": False}}
+        item["resource_profile"] = {**item.get("resource_profile", {}), "metric_actions": {}}
         restored.append(item)
     return restored
 

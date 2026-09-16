@@ -300,6 +300,11 @@ def merge_charts_into_detail(
             points = max(0, int(history_points))
             y_train = y_train.iloc[-points:] if points else y_train.iloc[0:0]
         merged_charts[kind] = {
+            "forecast_status": detail.get("data_quality", {}).get(kind, {}).get("forecast_status"),
+            "forecast_generated_at_epoch_ms": detail.get("forecast_diagnostics", {}).get(kind, {}).get("provenance", {}).get("generated_at_epoch_ms"),
+            "prediction_skipped": bool(detail.get("data_quality", {}).get(kind, {}).get("prediction_skipped")),
+            "latest_observation_ms": int(y_full.dropna().index.max().value // 1_000_000) if not y_full.dropna().empty else None,
+            "last_scaled_at_epoch_ms": out.get("spec", {}).get("last_scaled_at_epoch_ms"),
             "x_train_ms": _timestamps_ms_from_index(y_train.index),
             "y_train": _series_to_lists(y_train),
             "x_test_ms": _timestamps_ms_from_index(y_test.index),
@@ -329,7 +334,10 @@ def merge_charts_into_detail(
     if container_charts:
         out["container_charts"] = container_charts
     if isinstance(raw.get("container_data_quality"), dict):
-        out["container_data_quality"] = raw["container_data_quality"]
+        out["container_data_quality"] = {
+            name: {**metrics, **detail.get("container_data_quality", {}).get(name, {})}
+            for name, metrics in raw["container_data_quality"].items()
+        }
     if isinstance(raw.get("container_metric_modes"), dict):
         out["container_metric_modes"] = raw["container_metric_modes"]
     out.pop("charts_forecast", None)
@@ -377,6 +385,11 @@ def _merge_container_charts(
                 points = max(0, int(history_points))
                 y_train = y_train.iloc[-points:] if points else y_train.iloc[0:0]
             metric_out[str(metric)] = {
+                "forecast_status": detail.get("container_data_quality", {}).get(container, {}).get(metric, {}).get("forecast_status"),
+                "forecast_generated_at_epoch_ms": block.get("forecast_diagnostics", {}).get("provenance", {}).get("generated_at_epoch_ms"),
+                "prediction_skipped": bool(detail.get("container_data_quality", {}).get(container, {}).get(metric, {}).get("prediction_skipped")),
+                "latest_observation_ms": int(y_full.dropna().index.max().value // 1_000_000) if not y_full.dropna().empty else None,
+                "last_scaled_at_epoch_ms": raw.get("spec", {}).get("last_scaled_at_epoch_ms") or detail.get("spec", {}).get("last_scaled_at_epoch_ms"),
                 "x_train_ms": _timestamps_ms_from_index(y_train.index),
                 "y_train": _series_to_lists(y_train),
                 "x_test_ms": _timestamps_ms_from_index(y_test.index),

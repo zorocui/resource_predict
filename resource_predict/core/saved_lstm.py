@@ -46,6 +46,10 @@ def _load(descriptor):
         checkpoint = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
         if checkpoint.get("model_version") not in {"shared-lstm-experiment-v2", "shared-lstm-experiment-v3"}:
             raise ValueError("仅支持训练产物 model.pt v2/v3，不支持 resume.pt")
+        config = checkpoint.get("config", {})
+        if (not isinstance(config, dict) or config.get("resource_type") not in {"openstack_vm", "k8s_workload"}
+                or config.get("level") not in {"resource", "container"}):
+            raise ValueError("LSTM 模型资源类型或训练层级配置无效")
         architecture = checkpoint["architecture"]
         lookback, horizon = int(checkpoint["lookback"]), int(architecture["horizon"])
         if min(lookback, horizon) <= 0:
@@ -73,6 +77,21 @@ def _load(descriptor):
         if len(_cache) > 2:
             _cache.popitem(last=False)
         return result
+
+
+def lstm_applicability(identity, descriptor):
+    """类型/层级不适用是候选路由跳过，不等同于模型预测失败。"""
+    model = _load(descriptor)
+    if not identity:
+        raise ValueError("LSTM 缺少资源/容器/指标身份")
+    scope = {"model_resource_type": model["config"]["resource_type"], "model_level": model["config"]["level"],
+             "requested_resource_type": identity["resource_type"],
+             "requested_level": "container" if identity.get("container") else "resource"}
+    if scope["requested_resource_type"] != scope["model_resource_type"]:
+        return {**scope, "decision": "skipped", "reason": "resource_type_mismatch"}
+    if scope["requested_level"] != scope["model_level"]:
+        return {**scope, "decision": "skipped", "reason": "resource_level_mismatch"}
+    return {**scope, "decision": "run", "reason": "scope_matches"}
 
 
 def forecast_saved_lstm(history, index, identity, descriptor, max_age_hours):

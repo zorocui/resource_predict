@@ -14,7 +14,7 @@
       ${(data.needs_regeneration || []).length ? `<p role="status">${escape(data.needs_regeneration.join("、"))} 的汇总仍为旧口径，未计入当前准确率；请重新预测以生成新口径结果。</p>` : ""}
       <p>测试时间：${date(range[0])} 至 ${date(range[1])}</p>
       <p>${data.runs.map(run => `${escape(run.scope)} 更新于 ${date(run.generated_at_ms)}`).join("；") || "尚未生成简化版评估。下一次预测完成后自动显示，无需手动评估。"}</p>
-      <p>每类资源采用最近一次预测运行的测试汇总，增量预测仅代表本次重算范围。这是经过预处理的历史数据测试，不代表未来预测已兑现。</p>
+      <p>${data.runs.some(run => run.mixed_prediction_runs) ? "包含单资源局部更新：各资源保留各自最近的测试结果，预测批次可能不同。" : "每类资源采用最近一次预测运行的测试汇总，增量预测仅代表本次重算范围。"}这是经过预处理的历史数据测试，不代表未来预测已兑现。</p>
       ${data.invalid_points ? `<p>无效或非独立测试点：${number(data.invalid_points)}，未计入准确率。</p>` : ""}
       ${data.absolute_unit_points ? `<p>另有 ${number(data.absolute_unit_points)} 个核数、GiB 或其他非百分比点，仅报告误差，不计入准确率。</p>` : ""}
       ${data.valid_points === 0 && data.runs.length ? "<p>本次没有可计算百分比准确率的有效测试点，准确率显示 —，不是 0%。</p>" : ""}

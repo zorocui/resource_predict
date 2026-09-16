@@ -1,7 +1,9 @@
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from resource_predict.providers import k8s_prometheus as provider
 from tests.test_k8s_workload_provider import BASE_TS, GIB, FakePrometheusClient, _target
@@ -19,7 +21,7 @@ class HistoricalClient(FakePrometheusClient):
 def test_fetch_collects_historical_capacity_independent_of_latest_spec():
     HistoricalClient.range_calls = []
     target = replace(_target("cluster-a"), rate_window="7m")
-    with patch.object(provider, "PrometheusClient", HistoricalClient), patch.object(provider.time, "time", side_effect=[BASE_TS + 600, BASE_TS + 900]):
+    with patch.object(provider, "PrometheusClient", HistoricalClient), patch.object(provider, "time", SimpleNamespace(time=Mock(side_effect=[BASE_TS + 600, BASE_TS + 900]))):
         item, = provider._fetch_target(target, 0)
     evidence = item["scaling_evidence"]
     assert evidence["source"] == "k8s_prometheus_scaling_unfilled"
@@ -34,13 +36,13 @@ def test_fetch_collects_historical_capacity_independent_of_latest_spec():
     assert memory["usage"] == [0.5, 0.6]
     assert memory["capacity"] == [4, 2]
     assert memory["unit"] == "GiB"
-    assert evidence["provenance"]["owner_mapping"] == "current_instant_snapshot"
+    assert evidence["provenance"]["owner_mapping"] == "historical_range_unique_owner_with_current_fallback"
     assert evidence["limitations"]
-    assert len(HistoricalClient.range_calls) == 6
+    assert len(HistoricalClient.range_calls) == 10
     assert "[7m]" in HistoricalClient.range_calls[0]["query"]
 
 
-def test_missing_history_and_query_failure_are_nonfatal_and_never_fabricated():
+def test_missing_configured_capacity_stops_fetch_without_fabricating_history():
     class MissingClient(FakePrometheusClient):
         def query_range(self, query, **kwargs):
             if "kube_pod_container_resource_limits" in query:
@@ -48,12 +50,12 @@ def test_missing_history_and_query_failure_are_nonfatal_and_never_fabricated():
             return super().query_range(query, **kwargs)
 
     with patch.object(provider, "PrometheusClient", MissingClient):
-        item, = provider._fetch_target(_target("cluster-a"), 0)
-    evidence = item["scaling_evidence"]
-    assert len(evidence["query_errors"]) == 4
-    assert any("TimeoutError" in error for error in evidence["query_errors"])
-    assert all(value is None for row in evidence["series"] for value in row["capacity"])
-    assert all(value is None for row in evidence["series"] for value in row["usage"])
+        with pytest.raises(RuntimeError, match="历史容量查询无结果"):
+            provider._fetch_target(_target("cluster-a"), 0)
+    history, errors = provider._scaling_capacity_history(MissingClient(), "", 0, 1000, 300)
+    assert any("TimeoutError" in error for error in errors)
+    assert history[("cpu", "limit")] == {}
+    assert history[("memory", "limit")] == {}
 
 
 def test_evidence_matches_members_and_timestamps_without_filling_gaps():

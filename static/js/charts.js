@@ -109,7 +109,7 @@
       month: "2-digit",
       day: "2-digit",
       hour: variant === "md" ? undefined : "2-digit",
-      minute: variant === "mdhm" || variant === "mdh0" ? "2-digit" : undefined,
+      minute: variant === "mdhm" || variant === "mdh0" || variant === "full" ? "2-digit" : undefined,
       second: variant === "full" ? "2-digit" : undefined,
       hour12: false,
     }).formatToParts(new Date(ms));
@@ -493,6 +493,21 @@
     const modeLabel = isVm ? "原始" : activeMode.label;
     const isPercentMode = displayUnit === "percent";
     const historyData = prepareSeriesData(rawTrainPairs, windowInfo, isVm, gapConfig);
+    const observedPairs = toPairs(xObserved, yObserved);
+    const storedLatest = normalizeTsMs(chartData.latest_observation_ms);
+    const latestActual = Math.max(
+      Number.isFinite(storedLatest) ? storedLatest : -Infinity,
+      lastValidTimestamp(rawTrainPairs.concat(rawTestPairs, observedPairs).map(pair => pair[0])) ?? -Infinity
+    );
+    const futureBoundary = Math.max(testEndMs ?? -Infinity, latestActual);
+    const displayedFuture = bestMethod ? { [bestMethod]: chartData.preds_future?.[bestMethod] } : chartData.preds_future;
+    const futureRange = futureForecastRange(xPredFuture, displayedFuture, futureBoundary);
+    const stalePrediction = Boolean(chartData.prediction_skipped) || (latestActual > testEndMs && !futureRange);
+    const testLabel = stalePrediction ? "旧预测测试" : "测试";
+    const observedData = prepareSeriesData(observedPairs, windowInfo, isVm, gapConfig);
+    const actualData = stalePrediction
+      ? prepareSeriesData(rawTrainPairs.concat(toPairs(xTest, yTest), observedPairs), windowInfo, isVm, gapConfig)
+      : (observedData.length ? historyData.concat([[xTest[0] ?? xObserved[0], null]], observedData) : historyData);
     const historyBridgePoint = historyData.length ? historyData[historyData.length - 1] : null;
     const testData = prependBridgePoint(
       prepareSeriesData(rawTestPairs, windowInfo, isVm, gapConfig),
@@ -501,7 +516,7 @@
     const series = [{
       name: "历史",
       type: "line",
-      data: historyData,
+      data: actualData,
       showSymbol: false,
       sampling: "lttb",
       lineStyle: { color: "#2563eb", width: 1.35, opacity: (isVm || activeMode.key === "raw") ? 0.55 : 0.78 },
@@ -511,13 +526,13 @@
     }];
 
     if (app.chartAuxiliaryVisible) {
-      const futureRange = futureForecastRange(xPredFuture, chartData.preds_future, testEndMs);
       const markLineData = auxiliaryMarkLines(metricKey, isPercentMode);
       const markArea = futureRange ? {
         silent: true,
         itemStyle: { color: "rgba(217,119,6,.09)" },
+        label: { show: true, position: "insideTop", color: "#b45309" },
         data: [[
-          { xAxis: futureRange.startMs },
+          { name: "未来预测区", xAxis: futureRange.startMs },
           { xAxis: futureRange.endMs },
         ]],
       } : undefined;
@@ -541,8 +556,8 @@
       }
     }
 
-    series.push({
-      name: "测试",
+    if (!stalePrediction) series.push({
+      name: testLabel,
       type: "line",
       data: testData,
       showSymbol: false,
@@ -553,16 +568,18 @@
       z: 3,
     });
 
-    const legendData = ["历史", "测试"];
-    if (xObserved.length) {
-      legendData.push("预测后实际观测");
-      series.push({
-        name: "预测后实际观测", type: "line",
-        data: prepareSeriesData(toPairs(xObserved, yObserved), windowInfo, isVm, gapConfig),
-        showSymbol: false, sampling: "lttb", connectNulls: false,
-        lineStyle: { color: "#0f766e", width: 2.1 }, itemStyle: { color: "#0f766e" }, z: 3,
-      });
+    const scaledAt = normalizeTsMs(chartData.last_scaled_at_epoch_ms ?? resource?.spec?.last_scaled_at_epoch_ms);
+    if (Number.isFinite(scaledAt) && scaledAt > 0) {
+      const actualPairs = rawTrainPairs.concat(toPairs(xTest, yTest), observedPairs);
+      const nearby = actualPairs.reduce((best, point) => !best || Math.abs(point[0]-scaledAt) < Math.abs(best[0]-scaledAt) ? point : best, null);
+      if (nearby && (windowInfo.min == null || scaledAt >= windowInfo.min) && (windowInfo.max == null || scaledAt <= windowInfo.max)) {
+        series.push({name:"最近调配", type:"scatter", data:[nearby], symbol:"circle", symbolSize:12,
+          itemStyle:{color:"#7c3aed",borderColor:"#fff",borderWidth:2}, z:10,
+          tooltip:{trigger:"item",formatter:()=>`最近调配：${formatMs(scaledAt,"full")}<br/>定位至最近实际采样：${formatMs(nearby[0],"full")}<br/>${list.formatStatValue(nearby[1],displayUnit)}`}});
+      }
     }
+    const legendData = stalePrediction ? ["历史"] : ["历史", testLabel];
+    const legendSelected = { "历史": true, [testLabel]: true };
     const modelNames = new Set([
       ...Object.keys(chartData.preds || {}),
       ...Object.keys(chartData.preds_future || {}),
@@ -586,6 +603,7 @@
       );
       if (!rawPredPairs.length) continue;
       legendData.push(label);
+      legendSelected[label] = m === bestMethod;
       series.push({
         name: label,
         type: "line",
@@ -606,12 +624,21 @@
     const bestRmse = chartData.metrics?.[bestMethod]?.rmse;
     const timeAxis = buildTimeAxisConfigFromPairs(series.map((item) => item.data), windowInfo);
     const containerScope = activeContainerSubtext(resource, metricKey) || metricContainerScope(resource, metricKey, displayUnit);
+    const staleNote = chartData.forecast_status === "unavailable"
+      ? "连续数据不足，暂无预测；仅展示历史观测"
+      : stalePrediction
+      ? `${chartData.prediction_skipped ? "连续数据不足，沿用旧预测" : "旧预测已被实际观测覆盖，暂无新的未来预测"}；测试截止 ${formatMs(testEndMs,"full")}`
+      : "";
+    const generatedNote = chartData.forecast_generated_at_epoch_ms
+      ? `预测生成 ${formatMs(chartData.forecast_generated_at_epoch_ms, "full")}` : "";
+    const forecastNote = [staleNote, generatedNote].filter(Boolean).join("；");
+    const extraHeader = forecastNote ? 18 : 0;
     return {
       backgroundColor: "transparent",
       animation: false,
       title: {
         text: `${metricTitleForChart(resource, metricKey)} 预测 · ${modeLabel}${bestMethod ? ` · 最优 ${app.labelMap[bestMethod] || bestMethod}` : ""}${bestRmse !== undefined ? ` · RMSE ${bestRmse.toFixed(3)}` : ""}`,
-        subtext: containerScope,
+        subtext: [containerScope, forecastNote].filter(Boolean).join("\n"),
         left: "center",
         top: 6,
         textStyle: { color: "#0f172a", fontSize: 13, fontWeight: 800 },
@@ -638,8 +665,8 @@
           return html;
         },
       },
-      legend: { top: containerScope ? 54 : 34, left: 8, data: legendData, itemWidth: 12, itemHeight: 7, textStyle: { color: "#475569", fontSize: 10 } },
-      grid: { left: chartGridLeft(displayUnit), right: 18, top: containerScope ? 88 : 70, bottom: 58, containLabel: true },
+      legend: { top: (containerScope ? 54 : 34) + extraHeader, left: 8, data: legendData, selected: legendSelected, selectedMode: "multiple", itemWidth: 12, itemHeight: 7, textStyle: { color: "#475569", fontSize: 10 } },
+      grid: { left: chartGridLeft(displayUnit), right: 18, top: (containerScope ? 88 : 70) + extraHeader, bottom: 58, containLabel: true },
       xAxis: {
         type: "time",
         min: timeAxis.min,
@@ -1035,6 +1062,9 @@
       !!advice.has_mixed_signals,
       { analysisOnly: Boolean(advice.analysis_only), resourceType: list.resourceTypeOf(resource), resource }
     );
+    if (list.isK8s(resource)) {
+      app.els.detailActions.innerHTML += `<button type="button" class="secondary-btn" data-workload-refresh="${list.escapeHtml(resource.resource_id)}">重新拉取预测</button><span id="workload-refresh-message" role="status"></span>`;
+    }
   }
 
   function renderMetricTabs(resource, activeMetric) {

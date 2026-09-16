@@ -15,6 +15,23 @@ def register_scaling_routes(app: Flask, helpers: Dict[str, Callable[..., Any]]) 
     get_resource_detail = helpers["get_resource_detail"]
     safe_int = helpers["safe_int"]
 
+    @app.post("/api/resources/<resource_id>/refresh-forecast")
+    def api_workload_refresh(resource_id: str):
+        from resource_predict.data.updater import UpdateBusyError, get_update_status
+        from resource_predict.resource_types import resource_type_of
+        from resource_predict.services.workload_refresh import start_workload_refresh
+
+        resource = get_resource_detail(resource_id, include_charts=False)
+        if resource is None:
+            return jsonify({"error": "resource not found"}), 404
+        if resource_type_of(resource) != "k8s_workload":
+            return jsonify({"error": "仅支持 Workload 重新拉取预测"}), 400
+        try:
+            start_workload_refresh(resource)
+        except UpdateBusyError as exc:
+            return jsonify({"error": str(exc), "status": get_update_status()}), 409
+        return jsonify({"accepted": True, "resource_id": resource_id, "status_url": "/api/update-status"}), 202
+
     @app.post("/api/resources/<resource_id>/scale")
     def api_resource_scale(resource_id: str):
         detail = get_resource_detail(resource_id, include_charts=False)

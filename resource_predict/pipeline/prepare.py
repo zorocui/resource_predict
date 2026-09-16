@@ -9,7 +9,7 @@ import pandas as pd
 
 from resource_predict.data.io import coerce_metric_series
 from resource_predict.pipeline.windowing import recent_contiguous_segment
-from resource_predict.resource_types import metric_names_for_resource
+from resource_predict.resource_types import metric_names_for_resource, resource_type_of
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ def build_prepared_data(
                     prepared_item["container_metric_modes"] = item["container_metric_modes"]
 
                 min_len = min(len(prepared_item[m]) for m in metric_names_for_resource(prepared_item))
-                if test_size > 0 and min_len <= test_size:
+                if resource_type_of(prepared_item) != "k8s_workload" and test_size > 0 and min_len <= test_size:
                     raise ValueError(
                         f"有效点数不足：最短序列长度={min_len}，需大于 test_size={test_size}"
                     )
@@ -220,7 +220,7 @@ def prepare_recent_contiguous_forecast_data(
                 test_size=test_size,
             )
             if len(segment) <= test_size:
-                skips.append(_skip_entry(rid, metric))
+                skips.append(_skip_entry(rid, metric, series, segment, test_size, sample_interval_seconds))
         item["data_quality"] = quality_by_metric
 
         raw_containers = item.get("container_metrics")
@@ -251,7 +251,8 @@ def prepare_recent_contiguous_forecast_data(
                     )
                     if len(segment) <= test_size:
                         skips.append(
-                            _skip_entry(rid, f"container/{container_name}/{metric}")
+                            _skip_entry(rid, f"container/{container_name}/{metric}",
+                                        series, segment, test_size, sample_interval_seconds)
                         )
                 containers_out[container_name] = metric_out
             item["container_metrics"] = containers_out
@@ -297,9 +298,42 @@ def _update_recent_segment_quality(
     })
 
 
-def _skip_entry(resource_id: str, metric: str) -> Dict[str, str]:
+def _skip_entry(
+    resource_id: str, metric: str, original: pd.Series, segment: pd.Series,
+    test_size: int, sample_interval_seconds: float,
+) -> Dict[str, str]:
+    valid = original.sort_index()
+    valid = valid[~valid.index.duplicated(keep="last")].dropna()
+    gap_description = "未发现截断缺口，已有有效历史长度不足"
+    if not segment.empty:
+        previous = valid.index[valid.index < segment.index[0]]
+        if len(previous):
+            before, after = previous[-1], segment.index[0]
+            step = pd.Timedelta(seconds=sample_interval_seconds)
+            missing = max(0, int(np.ceil((after - before) / step)) - 1)
+            gap_description = (
+                f"最后截断缺口：前一有效点={_forecast_log_time(before)}，"
+                f"后一有效点={_forecast_log_time(after)}，缺失采样点数={missing}，"
+                f"缺失时刻={_forecast_log_time(before + step)} 至 "
+                f"{_forecast_log_time(before + missing * step)}（每{sample_interval_seconds:g}秒一个点）"
+            )
+    logger.warning(
+        "[progress] 指标预测跳过：resource_id=%s metric=%s；总有效点数=%d；"
+        "最近连续段=%s 至 %s，连续有效点数=%d；test_size=%d，最低需要=%d点，"
+        "距最低要求还差=%d点（不等于缺口缺失点数）；%s；时间统一为UTC",
+        resource_id, metric, len(valid),
+        _forecast_log_time(segment.index[0]) if len(segment) else "无",
+        _forecast_log_time(segment.index[-1]) if len(segment) else "无",
+        len(segment), test_size, test_size + 1, max(0, test_size + 1 - len(segment)),
+        gap_description,
+    )
     return {
         "resource_id": resource_id,
         "metric": metric,
         "reason": "recent_contiguous_segment_too_short",
     }
+
+
+def _forecast_log_time(value: pd.Timestamp) -> str:
+    value = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+    return value.isoformat()

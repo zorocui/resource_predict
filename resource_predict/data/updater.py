@@ -183,6 +183,7 @@ def mark_external_update_failed(
     phase: str = "error",
     *,
     cluster_results: Optional[List[Dict[str, Any]]] = None,
+    record_history: bool = True,
 ) -> None:
     with _lock:
         _update_status["running"] = False
@@ -194,10 +195,11 @@ def mark_external_update_failed(
             _update_status["cluster_results"] = [
                 dict(item) for item in cluster_results if isinstance(item, dict)
             ]
-    _record_current_update_history(error=error)
+    if record_history:
+        _record_current_update_history(error=error)
 
 
-def mark_external_update_finished(result: Dict[str, Any]) -> None:
+def mark_external_update_finished(result: Dict[str, Any], *, record_history: bool = True) -> None:
     with _lock:
         _update_status["running"] = False
         _update_status["phase"] = "idle"
@@ -213,8 +215,9 @@ def mark_external_update_finished(result: Dict[str, Any]) -> None:
         ]
         _update_status["total_updates"] += 1
         _update_status["total_new_points"] += int(result.get("total_new_points") or 0)
-        _update_status["message"] = "K8S Prometheus 数据拉取完成"
-    _record_current_update_history(result=result)
+        _update_status["message"] = result.get("message") or "K8S Prometheus 数据拉取完成"
+    if record_history:
+        _record_current_update_history(result=result)
 
 
 def _record_current_update_history(
@@ -676,6 +679,7 @@ def run_upsert_with_data(
     out_dir: Optional[Union[str, Path]] = None,
     task_source: str = "推送 Upsert 更新",
     freq_hint: Optional[str] = None,
+    _exclusive_already_acquired: bool = False,
 ) -> Dict[str, Any]:
     """
     使用外部传入数据进行显式 upsert：已有资源更新，不存在的资源插入。
@@ -687,18 +691,15 @@ def run_upsert_with_data(
         "[updater] 收到 push upsert 数据：%d 个资源",
         len(new_data_list) if isinstance(new_data_list, list) else 0,
     )
-    with _lock:
-        inherited_external_source = bool(
-            _update_status.get("running") and _update_status.get("task_source")
-        )
-    effective_source = "" if inherited_external_source else task_source
     return _do_update(
         new_data_list=new_data_list,
         fail_if_busy=fail_if_busy,
         allow_create=True,
         out_dir=out_dir,
-        task_source=effective_source,
-        record_history=not inherited_external_source,
+        task_source=task_source,
+        _exclusive_already_acquired=_exclusive_already_acquired,
+        record_history=not _exclusive_already_acquired,
+        keep_running=_exclusive_already_acquired,
         freq_hint=freq_hint,
     )
 
@@ -788,6 +789,8 @@ def _do_update(
     allow_create: bool = False,
     out_dir: Optional[Union[str, Path]] = None,
     _exclusive_already_acquired: bool = False,
+    force_predict: bool = False,
+    keep_running: bool = False,
     task_source: str = "",
     record_history: bool = True,
     freq_hint: Optional[str] = None,
@@ -832,11 +835,13 @@ def _do_update(
             _update_status["predicted_resources"] = 0
             if record_history:
                 _update_status["last_started_at"] = t_start
+                _update_status["last_finished_at"] = None
             _update_status["last_error"] = None
             _update_status["last_result"] = None
             if task_source:
                 _update_status["task_source"] = task_source
-                _update_status["fetch_window_label"] = ""
+                if record_history:
+                    _update_status["fetch_window_label"] = ""
 
         if not isinstance(new_data_list, list) or not new_data_list:
             raise ValueError("传入的增量数据为空")
@@ -987,7 +992,9 @@ def _do_update(
             if retention_changed:
                 changed_metrics = list(metric_names_for_resource(res))
 
-            if has_new or spec_changed or retention_changed:
+            if force_predict:
+                changed_metrics = list(metric_names_for_resource(res))
+            if has_new or spec_changed or retention_changed or force_predict:
                 updated_count += 1
                 updated_resource_ids.append(rid)
                 if changed_metrics:
@@ -1051,6 +1058,7 @@ def _do_update(
             prepared,
             freq=freq,
             changed_resource_ids=updated_resource_ids,
+            defer_cleanup=force_predict,
         )
         logger.info(
             "[updater] raw 分片提交：resources=%d written=%d reused=%d removed=%d",
@@ -1069,6 +1077,7 @@ def _do_update(
             out_dir=str(output_dir),
             resource_ids=updated_resource_ids,
             metric_names_by_resource=updated_metrics_by_resource,
+            **({"local_update": True} if force_predict else {}),
         )
         logger.info("[updater] 预测完成，共 %d 个资源", len(manifest))
 
@@ -1081,13 +1090,20 @@ def _do_update(
         result["updated_resource_ids"] = updated_resource_ids
         result["created_resource_ids"] = created_resource_ids
         result["updated_metrics_by_resource"] = updated_metrics_by_resource
-        result["predicted_resources"] = len(updated_resource_ids)
+        current_ids = set(updated_resource_ids)
+        current_predictions = [item for item in manifest if item.get("resource_id") in current_ids]
+        result["predicted_resources"] = sum(item.get("prediction_status") != "skipped" for item in current_predictions)
+        incomplete = [item for item in current_predictions if item.get("prediction_status") in {"partial_success", "skipped"}]
+        if incomplete:
+            result["status"] = "partial_success"
+            result["message"] = "数据已更新；部分指标连续数据不足，保留旧预测或显示暂无预测"
 
         with _lock:
             _update_status["last_finished_at"] = time.time()
             _update_status["last_error"] = None
             _update_status["phase"] = "idle"
-            _update_status["predicted_resources"] = len(updated_resource_ids)
+            _update_status["predicted_resources"] = result["predicted_resources"]
+            _update_status["message"] = result.get("message", "数据更新完成")
             _update_status["last_result"] = dict(result)
             _update_status["total_updates"] += 1
             _update_status["total_new_points"] += total_new_pts
@@ -1118,7 +1134,8 @@ def _do_update(
 
     finally:
         with _lock:
-            _update_status["running"] = False
+            if not keep_running:
+                _update_status["running"] = False
             if _update_status.get("phase") != "error":
                 _update_status["phase"] = "idle"
             _update_status["current_resource_ids"] = []
@@ -1135,6 +1152,22 @@ def _run_scoped_data_update(
     *,
     allow_create: bool,
     fail_if_busy: bool,
+    task_source: str,
+) -> Dict[str, Any]:
+    if not _update_exclusive.acquire(blocking=not fail_if_busy):
+        raise UpdateBusyError("已有更新任务正在运行中")
+    try:
+        return _do_scoped_data_update(new_data_list, allow_create=allow_create, task_source=task_source)
+    finally:
+        with _lock:
+            _update_status["running"] = False
+        _update_exclusive.release()
+
+
+def _do_scoped_data_update(
+    new_data_list: List[Dict[str, Any]],
+    *,
+    allow_create: bool,
     task_source: str,
 ) -> Dict[str, Any]:
     task_started_at = time.time()
@@ -1167,7 +1200,8 @@ def _run_scoped_data_update(
             continue
         result = _do_update(
             new_data_list=items,
-            fail_if_busy=fail_if_busy,
+            _exclusive_already_acquired=True,
+            keep_running=True,
             allow_create=allow_create,
             out_dir=scoped_out_dir(scope),
             task_source=task_source,
@@ -1175,6 +1209,9 @@ def _run_scoped_data_update(
         )
         results["results_by_scope"][scope] = result
         results["warnings"].extend(result.get("warnings") or [])
+        if result.get("status") == "partial_success":
+            results["status"] = "partial_success"
+            results["message"] = result.get("message")
         if not result.get("success"):
             results["success"] = False
             results["error"] = result.get("error")
@@ -1203,6 +1240,7 @@ def _run_scoped_data_update(
         _update_status["resources_updated"] = results["resources_updated"]
         _update_status["resources_created"] = results["resources_created"]
         _update_status["predicted_resources"] = results["predicted_resources"]
+        _update_status["message"] = results.get("message", "数据更新完成")
     _record_current_update_history(result=results, error=results.get("error"))
     return results
 

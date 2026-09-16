@@ -39,9 +39,12 @@ python -c "import torch; print(torch.__version__)"
 
 每条资源—容器—指标通过完整身份查找对应的离线归一化参数；取最近 lookback 个观测，生成未来曲线，再还原原尺度并按项目规则裁剪。
 CPU/内存四类指标仍共享一个网络。当前单个配置指向一个 model.pt，文件的资源类型和层级必须匹配；容器模型不能直接替代 Workload 聚合指标模型。
+在线先按模型适用范围路由：容器模型用于容器指标，遇到 Workload 聚合指标时正常跳过；K8S 模型遇到 VM 指标也跳过。跳过后使用其余候选，仅配置 LSTM 时使用 Rolling Mean 兜底，不再把范围不适用记录为逐阶段预测失败。
+可查看 `forecast_diagnostics.saved_lstm.routing` 中的 `decision=skipped`、`reason=resource_level_mismatch/resource_type_mismatch`，以及实际/模型资源类型和层级。
 未知资源/容器/指标没有 scaler 时，此 LSTM 候选失败，其他候选继续处理；不会临时用当前测试标签估计归一化参数。
 
 检查项目包括模型格式/权重、采样间隔、输入连续性、lookback、输出长度、模型滞后和资源身份。错误按阶段写入诊断及误差报告。
+缺失或损坏模型文件、无效的模型范围声明、缺少输入身份仍属于真实错误，不会用“不适用”跳过掩盖。
 LSTM 固定输出长度由训练决定：在线验证、测试、未来步数都不能超过训练 horizon。小于 horizon 时取预测前缀，不递推拼接更长预测。
 例如训练输出 24 小时，VM 测试窗口仍为 72 小时时，LSTM 没有可用验证分数，不能成为最佳候选；应使用适合的验证窗口或训练更长 horizon。
 
